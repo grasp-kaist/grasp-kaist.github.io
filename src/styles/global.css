@@ -348,6 +348,12 @@ p {
   margin: 0;
 }
 
+.course-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
 .prose {
   max-width: 760px;
 }
@@ -358,6 +364,20 @@ p {
 
 .prose :last-child {
   margin-bottom: 0;
+}
+
+.lecture-materials {
+  margin-top: 2rem;
+  max-width: 760px;
+}
+
+.material-list {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.material-list li {
+  margin: 0.25rem 0;
 }
 
 .empty-state {

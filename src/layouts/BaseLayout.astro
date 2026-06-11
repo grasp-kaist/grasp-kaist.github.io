@@ -18,13 +18,14 @@ const currentPath = Astro.url.pathname.replace(/\/$/, '') || '/';
 const navItems = [
   { href: '/', label: 'Main' },
   { href: '/members', label: 'Members' },
+  { href: '/teaching', label: 'Teaching' },
   { href: '/student-seminar', label: 'Student Seminar' },
   { href: '/ongoing-study-groups', label: 'Ongoing Study Groups' },
 ];
 
 const isActive = (href: string) => {
   const normalizedHref = href.replace(/\/$/, '') || '/';
-  return currentPath === normalizedHref;
+  return currentPath === normalizedHref || (normalizedHref !== '/' && currentPath.startsWith(`${normalizedHref}/`));
 };
 ---
 

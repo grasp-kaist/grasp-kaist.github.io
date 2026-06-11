@@ -115,6 +115,57 @@ Supported image formats are:
 
 A 4:5 portrait ratio is recommended. Images with other ratios may be cropped to fit the displayed photo area.
 
+## Updating Teaching Courses
+
+Teaching courses are stored under:
+
+```text
+src/data/teaching/
+```
+
+Each course lives in its own folder:
+
+```text
+src/data/teaching/<course-slug>/
+```
+
+The main course page is:
+
+```text
+src/data/teaching/<course-slug>/index.md
+```
+
+The generated course URL is:
+
+```text
+/teaching/<course-slug>
+```
+
+The `index.md` file can use optional frontmatter fields:
+
+```markdown
+---
+title: Example Course
+semester:
+instructor:
+order: 999
+---
+
+Course information will be added here.
+```
+
+Optional lecture materials go under:
+
+```text
+src/data/teaching/<course-slug>/materials/
+```
+
+The materials list is generated automatically from files in that folder. Supported material formats are:
+
+```text
+.pdf, .ppt, .pptx, .tex, .zip, .md, .txt
+```
+
 ## Student Seminar and Ongoing Study Groups
 
 The Student Seminar and Ongoing Study Groups pages are still under development.

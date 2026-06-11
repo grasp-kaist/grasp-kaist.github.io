@@ -1,0 +1,151 @@
+---
+import type { AstroComponentFactory } from 'astro/runtime/server/index.js';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+
+type CourseFrontmatter = {
+  title?: unknown;
+  semester?: unknown;
+  instructor?: unknown;
+  order?: unknown;
+};
+
+type CourseModule = {
+  frontmatter?: CourseFrontmatter;
+  Content: AstroComponentFactory;
+};
+
+type CoursePage = {
+  slug: string;
+  title: string;
+  semester?: string;
+  instructor?: string;
+};
+
+type Material = {
+  fileName: string;
+  url: string;
+};
+
+type PageProps = {
+  course: CoursePage;
+  module: CourseModule;
+  materials: Material[];
+};
+
+export function getStaticPaths() {
+  type StaticPath = {
+    params: { slug: string };
+    props: PageProps;
+  };
+
+  const courseModules = import.meta.glob('../../data/teaching/*/index.md', { eager: true });
+  const materialModules = import.meta.glob<string>('../../data/teaching/*/materials/*.{pdf,ppt,pptx,tex,zip,md,txt}', {
+    eager: true,
+    query: '?url',
+    import: 'default',
+  });
+
+  function getOptionalString(value: unknown) {
+    if (typeof value !== 'string') {
+      return undefined;
+    }
+
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+  }
+
+  function getCourseSlug(path: string) {
+    const match = path.match(/\/data\/teaching\/([^/]+)\/index\.md$/);
+    return match?.[1] ?? '';
+  }
+
+  function getMaterialParts(path: string) {
+    const match = path.match(/\/data\/teaching\/([^/]+)\/materials\/([^/]+)$/);
+    return match ? { slug: match[1], fileName: match[2] } : undefined;
+  }
+
+  function getMaterialsForCourse(slug: string): Material[] {
+    return Object.entries(materialModules)
+      .map(([path, url]) => {
+        const parts = getMaterialParts(path);
+
+        if (!parts || parts.slug !== slug) {
+          return undefined;
+        }
+
+        return {
+          fileName: parts.fileName,
+          url,
+        };
+      })
+      .filter((material): material is Material => Boolean(material))
+      .sort((a, b) => a.fileName.localeCompare(b.fileName));
+  }
+
+  const paths: StaticPath[] = [];
+
+  for (const [path, module] of Object.entries(courseModules)) {
+    const slug = getCourseSlug(path);
+
+    if (!slug) {
+      continue;
+    }
+
+    const courseModule = module as CourseModule;
+    const frontmatter = courseModule.frontmatter ?? {};
+    const course: CoursePage = {
+      slug,
+      title: getOptionalString(frontmatter.title) ?? slug,
+      semester: getOptionalString(frontmatter.semester),
+      instructor: getOptionalString(frontmatter.instructor),
+    };
+
+    paths.push({
+      params: { slug },
+      props: {
+        course,
+        module: courseModule,
+        materials: getMaterialsForCourse(slug),
+      },
+    });
+  }
+
+  return paths;
+}
+
+const { course, module, materials } = Astro.props as PageProps;
+const { Content } = module;
+---
+
+<BaseLayout title={course.title} description={`${course.title} teaching materials for GRASP Lab at KAIST.`}>
+  <section class="page-heading">
+    <h1>{course.title}</h1>
+    {(course.semester || course.instructor) && (
+      <p class="entry-meta">
+        {course.semester && <span>{course.semester}</span>}
+        {course.instructor && <span>{course.instructor}</span>}
+      </p>
+    )}
+  </section>
+
+  <article class="prose">
+    <Content />
+  </article>
+
+  <section class="section-block lecture-materials" aria-labelledby="lecture-materials-heading">
+    <h2 id="lecture-materials-heading">Lecture Materials</h2>
+    {
+      materials.length > 0 ? (
+        <ul class="material-list">
+          {materials.map((material) => (
+            <li>
+              <a href={material.url}>{material.fileName}</a>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p class="empty-state">No lecture materials have been added yet.</p>
+      )
+    }
+  </section>
+</BaseLayout>
