@@ -286,6 +286,10 @@ p {
   margin: 0;
 }
 
+.member-profile__contact-line {
+  display: block;
+}
+
 .member-profile__url {
   overflow-wrap: anywhere;
   word-break: break-word;

@@ -7,15 +7,22 @@ type Member = {
   order: number;
   name: string;
   position: string;
-  contact: string;
-  researchInterests?: string[];
-  website?: string;
-  photo?: string;
+  contact?: unknown;
+  researchInterests?: unknown;
+  website?: unknown;
+  photo?: unknown;
 };
 
 type MemberWithPhotoUrl = Member & {
+  contactLines: ContactPart[][];
+  researchInterestsList: string[];
+  websiteUrl?: string;
   photoUrl?: string;
 };
+
+type ContactPart =
+  | { type: 'text'; value: string }
+  | { type: 'link'; href: string; value: string };
 
 const allowedPhotoExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.svg']);
 const photoModules = import.meta.glob<string>('../data/members/*.{jpg,jpeg,png,webp,svg}', {
@@ -27,32 +34,101 @@ const photoByFileName = Object.fromEntries(
   Object.entries(photoModules).map(([path, url]) => [path.split('/').pop(), url]),
 ) as Record<string, string>;
 
-function getMemberPhotoUrl(member: Member) {
-  if (!member.photo) {
+function getOptionalString(value: unknown) {
+  if (typeof value !== 'string') {
     return undefined;
   }
 
-  const photo = member.photo;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function isAllowedLinkTarget(value: string) {
+  return value.startsWith('https://') || value.startsWith('http://') || value.startsWith('mailto:');
+}
+
+function parseContactLine(contact: string): ContactPart[] {
+  const parts: ContactPart[] = [];
+  const linkPattern = /\[([^\]]+)\]\(([^)]+)\)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = linkPattern.exec(contact))) {
+    const [raw, label, href] = match;
+    const cleanLabel = label.trim();
+    const cleanHref = href.trim();
+
+    if (match.index > lastIndex) {
+      parts.push({ type: 'text', value: contact.slice(lastIndex, match.index) });
+    }
+
+    if (cleanLabel && isAllowedLinkTarget(cleanHref)) {
+      parts.push({ type: 'link', href: cleanHref, value: cleanLabel });
+    } else {
+      parts.push({ type: 'text', value: raw });
+    }
+
+    lastIndex = match.index + raw.length;
+  }
+
+  if (lastIndex < contact.length) {
+    parts.push({ type: 'text', value: contact.slice(lastIndex) });
+  }
+
+  return parts.length ? parts : [{ type: 'text', value: contact }];
+}
+
+function getContactLines(value: unknown): ContactPart[][] {
+  if (Array.isArray(value)) {
+    return value.map((line) => getOptionalString(line)).filter((line): line is string => {
+      return Boolean(line);
+    }).map(parseContactLine);
+  }
+
+  const contact = getOptionalString(value);
+  return contact ? [parseContactLine(contact)] : [];
+}
+
+function getResearchInterests(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter((interest): interest is string => {
+    return typeof interest === 'string' && interest.trim().length > 0;
+  }).map((interest) => interest.trim());
+}
+
+function getMemberPhotoUrl(member: Member) {
+  const photo = getOptionalString(member.photo);
+
+  if (!photo) {
+    return undefined;
+  }
+
   const isFileNameOnly = photo === posixBasename(photo) && photo === winBasename(photo);
 
   if (!isFileNameOnly || photo === '.' || photo === '..') {
-    throw new Error(
-      `Invalid member photo for ${member.name}: "${photo}" must be a file name only, e.g. taein-oh.png`,
+    console.warn(
+      `Invalid member photo for ${member.name}: "${photo}" must be a file name only, e.g. taein-oh.png. Using placeholder.`,
     );
+    return undefined;
   }
 
   const extension = posixExtname(photo).toLowerCase();
 
   if (!allowedPhotoExtensions.has(extension)) {
-    throw new Error(
-      `Invalid member photo extension for ${member.name}: "${photo}". Allowed extensions: .jpg, .jpeg, .png, .webp, .svg`,
+    console.warn(
+      `Invalid member photo extension for ${member.name}: "${photo}". Allowed extensions: .jpg, .jpeg, .png, .webp, .svg. Using placeholder.`,
     );
+    return undefined;
   }
 
   const photoUrl = photoByFileName[photo];
 
   if (!photoUrl) {
-    throw new Error(`Missing member photo for ${member.name}: src/data/members/${photo}`);
+    console.warn(`Missing member photo for ${member.name}: src/data/members/${photo}. Using placeholder.`);
+    return undefined;
   }
 
   return photoUrl;
@@ -63,6 +139,9 @@ const members: MemberWithPhotoUrl[] = Object.values(modules).map((module) => {
   const member = (module as { default: Member }).default;
   return {
     ...member,
+    contactLines: getContactLines(member.contact),
+    researchInterestsList: getResearchInterests(member.researchInterests),
+    websiteUrl: getOptionalString(member.website),
     photoUrl: getMemberPhotoUrl(member),
   };
 }).sort((a, b) => {
@@ -91,22 +170,32 @@ const members: MemberWithPhotoUrl[] = Object.values(modules).map((module) => {
               <h2>{member.name}</h2>
               <p class="member-profile__position">{member.position}</p>
               <dl class="member-profile__details">
-                {member.researchInterests?.length ? (
+                {member.researchInterestsList.length > 0 ? (
                   <div>
                     <dt>Research Interests</dt>
-                    <dd>{member.researchInterests.join(', ')}</dd>
+                    <dd>{member.researchInterestsList.join(', ')}</dd>
                   </div>
                 ) : null}
-                <div>
-                  <dt>Contact</dt>
-                  <dd>{member.contact}</dd>
-                </div>
-                {member.website && (
+                {member.contactLines.length > 0 ? (
+                  <div>
+                    <dt>Contact</dt>
+                    <dd>
+                      {member.contactLines.map((line) => (
+                        <span class="member-profile__contact-line">
+                          {line.map((part) => (
+                            part.type === 'link' ? <a href={part.href}>{part.value}</a> : part.value
+                          ))}
+                        </span>
+                      ))}
+                    </dd>
+                  </div>
+                ) : null}
+                {member.websiteUrl && (
                   <div>
                     <dt>Website</dt>
                     <dd>
-                      <a class="member-profile__url" href={member.website}>
-                        {member.website}
+                      <a class="member-profile__url" href={member.websiteUrl}>
+                        {member.websiteUrl}
                       </a>
                     </dd>
                   </div>
