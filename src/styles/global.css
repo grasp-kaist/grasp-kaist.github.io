@@ -276,6 +276,16 @@ p {
   margin-bottom: 0.75rem;
 }
 
+.member-profile__detail-lines {
+  color: var(--muted);
+  font-style: italic;
+  font-size: 0.95rem;
+  line-height: 1.45;
+  list-style: none;
+  margin: -0.35rem 0 0.75rem;
+  padding: 0;
+}
+
 .member-profile__details {
   display: grid;
   gap: 0.35rem 1.25rem;
@@ -305,6 +315,15 @@ p {
 .member-profile__url {
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.members-email-note {
+  background: #eeeeea;
+  border-left: 3px solid var(--line-strong);
+  color: var(--muted);
+  font-size: 0.94rem;
+  margin-top: 1.5rem;
+  padding: 0.55rem 0.75rem;
 }
 
 .content-entry {

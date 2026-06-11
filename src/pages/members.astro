@@ -7,6 +7,7 @@ type Member = {
   order: number;
   name: string;
   position: string;
+  details?: unknown;
   contact?: unknown;
   researchInterests?: unknown;
   website?: unknown;
@@ -14,6 +15,7 @@ type Member = {
 };
 
 type MemberWithPhotoUrl = Member & {
+  detailsList: string[];
   contactLines: ContactPart[][];
   researchInterestsList: string[];
   websiteUrl?: string;
@@ -89,6 +91,17 @@ function getContactLines(value: unknown): ContactPart[][] {
   return contact ? [parseContactLine(contact)] : [];
 }
 
+function getDetails(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.map((line) => getOptionalString(line)).filter((line): line is string => {
+      return Boolean(line);
+    });
+  }
+
+  const details = getOptionalString(value);
+  return details ? [details] : [];
+}
+
 function getResearchInterests(value: unknown) {
   if (!Array.isArray(value)) {
     return [];
@@ -139,6 +152,7 @@ const members: MemberWithPhotoUrl[] = Object.values(modules).map((module) => {
   const member = (module as { default: Member }).default;
   return {
     ...member,
+    detailsList: getDetails(member.details),
     contactLines: getContactLines(member.contact),
     researchInterestsList: getResearchInterests(member.researchInterests),
     websiteUrl: getOptionalString(member.website),
@@ -169,6 +183,13 @@ const members: MemberWithPhotoUrl[] = Object.values(modules).map((module) => {
             <div class="member-profile__body">
               <h2>{member.name}</h2>
               <p class="member-profile__position">{member.position}</p>
+              {member.detailsList.length > 0 ? (
+                <ul class="member-profile__detail-lines">
+                  {member.detailsList.map((detail) => (
+                    <li>{detail}</li>
+                  ))}
+                </ul>
+              ) : null}
               <dl class="member-profile__details">
                 {member.researchInterestsList.length > 0 ? (
                   <div>
@@ -209,4 +230,8 @@ const members: MemberWithPhotoUrl[] = Object.values(modules).map((module) => {
       <p class="empty-state">Current member information will be added here.</p>
     )
   }
+
+  <aside class="members-email-note" aria-label="Email convention">
+    Email: xxxx@kaist → <a href="mailto:xxxx@kaist.ac.kr">xxxx@kaist.ac.kr</a>
+  </aside>
 </BaseLayout>

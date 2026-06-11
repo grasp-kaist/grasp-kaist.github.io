@@ -42,8 +42,9 @@ A member JSON file looks like this:
   "order": 4,
   "name": "Example",
   "position": "Undergraduate Student, School of Computing, KAIST",
+  "details": [],
   "contact": [
-    "example@kaist.ac.kr",
+    "example@kaist",
     "+82-10-1234-5678"
   ],
   "website": "https://example.github.io/",
@@ -70,22 +71,44 @@ Members with the same `order` value are sorted alphabetically by `name`.
 
 `name`, `position`, `contact`, and `website` should contain your public-facing information.
 
-`contact` may be a single string or an array of strings. Use an array when listing multiple contacts so each item appears on its own line:
+`contact` may be a single string or an array of strings. Use an array when listing multiple contacts so each item appears on its own line. Since contact information can be sensitive when exposed to web crawlers, consider writing it in a lightly obfuscated form, such as `example (at) gmail.com`. The Members page has a note explaining that `@kaist` should be read as `@kaist.ac.kr`, so you may also use that convention. Please also think carefully before adding a personal phone number.
 
 ```json
 {
   "contact": [
-    "example@kaist.ac.kr",
+    "example@kaist",
     "+82-10-1234-5678"
   ]
 }
 ```
 
-If you do not want to show a field such as `contact` or `website`, leave it as an empty string:
+If you do not want to show a field such as `contact` or `website`, do not delete the field. Leave it as an empty string:
 
 ```json
 {
   "website": ""
+}
+```
+
+`details` is a field for any additional information you would like to include. It is intentionally flexible, since it is unclear whether people will want to list degrees, previous affiliations, research interests, advisors, or other information. Use it freely. Like `contact`, it can contain multiple entries.
+
+For example:
+
+```json
+{
+  "details": [
+    "B.S. in Mathematical Sciences, KAIST",
+    "Advisor: Example Professor",
+    "Research interests: graph theory and algorithms"
+  ]
+}
+```
+
+If you do not want to show details, leave it as an empty array:
+
+```json
+{
+  "details": []
 }
 ```
 
@@ -221,8 +244,11 @@ Important source files:
 src/layouts/BaseLayout.astro
 src/styles/global.css
 src/data/members/
+src/data/teaching/
 src/pages/index.astro
 src/pages/members.astro
+src/pages/teaching.astro
+src/pages/teaching/[slug].astro
 src/pages/student-seminar.astro
 src/pages/ongoing-study-groups.astro
 ```

@@ -2,10 +2,8 @@
   "order": 4,
   "name": "Taein Oh",
   "position": "Undergraduate Student, Department of Mathematical Sciences, KAIST",
-  "contact": [
-    "octanec8h18@kaist.ac.kr",
-    "+82-10-5858-5697"
-  ],
+  "details": [],
+  "contact": "octanec8h18@kaist",
   "website": "https://octane-kr.github.io/",
   "photo": "taein-oh.png"
 }
