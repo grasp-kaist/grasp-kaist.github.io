@@ -1,17 +1,52 @@
 ---
-
+import BaseLayout from '../layouts/BaseLayout.astro';
 ---
 
-<html lang="en">
-	<head>
-		<meta charset="utf-8" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<link rel="icon" href="/favicon.ico" />
-		<meta name="viewport" content="width=device-width" />
-		<meta name="generator" content={Astro.generator} />
-		<title>Astro</title>
-	</head>
-	<body>
-		<h1>Astro</h1>
-	</body>
-</html>
+<BaseLayout
+  title="GRASP Lab"
+  description="GRASP Lab at KAIST studies robotics, AI, and intelligent systems."
+>
+  <section class="page-heading">
+    <p class="page-heading__label">KAIST</p>
+    <h1>GRASP Lab</h1>
+    <p class="lead">
+      GRASP Lab is a KAIST research group exploring robotics, artificial intelligence,
+      and systems that help machines perceive, reason, and act in the physical world.
+      This first website version uses placeholder content while the lab prepares its
+      official description.
+    </p>
+  </section>
+
+  <section class="section-grid" aria-labelledby="about-heading">
+    <p class="section-grid__label">About</p>
+    <div class="text-column">
+      <h2 id="about-heading">Research Direction</h2>
+      <p>
+        The lab website will collect information about members, student seminars, and
+        active study groups. For now, the text is intentionally short and provisional
+        so maintainers can replace it with approved lab content.
+      </p>
+    </div>
+  </section>
+
+  <section class="section-grid" aria-labelledby="links-heading">
+    <p class="section-grid__label">Links</p>
+    <div>
+      <h2 id="links-heading">Useful Links</h2>
+      <ul class="link-list">
+        <li>
+          <a href="https://www.kaist.ac.kr/en/">KAIST</a>
+          <span>Korea Advanced Institute of Science and Technology</span>
+        </li>
+        <li>
+          <a href="https://example.com/professor">Professor Website Placeholder</a>
+          <span>Replace with the official principal investigator website.</span>
+        </li>
+        <li>
+          <a href="https://example.com/lab-resources">Lab Resource Placeholder</a>
+          <span>Replace with shared resources when available.</span>
+        </li>
+      </ul>
+    </div>
+  </section>
+</BaseLayout>

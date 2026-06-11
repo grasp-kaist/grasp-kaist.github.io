@@ -1,43 +1,126 @@
-# Astro Starter Kit: Minimal
+# GRASP Lab Website
+
+Initial static website for the GRASP lab at KAIST.
+
+The site is built with Astro and deployed to GitHub Pages at <https://grasp-kaist.github.io>.
+
+## Run Locally
+
+Install dependencies:
 
 ```sh
-npm create astro@latest -- --template minimal
+npm install
 ```
 
-> 🧑‍🚀 **Seasoned astronaut?** Delete this file. Have fun!
+Start the local development server:
 
-## 🚀 Project Structure
+```sh
+npm run dev
+```
 
-Inside of your Astro project, you'll see the following folders and files:
+Build the static site:
+
+```sh
+npm run build
+```
+
+Preview the production build locally:
+
+```sh
+npm run preview
+```
+
+## Project Structure
+
+Important files and folders:
 
 ```text
-/
-├── public/
-├── src/
-│   └── pages/
-│       └── index.astro
-└── package.json
+src/layouts/BaseLayout.astro
+src/styles/global.css
+src/content.config.ts
+src/content/members/
+src/content/student-seminar/
+src/content/study-groups/
+src/pages/index.astro
+src/pages/members.astro
+src/pages/student-seminar.astro
+src/pages/ongoing-study-groups.astro
 ```
 
-Astro looks for `.astro` or `.md` files in the `src/pages/` directory. Each page is exposed as a route based on its file name.
+The pages are static. There is no backend, login, database, server route, or external CMS.
 
-There's nothing special about `src/components/`, but that's where we like to put any Astro/React/Vue/Svelte/Preact components.
+## Editing Convention
 
-Any static assets, like images, can be placed in the `public/` directory.
+- Members edit their own member file under `src/content/members/`.
+- Student seminar organizers edit files under `src/content/student-seminar/`.
+- Study group organizers edit files under `src/content/study-groups/`.
+- Site-wide layout, styling, configuration, and deployment changes are handled by site admins.
 
-## 🧞 Commands
+## Add or Edit a Member
 
-All commands are run from the root of the project, from a terminal:
+Create or edit a Markdown file in `src/content/members/`.
 
-| Command                   | Action                                           |
-| :------------------------ | :----------------------------------------------- |
-| `npm install`             | Installs dependencies                            |
-| `npm run dev`             | Starts local dev server at `localhost:4321`      |
-| `npm run build`           | Build your production site to `./dist/`          |
-| `npm run preview`         | Preview your build locally, before deploying     |
-| `npm run astro ...`       | Run CLI commands like `astro add`, `astro check` |
-| `npm run astro -- --help` | Get help using the Astro CLI                     |
+Example:
 
-## 👀 Want to learn more?
+```md
+---
+order: 10
+name: "Placeholder Student"
+position: "Graduate Student"
+interests:
+  - "robot learning"
+  - "planning"
+contact: "placeholder@example.com"
+website: "https://example.com/placeholder"
+---
+```
 
-Feel free to check [our documentation](https://docs.astro.build) or jump into our [Discord server](https://astro.build/chat).
+The `order` field controls the display order on the Members page. Use clearly fake placeholder information until real member information is approved.
+
+## Add or Edit a Student Seminar Entry
+
+Create or edit a Markdown file in `src/content/student-seminar/`.
+
+Example:
+
+```md
+---
+order: 10
+semester: "Fall 2026"
+title: "Placeholder Seminar Title"
+speaker: "Placeholder Speaker"
+date: "2026-09-01"
+location: "TBD"
+organizers:
+  - "Student seminar organizers"
+---
+
+Add the abstract, paper links, or notes here.
+```
+
+The `order` field controls the display order on the Student Seminar page.
+
+## Add or Edit a Study Group Entry
+
+Create or edit a Markdown file in `src/content/study-groups/`.
+
+Example:
+
+```md
+---
+order: 10
+semester: "Fall 2026"
+title: "Placeholder Study Group"
+topic: "Robot learning"
+startDate: "2026-09-01"
+meetingTime: "TBD"
+location: "TBD"
+coordinators:
+  - "Study group organizers"
+status: "planning"
+---
+
+Add the study plan, reading list, or participation notes here.
+```
+
+The `order` field controls the display order on the Ongoing Study Groups page.

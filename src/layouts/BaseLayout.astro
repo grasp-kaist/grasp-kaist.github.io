@@ -1,0 +1,72 @@
+---
+import '../styles/global.css';
+
+interface Props {
+  title: string;
+  description?: string;
+}
+
+const {
+  title,
+  description = 'GRASP Lab at KAIST',
+} = Astro.props;
+
+const pageTitle = title === 'GRASP Lab' ? title : `${title} | GRASP Lab`;
+const currentPath = Astro.url.pathname.replace(/\/$/, '') || '/';
+
+const navItems = [
+  { href: '/', label: 'Main' },
+  { href: '/members', label: 'Members' },
+  { href: '/student-seminar', label: 'Student Seminar' },
+  { href: '/ongoing-study-groups', label: 'Ongoing Study Groups' },
+];
+
+const isActive = (href: string) => {
+  const normalizedHref = href.replace(/\/$/, '') || '/';
+  return currentPath === normalizedHref;
+};
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" href="/favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <meta name="generator" content={Astro.generator} />
+    <title>{pageTitle}</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <div class="site-header__bar">
+        <a class="site-title" href="/" aria-label="GRASP Lab home">
+          <span class="site-title__name">GRASP Lab</span>
+          <span class="site-title__affiliation">KAIST</span>
+        </a>
+        <nav class="site-nav" aria-label="Primary navigation">
+          {
+            navItems.map((item) => (
+              <a
+                href={item.href}
+                class:list={['site-nav__link', { 'site-nav__link--active': isActive(item.href) }]}
+                aria-current={isActive(item.href) ? 'page' : undefined}
+              >
+                {item.label}
+              </a>
+            ))
+          }
+        </nav>
+      </div>
+    </header>
+    <main id="content" class="site-main">
+      <slot />
+    </main>
+    <footer class="site-footer">
+      <span>GRASP Lab, KAIST</span>
+      <span>Static website maintained through GitHub.</span>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,49 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../layouts/BaseLayout.astro';
+
+const members = (await getCollection('members')).sort((a, b) => {
+  return a.data.order - b.data.order || a.data.name.localeCompare(b.data.name);
+});
+---
+
+<BaseLayout title="Members" description="Members of GRASP Lab at KAIST.">
+  <section class="page-heading">
+    <p class="page-heading__label">People</p>
+    <h1>Members</h1>
+    <p class="lead">
+      Member profiles are generated from editable Markdown files under
+      <code>src/content/members</code>.
+    </p>
+  </section>
+
+  <table class="members-table">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Position</th>
+        <th>Research Interests</th>
+        <th>Contact</th>
+      </tr>
+    </thead>
+    <tbody>
+      {
+        members.map((member) => (
+          <tr>
+            <td>
+              <span class="member-name">{member.data.name}</span>
+            </td>
+            <td>{member.data.position}</td>
+            <td>{member.data.interests.join(', ')}</td>
+            <td>
+              <span class="contact-list">
+                <span>{member.data.contact}</span>
+                {member.data.website && <a href={member.data.website}>Website</a>}
+              </span>
+            </td>
+          </tr>
+        ))
+      }
+    </tbody>
+  </table>
+</BaseLayout>
