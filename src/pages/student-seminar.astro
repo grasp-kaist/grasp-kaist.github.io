@@ -1,58 +1,11 @@
 ---
-import { getCollection, render } from 'astro:content';
 import BaseLayout from '../layouts/BaseLayout.astro';
-
-const entries = (await getCollection('studentSeminar')).sort((a, b) => {
-  return a.data.order - b.data.order || a.data.date.localeCompare(b.data.date);
-});
-
-const seminarEntries = await Promise.all(
-  entries.map(async (entry) => {
-    const { Content } = await render(entry);
-    return { ...entry, Content };
-  }),
-);
 ---
 
 <BaseLayout title="Student Seminar" description="Student seminar schedule for GRASP Lab at KAIST.">
   <section class="page-heading">
-    <p class="page-heading__label">Seminar</p>
     <h1>Student Seminar</h1>
-    <p class="lead">
-      Entries are maintained by student seminar organizers in
-      <code>src/content/student-seminar</code>.
-    </p>
   </section>
 
-  <div class="entry-list">
-    {
-      seminarEntries.map(({ data, Content }) => (
-        <article class="content-entry">
-          <h2 class="entry-title">{data.title}</h2>
-          <p class="entry-meta">
-            <span>{data.semester}</span>
-            <span>{data.date}</span>
-            <span>{data.location}</span>
-          </p>
-          <dl class="entry-details">
-            <div>
-              <dt>Speaker</dt>
-              <dd>{data.speaker}</dd>
-            </div>
-            <div>
-              <dt>Organizers</dt>
-              <dd>{data.organizers.join(', ') || 'TBD'}</dd>
-            </div>
-          </dl>
-          <div class="prose">
-            <Content />
-          </div>
-        </article>
-      ))
-    }
-  </div>
-
-  <aside class="maintenance-note">
-    <p>Student seminar organizers should edit or add Markdown files in the student seminar content folder.</p>
-  </aside>
+  <p class="empty-state">Student seminar information will be added here.</p>
 </BaseLayout>

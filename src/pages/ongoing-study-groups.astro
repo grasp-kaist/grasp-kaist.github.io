@@ -1,17 +1,5 @@
 ---
-import { getCollection, render } from 'astro:content';
 import BaseLayout from '../layouts/BaseLayout.astro';
-
-const entries = (await getCollection('studyGroups')).sort((a, b) => {
-  return a.data.order - b.data.order || a.data.startDate.localeCompare(b.data.startDate);
-});
-
-const studyGroups = await Promise.all(
-  entries.map(async (entry) => {
-    const { Content } = await render(entry);
-    return { ...entry, Content };
-  }),
-);
 ---
 
 <BaseLayout
@@ -19,51 +7,8 @@ const studyGroups = await Promise.all(
   description="Ongoing study groups for GRASP Lab at KAIST."
 >
   <section class="page-heading">
-    <p class="page-heading__label">Study Groups</p>
     <h1>Ongoing Study Groups</h1>
-    <p class="lead">
-      Entries are maintained by study group organizers in
-      <code>src/content/study-groups</code>.
-    </p>
   </section>
 
-  <div class="entry-list">
-    {
-      studyGroups.map(({ data, Content }) => (
-        <article class="content-entry">
-          <h2 class="entry-title">{data.title}</h2>
-          <p class="entry-meta">
-            <span>{data.semester}</span>
-            <span>{data.status}</span>
-            <span>{data.startDate}</span>
-          </p>
-          <dl class="entry-details">
-            <div>
-              <dt>Topic</dt>
-              <dd>{data.topic}</dd>
-            </div>
-            <div>
-              <dt>Meeting Time</dt>
-              <dd>{data.meetingTime}</dd>
-            </div>
-            <div>
-              <dt>Location</dt>
-              <dd>{data.location}</dd>
-            </div>
-            <div>
-              <dt>Coordinators</dt>
-              <dd>{data.coordinators.join(', ') || 'TBD'}</dd>
-            </div>
-          </dl>
-          <div class="prose">
-            <Content />
-          </div>
-        </article>
-      ))
-    }
-  </div>
-
-  <aside class="maintenance-note">
-    <p>Study group organizers should edit or add Markdown files in the ongoing study groups content folder.</p>
-  </aside>
+  <p class="empty-state">Ongoing study group information will be added here.</p>
 </BaseLayout>

@@ -4,49 +4,30 @@ import BaseLayout from '../layouts/BaseLayout.astro';
 
 <BaseLayout
   title="GRASP Lab"
-  description="GRASP Lab at KAIST studies robotics, AI, and intelligent systems."
+  description="GRASP Lab studies Graph Algorithms and Structural Parameters."
 >
   <section class="page-heading">
-    <p class="page-heading__label">KAIST</p>
     <h1>GRASP Lab</h1>
     <p class="lead">
-      GRASP Lab is a KAIST research group exploring robotics, artificial intelligence,
-      and systems that help machines perceive, reason, and act in the physical world.
-      This first website version uses placeholder content while the lab prepares its
-      official description.
+      GRASP Lab studies Graph Algorithms and Structural Parameters.
     </p>
   </section>
 
-  <section class="section-grid" aria-labelledby="about-heading">
-    <p class="section-grid__label">About</p>
-    <div class="text-column">
-      <h2 id="about-heading">Research Direction</h2>
-      <p>
-        The lab website will collect information about members, student seminars, and
-        active study groups. For now, the text is intentionally short and provisional
-        so maintainers can replace it with approved lab content.
-      </p>
-    </div>
+  <section class="section-block" aria-labelledby="location-heading">
+    <h2 id="location-heading">Lab Location</h2>
+    <p lang="ko">대전광역시 유성구 대학로 291, 한국과학기술원(KAIST) E3-5 309호</p>
+    <p>
+      Room 309, E3-5, Korea Advanced Institute of Science and Technology (KAIST),
+      291 Daehak-ro, Yuseong-gu, Daejeon, Republic of Korea
+    </p>
   </section>
 
-  <section class="section-grid" aria-labelledby="links-heading">
-    <p class="section-grid__label">Links</p>
-    <div>
-      <h2 id="links-heading">Useful Links</h2>
-      <ul class="link-list">
-        <li>
-          <a href="https://www.kaist.ac.kr/en/">KAIST</a>
-          <span>Korea Advanced Institute of Science and Technology</span>
-        </li>
-        <li>
-          <a href="https://example.com/professor">Professor Website Placeholder</a>
-          <span>Replace with the official principal investigator website.</span>
-        </li>
-        <li>
-          <a href="https://example.com/lab-resources">Lab Resource Placeholder</a>
-          <span>Replace with shared resources when available.</span>
-        </li>
-      </ul>
-    </div>
+  <section class="section-block" aria-labelledby="links-heading">
+    <h2 id="links-heading">Useful Links</h2>
+    <ul class="link-list">
+      <li><a href="https://www.kaist.ac.kr/">KAIST</a></li>
+      <li><a href="https://ssimplexity.github.io/">Professor Eunjung Kim</a></li>
+      <li><a href="https://www.wiederrecht.com/">Professor Sebastian Wiederrecht</a></li>
+    </ul>
   </section>
 </BaseLayout>

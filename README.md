@@ -37,10 +37,8 @@ Important files and folders:
 ```text
 src/layouts/BaseLayout.astro
 src/styles/global.css
-src/content.config.ts
-src/content/members/
-src/content/student-seminar/
-src/content/study-groups/
+src/assets/members/
+src/data/members/
 src/pages/index.astro
 src/pages/members.astro
 src/pages/student-seminar.astro
@@ -51,76 +49,55 @@ The pages are static. There is no backend, login, database, server route, or ext
 
 ## Editing Convention
 
-- Members edit their own member file under `src/content/members/`.
-- Student seminar organizers edit files under `src/content/student-seminar/`.
-- Study group organizers edit files under `src/content/study-groups/`.
+- Members edit or add their own JSON file under `src/data/members/`.
+- Student seminar organizers maintain seminar information once a data format is added.
+- Study group organizers maintain study group information once a data format is added.
 - Site-wide layout, styling, configuration, and deployment changes are handled by site admins.
 
 ## Add or Edit a Member
 
-Create or edit a Markdown file in `src/content/members/`.
+Create or edit one JSON file per person in `src/data/members/`.
 
 Example:
 
-```md
----
-order: 10
-name: "Placeholder Student"
-position: "Graduate Student"
-interests:
-  - "robot learning"
-  - "planning"
-contact: "placeholder@example.com"
-website: "https://example.com/placeholder"
----
+```json
+{
+  "order": 3,
+  "name": "Taein Oh",
+  "position": "Undergraduate Student, Department of Mathematical Sciences, KAIST",
+  "contact": "octanec8h18@kaist.ac.kr, +82-10-5858-5697",
+  "website": "https://octane-kr.github.io/",
+  "photo": "taein-oh.png"
+}
 ```
 
-The `order` field controls the display order on the Members page. Use clearly fake placeholder information until real member information is approved.
+The required fields are `order`, `name`, `position`, and `contact`. The `researchInterests`, `website`, and `photo` fields are optional.
+
+Use the `order` field to group members:
+
+- `0`: Lab professor / principal investigator
+- `1`: Postdoctoral researcher or Ph.D. student
+- `2`: M.S. student
+- `3`: Undergraduate student
+- `4`: Visitor
+
+People with the same `order` are sorted alphabetically by `name`.
+
+Optional fields can be added like this:
+
+```json
+{
+  "researchInterests": ["Graph algorithms", "Parameterized algorithms"],
+  "photo": "name.jpg"
+}
+```
+
+The `photo` field should be only the file name, such as `taein-oh.png`. Member photos should be stored under `src/assets/members/`; the site imports them automatically through Vite. If `photo` is omitted, the default placeholder is shown. The build fails with a clear error if a referenced photo is missing, uses a path instead of a file name, or has an unsupported extension.
 
 ## Add or Edit a Student Seminar Entry
 
-Create or edit a Markdown file in `src/content/student-seminar/`.
-
-Example:
-
-```md
----
-order: 10
-semester: "Fall 2026"
-title: "Placeholder Seminar Title"
-speaker: "Placeholder Speaker"
-date: "2026-09-01"
-location: "TBD"
-organizers:
-  - "Student seminar organizers"
----
-
-Add the abstract, paper links, or notes here.
-```
-
-The `order` field controls the display order on the Student Seminar page.
+The Student Seminar page currently shows a clean empty state. When the seminar format is decided, site admins should add a simple editable data file structure for seminar organizers to maintain.
 
 ## Add or Edit a Study Group Entry
 
-Create or edit a Markdown file in `src/content/study-groups/`.
-
-Example:
-
-```md
----
-order: 10
-semester: "Fall 2026"
-title: "Placeholder Study Group"
-topic: "Robot learning"
-startDate: "2026-09-01"
-meetingTime: "TBD"
-location: "TBD"
-coordinators:
-  - "Study group organizers"
-status: "planning"
----
-
-Add the study plan, reading list, or participation notes here.
-```
-
-The `order` field controls the display order on the Ongoing Study Groups page.
+The Ongoing Study Groups page currently shows a clean empty state. When the study group format is decided, site admins should add a simple editable data file structure for study group organizers to maintain.

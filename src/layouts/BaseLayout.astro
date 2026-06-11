@@ -1,5 +1,6 @@
 ---
 import '../styles/global.css';
+import kaistLogo from '../assets/kaist-logo.svg?url';
 
 interface Props {
   title: string;
@@ -43,8 +44,7 @@ const isActive = (href: string) => {
     <header class="site-header">
       <div class="site-header__bar">
         <a class="site-title" href="/" aria-label="GRASP Lab home">
-          <span class="site-title__name">GRASP Lab</span>
-          <span class="site-title__affiliation">KAIST</span>
+          GRASP Lab
         </a>
         <nav class="site-nav" aria-label="Primary navigation">
           {
@@ -65,8 +65,8 @@ const isActive = (href: string) => {
       <slot />
     </main>
     <footer class="site-footer">
-      <span>GRASP Lab, KAIST</span>
-      <span>Static website maintained through GitHub.</span>
+      <span>&copy; GRASP Lab</span>
+      <img src={kaistLogo} class="footer-logo" alt="" aria-hidden="true" loading="lazy" />
     </footer>
   </body>
 </html>

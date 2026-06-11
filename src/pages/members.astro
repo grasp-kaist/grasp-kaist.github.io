@@ -1,49 +1,121 @@
 ---
-import { getCollection } from 'astro:content';
+import { basename as posixBasename, extname as posixExtname } from 'node:path/posix';
+import { basename as winBasename } from 'node:path/win32';
 import BaseLayout from '../layouts/BaseLayout.astro';
 
-const members = (await getCollection('members')).sort((a, b) => {
-  return a.data.order - b.data.order || a.data.name.localeCompare(b.data.name);
+type Member = {
+  order: number;
+  name: string;
+  position: string;
+  contact: string;
+  researchInterests?: string[];
+  website?: string;
+  photo?: string;
+};
+
+type MemberWithPhotoUrl = Member & {
+  photoUrl?: string;
+};
+
+const allowedPhotoExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.svg']);
+const photoModules = import.meta.glob<string>('../assets/members/*.{jpg,jpeg,png,webp,svg}', {
+  eager: true,
+  query: '?url',
+  import: 'default',
+});
+const photoByFileName = Object.fromEntries(
+  Object.entries(photoModules).map(([path, url]) => [path.split('/').pop(), url]),
+) as Record<string, string>;
+
+function getMemberPhotoUrl(member: Member) {
+  if (!member.photo) {
+    return undefined;
+  }
+
+  const photo = member.photo;
+  const isFileNameOnly = photo === posixBasename(photo) && photo === winBasename(photo);
+
+  if (!isFileNameOnly || photo === '.' || photo === '..') {
+    throw new Error(
+      `Invalid member photo for ${member.name}: "${photo}" must be a file name only, e.g. taein-oh.png`,
+    );
+  }
+
+  const extension = posixExtname(photo).toLowerCase();
+
+  if (!allowedPhotoExtensions.has(extension)) {
+    throw new Error(
+      `Invalid member photo extension for ${member.name}: "${photo}". Allowed extensions: .jpg, .jpeg, .png, .webp, .svg`,
+    );
+  }
+
+  const photoUrl = photoByFileName[photo];
+
+  if (!photoUrl) {
+    throw new Error(`Missing member photo for ${member.name}: src/assets/members/${photo}`);
+  }
+
+  return photoUrl;
+}
+
+const modules = import.meta.glob('../data/members/*.json', { eager: true });
+const members: MemberWithPhotoUrl[] = Object.values(modules).map((module) => {
+  const member = (module as { default: Member }).default;
+  return {
+    ...member,
+    photoUrl: getMemberPhotoUrl(member),
+  };
+}).sort((a, b) => {
+  return a.order - b.order || a.name.localeCompare(b.name);
 });
 ---
 
 <BaseLayout title="Members" description="Members of GRASP Lab at KAIST.">
   <section class="page-heading">
-    <p class="page-heading__label">People</p>
     <h1>Members</h1>
-    <p class="lead">
-      Member profiles are generated from editable Markdown files under
-      <code>src/content/members</code>.
-    </p>
   </section>
 
-  <table class="members-table">
-    <thead>
-      <tr>
-        <th>Name</th>
-        <th>Position</th>
-        <th>Research Interests</th>
-        <th>Contact</th>
-      </tr>
-    </thead>
-    <tbody>
-      {
-        members.map((member) => (
-          <tr>
-            <td>
-              <span class="member-name">{member.data.name}</span>
-            </td>
-            <td>{member.data.position}</td>
-            <td>{member.data.interests.join(', ')}</td>
-            <td>
-              <span class="contact-list">
-                <span>{member.data.contact}</span>
-                {member.data.website && <a href={member.data.website}>Website</a>}
-              </span>
-            </td>
-          </tr>
-        ))
-      }
-    </tbody>
-  </table>
+  {
+    members.length > 0 ? (
+      <ul class="member-list">
+        {members.map((member) => (
+          <li class="member-profile">
+            <div class="member-profile__photo">
+              {member.photoUrl ? (
+                <img src={member.photoUrl} alt={member.name} loading="lazy" />
+              ) : (
+                <div class="member-profile__placeholder" aria-hidden="true" />
+              )}
+            </div>
+            <div class="member-profile__body">
+              <h2>{member.name}</h2>
+              <p class="member-profile__position">{member.position}</p>
+              <dl class="member-profile__details">
+                {member.researchInterests?.length ? (
+                  <div>
+                    <dt>Research Interests</dt>
+                    <dd>{member.researchInterests.join(', ')}</dd>
+                  </div>
+                ) : null}
+                <div>
+                  <dt>Contact</dt>
+                  <dd>{member.contact}</dd>
+                </div>
+                {member.website && (
+                  <div>
+                    <dt>Website</dt>
+                    <dd>
+                      <a href={member.website}>Personal website</a>
+                    </dd>
+                  </div>
+                )}
+              </dl>
+            </div>
+          </li>
+        ))}
+      </ul>
+    ) : (
+      <p class="empty-state">Current member information will be added here.</p>
+    )
+  }
 </BaseLayout>
