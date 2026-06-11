@@ -18,7 +18,7 @@ type MemberWithPhotoUrl = Member & {
 };
 
 const allowedPhotoExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.svg']);
-const photoModules = import.meta.glob<string>('../assets/members/*.{jpg,jpeg,png,webp,svg}', {
+const photoModules = import.meta.glob<string>('../data/members/*.{jpg,jpeg,png,webp,svg}', {
   eager: true,
   query: '?url',
   import: 'default',
@@ -52,7 +52,7 @@ function getMemberPhotoUrl(member: Member) {
   const photoUrl = photoByFileName[photo];
 
   if (!photoUrl) {
-    throw new Error(`Missing member photo for ${member.name}: src/assets/members/${photo}`);
+    throw new Error(`Missing member photo for ${member.name}: src/data/members/${photo}`);
   }
 
   return photoUrl;

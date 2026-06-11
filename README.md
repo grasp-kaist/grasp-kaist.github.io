@@ -37,7 +37,6 @@ Important files and folders:
 ```text
 src/layouts/BaseLayout.astro
 src/styles/global.css
-src/assets/members/
 src/data/members/
 src/pages/index.astro
 src/pages/members.astro
@@ -56,7 +55,7 @@ The pages are static. There is no backend, login, database, server route, or ext
 
 ## Add or Edit a Member
 
-Create or edit one JSON file per person in `src/data/members/`.
+Create or edit one JSON file per person in `src/data/members/`. Optional member photo files also go in this same folder.
 
 Example:
 
@@ -92,7 +91,7 @@ Optional fields can be added like this:
 }
 ```
 
-The `photo` field should be only the file name, such as `taein-oh.png`. Member photos should be stored under `src/assets/members/`; the site imports them automatically through Vite. If `photo` is omitted, the default placeholder is shown. The build fails with a clear error if a referenced photo is missing, uses a path instead of a file name, or has an unsupported extension.
+The `photo` field should be only the file name, such as `taein-oh.png`. Place the matching image file in the same `src/data/members/` folder. Supported image formats are `.jpg`, `.jpeg`, `.png`, `.webp`, and `.svg`; the site imports matching photos automatically through Vite. If `photo` is omitted, the default placeholder is shown. The build fails with a clear error if a referenced photo is missing, uses a path instead of a file name, or has an unsupported extension.
 
 ## Add or Edit a Student Seminar Entry
 
