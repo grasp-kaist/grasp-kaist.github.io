@@ -117,54 +117,69 @@ A 4:5 portrait ratio is recommended. Images with other ratios may be cropped to 
 
 ## Updating Teaching Courses
 
-Teaching courses are stored under:
+Teaching course information is stored under:
 
 ```text
 src/data/teaching/
 ```
 
-Each course lives in its own folder:
+To add a new course to the Teaching page, create a new folder under `src/data/teaching/`. It is recommended to copy the existing `example-course` folder and modify it.
+
+You can edit files directly on GitHub:
+
+https://github.com/grasp-kaist/grasp-kaist.github.io/tree/main/src/data/teaching/
+
+Each course folder should contain:
 
 ```text
-src/data/teaching/<course-slug>/
+src/data/teaching/example-course/
+src/data/teaching/example-course/index.md
+src/data/teaching/example-course/materials/
 ```
 
-The main course page is:
+### Course Page
 
-```text
-src/data/teaching/<course-slug>/index.md
-```
+The `index.md` file is the main Markdown document for the course page.
 
-The generated course URL is:
+You can freely write the course description there. For example, you may include:
 
-```text
-/teaching/<course-slug>
-```
+* offered semesters
+* course codes for each semester
+* lecturer information
+* a short summary of the course content
+* links to external course pages or resources
 
-The `index.md` file can use optional frontmatter fields:
+In Markdown, links can be written as:
 
 ```markdown
----
-title: Example Course
-semester:
-instructor:
-order: 999
----
-
-Course information will be added here.
+[display text](https://example.com/)
 ```
 
-Optional lecture materials go under:
+Please refer to `example-course/index.md` for the recommended format.
+
+### Lecture Materials
+
+Lecture materials should be placed under the course’s `materials/` folder.
+
+For example:
 
 ```text
-src/data/teaching/<course-slug>/materials/
+src/data/teaching/example-course/materials/
 ```
 
-The materials list is generated automatically from files in that folder. Supported material formats are:
+You may upload files such as syllabi, lecture notes, slides, and other course materials.
+
+The website provides search over material file names, so it is recommended to include useful information in the file names, such as the year, semester, and material type.
+
+For example:
 
 ```text
-.pdf, .ppt, .pptx, .tex, .zip, .md, .txt
+2025fall-syllabus.pdf
+2025fall-lecture-note-01.pdf
+2025fall-lecture-slide-01.pdf
 ```
+
+Please refer to the example course for the current folder structure and file naming style.
 
 ## Student Seminar and Ongoing Study Groups
 

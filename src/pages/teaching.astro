@@ -3,9 +3,6 @@ import BaseLayout from '../layouts/BaseLayout.astro';
 
 type CourseFrontmatter = {
   title?: unknown;
-  semester?: unknown;
-  instructor?: unknown;
-  order?: unknown;
 };
 
 type CourseModule = {
@@ -15,9 +12,6 @@ type CourseModule = {
 type CourseSummary = {
   slug: string;
   title: string;
-  semester?: string;
-  instructor?: string;
-  order?: number;
 };
 
 const courseModules = import.meta.glob('../data/teaching/*/index.md', { eager: true });
@@ -29,19 +23,6 @@ function getOptionalString(value: unknown) {
 
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
-}
-
-function getOptionalOrder(value: unknown) {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    return value;
-  }
-
-  if (typeof value !== 'string' || !value.trim()) {
-    return undefined;
-  }
-
-  const order = Number(value);
-  return Number.isFinite(order) ? order : undefined;
 }
 
 function getCourseSlug(path: string) {
@@ -57,16 +38,10 @@ const courses: CourseSummary[] = Object.entries(courseModules)
     return {
       slug,
       title: getOptionalString(frontmatter.title) ?? slug,
-      semester: getOptionalString(frontmatter.semester),
-      instructor: getOptionalString(frontmatter.instructor),
-      order: getOptionalOrder(frontmatter.order),
     };
   })
   .filter((course) => course.slug)
-  .sort((a, b) => {
-    const orderDifference = (a.order ?? Number.POSITIVE_INFINITY) - (b.order ?? Number.POSITIVE_INFINITY);
-    return orderDifference || a.title.localeCompare(b.title);
-  });
+  .sort((a, b) => a.title.localeCompare(b.title));
 ---
 
 <BaseLayout title="Teaching" description="Teaching information for GRASP Lab at KAIST.">
@@ -82,12 +57,6 @@ const courses: CourseSummary[] = Object.entries(courseModules)
             <h2 class="entry-title">
               <a href={`/teaching/${course.slug}`}>{course.title}</a>
             </h2>
-            {(course.semester || course.instructor) && (
-              <p class="entry-meta">
-                {course.semester && <span>{course.semester}</span>}
-                {course.instructor && <span>{course.instructor}</span>}
-              </p>
-            )}
           </li>
         ))}
       </ol>

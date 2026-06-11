@@ -4,9 +4,6 @@ import BaseLayout from '../../layouts/BaseLayout.astro';
 
 type CourseFrontmatter = {
   title?: unknown;
-  semester?: unknown;
-  instructor?: unknown;
-  order?: unknown;
 };
 
 type CourseModule = {
@@ -17,8 +14,6 @@ type CourseModule = {
 type CoursePage = {
   slug: string;
   title: string;
-  semester?: string;
-  instructor?: string;
 };
 
 type Material = {
@@ -41,7 +36,7 @@ export function getStaticPaths() {
   const courseModules = import.meta.glob('../../data/teaching/*/index.md', { eager: true });
   const materialModules = import.meta.glob<string>('../../data/teaching/*/materials/*.{pdf,ppt,pptx,tex,zip,md,txt}', {
     eager: true,
-    query: '?url',
+    query: '?url&no-inline',
     import: 'default',
   });
 
@@ -96,8 +91,6 @@ export function getStaticPaths() {
     const course: CoursePage = {
       slug,
       title: getOptionalString(frontmatter.title) ?? slug,
-      semester: getOptionalString(frontmatter.semester),
-      instructor: getOptionalString(frontmatter.instructor),
     };
 
     paths.push({
@@ -120,12 +113,6 @@ const { Content } = module;
 <BaseLayout title={course.title} description={`${course.title} teaching materials for GRASP Lab at KAIST.`}>
   <section class="page-heading">
     <h1>{course.title}</h1>
-    {(course.semester || course.instructor) && (
-      <p class="entry-meta">
-        {course.semester && <span>{course.semester}</span>}
-        {course.instructor && <span>{course.instructor}</span>}
-      </p>
-    )}
   </section>
 
   <article class="prose">
@@ -136,16 +123,199 @@ const { Content } = module;
     <h2 id="lecture-materials-heading">Lecture Materials</h2>
     {
       materials.length > 0 ? (
-        <ul class="material-list">
-          {materials.map((material) => (
-            <li>
-              <a href={material.url}>{material.fileName}</a>
-            </li>
-          ))}
-        </ul>
+        <div class="materials-widget" data-materials-widget>
+          <div class="materials-search-controls">
+            <label class="visually-hidden" for={`materials-search-${course.slug}`}>Search materials</label>
+            <input
+              id={`materials-search-${course.slug}`}
+              class="materials-search"
+              type="search"
+              placeholder="Search materials..."
+              data-materials-search
+            />
+            <button type="button" data-materials-search-button>Search</button>
+          </div>
+          <div class="materials-box">
+            <div class="materials-list-header">
+              <input
+                class="materials-master-checkbox"
+                type="checkbox"
+                data-materials-master-checkbox
+                aria-label="Toggle visible materials"
+                title="Toggle visible materials"
+              />
+              <span>Material</span>
+              <button type="button" data-download-selected>Download selected</button>
+            </div>
+            <ul class="material-list">
+              {materials.map((material) => (
+                <li class="material-row" data-material-row data-file-name={material.fileName} data-file-url={material.url}>
+                  <label class="material-checkbox">
+                    <input type="checkbox" data-material-checkbox aria-label={`Select ${material.fileName}`} />
+                  </label>
+                  <a href={material.url} download={material.fileName}>{material.fileName}</a>
+                </li>
+              ))}
+            </ul>
+            <p class="materials-no-match" hidden data-materials-no-match>No matching materials.</p>
+          </div>
+          <p class="materials-status" aria-live="polite" data-materials-status></p>
+        </div>
       ) : (
         <p class="empty-state">No lecture materials have been added yet.</p>
       )
     }
   </section>
+
+  <script>
+    for (const widget of document.querySelectorAll('[data-materials-widget]')) {
+      const searchInput = widget.querySelector<HTMLInputElement>('[data-materials-search]');
+      const rows = Array.from(widget.querySelectorAll<HTMLLIElement>('[data-material-row]'));
+      const noMatch = widget.querySelector<HTMLElement>('[data-materials-no-match]');
+      const status = widget.querySelector<HTMLElement>('[data-materials-status]');
+      const searchButton = widget.querySelector<HTMLButtonElement>('[data-materials-search-button]');
+      const masterCheckbox = widget.querySelector<HTMLInputElement>('[data-materials-master-checkbox]');
+      const downloadSelectedButton = widget.querySelector<HTMLButtonElement>('[data-download-selected]');
+
+      const setStatus = (message: string) => {
+        if (!status) {
+          return;
+        }
+
+        status.textContent = message;
+
+        if (message) {
+          window.setTimeout(() => {
+            if (status.textContent === message) {
+              status.textContent = '';
+            }
+          }, 2500);
+        }
+      };
+
+      const clearStatus = () => setStatus('');
+
+      const getCheckbox = (row: HTMLLIElement) => {
+        return row.querySelector<HTMLInputElement>('[data-material-checkbox]');
+      };
+
+      const getVisibleRows = () => rows.filter((row) => !row.hidden);
+
+      const updateMasterCheckbox = () => {
+        if (!masterCheckbox) {
+          return;
+        }
+
+        const visibleRows = getVisibleRows();
+        const checkedRows = visibleRows.filter((row) => getCheckbox(row)?.checked);
+
+        masterCheckbox.disabled = visibleRows.length === 0;
+        masterCheckbox.checked = visibleRows.length > 0 && checkedRows.length === visibleRows.length;
+        masterCheckbox.indeterminate = false;
+      };
+
+      const filterRows = () => {
+        clearStatus();
+
+        const tokens = searchInput?.value
+          .trim()
+          .toLowerCase()
+          .split(/\s+/)
+          .filter(Boolean) ?? [];
+        let visibleCount = 0;
+
+        for (const row of rows) {
+          const fileName = row.dataset.fileName?.toLowerCase() ?? '';
+          const isVisible = tokens.every((token) => fileName.includes(token));
+          row.hidden = !isVisible;
+
+          if (!isVisible) {
+            const checkbox = getCheckbox(row);
+
+            if (checkbox) {
+              checkbox.checked = false;
+            }
+          }
+
+          if (isVisible) {
+            visibleCount += 1;
+          }
+        }
+
+        if (noMatch) {
+          noMatch.hidden = visibleCount > 0;
+        }
+
+        updateMasterCheckbox();
+      };
+
+      searchButton?.addEventListener('click', filterRows);
+
+      searchInput?.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter') {
+          return;
+        }
+
+        event.preventDefault();
+        filterRows();
+      });
+
+      masterCheckbox?.addEventListener('click', () => {
+        clearStatus();
+
+        const visibleRows = getVisibleRows();
+        const allVisibleChecked = visibleRows.length > 0 && visibleRows.every((row) => getCheckbox(row)?.checked);
+        const shouldCheck = !allVisibleChecked;
+
+        for (const row of visibleRows) {
+          const checkbox = getCheckbox(row);
+
+          if (checkbox) {
+            checkbox.checked = shouldCheck;
+          }
+        }
+
+        updateMasterCheckbox();
+      });
+
+      for (const row of rows) {
+        getCheckbox(row)?.addEventListener('change', () => {
+          clearStatus();
+          updateMasterCheckbox();
+        });
+      }
+
+      updateMasterCheckbox();
+
+      downloadSelectedButton?.addEventListener('click', () => {
+        const selectedRows = rows.filter((row) => getCheckbox(row)?.checked);
+
+        if (selectedRows.length === 0) {
+          setStatus('Select at least one material.');
+          return;
+        }
+
+        selectedRows.forEach((row, index) => {
+          const fileName = row.dataset.fileName;
+          const fileUrl = row.dataset.fileUrl;
+
+          if (!fileName || !fileUrl) {
+            return;
+          }
+
+          window.setTimeout(() => {
+            const link = document.createElement('a');
+            link.href = fileUrl;
+            link.download = fileName;
+            link.rel = 'noopener';
+            document.body.append(link);
+            link.click();
+            link.remove();
+          }, index * 150);
+        });
+
+        setStatus(`Downloading ${selectedRows.length} material(s).`);
+      });
+    }
+  </script>
 </BaseLayout>

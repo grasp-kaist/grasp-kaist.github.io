@@ -1,8 +1,12 @@
 ---
-title: Example Course
-semester:
-instructor:
-order: 999
+title: "Example Course"
 ---
 
-Course information will be added here.
+## Course Information
+
+| Semester | Course Code | Lecturer(s) |
+| - | - | - |
+| 2025 Fall | CS.00000A | Example |
+| 2030 Fall | CS.00000B | TBD |
+
+Write the course description freely here.
