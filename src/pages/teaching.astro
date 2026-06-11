@@ -41,7 +41,17 @@ const courses: CourseSummary[] = Object.entries(courseModules)
     };
   })
   .filter((course) => course.slug)
-  .sort((a, b) => a.title.localeCompare(b.title));
+  .sort((a, b) => {
+    if (a.slug === 'example-course' && b.slug !== 'example-course') {
+      return 1;
+    }
+
+    if (b.slug === 'example-course' && a.slug !== 'example-course') {
+      return -1;
+    }
+
+    return a.title.localeCompare(b.title);
+  });
 ---
 
 <BaseLayout title="Teaching" description="Teaching information for GRASP Lab at KAIST.">
