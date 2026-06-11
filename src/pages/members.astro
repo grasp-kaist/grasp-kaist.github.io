@@ -105,7 +105,9 @@ const members: MemberWithPhotoUrl[] = Object.values(modules).map((module) => {
                   <div>
                     <dt>Website</dt>
                     <dd>
-                      <a href={member.website}>Personal website</a>
+                      <a class="member-profile__url" href={member.website}>
+                        {member.website}
+                      </a>
                     </dd>
                   </div>
                 )}

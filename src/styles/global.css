@@ -286,6 +286,11 @@ p {
   margin: 0;
 }
 
+.member-profile__url {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .content-entry {
   border-bottom: 1px solid var(--line);
   padding: 1.1rem 0;
