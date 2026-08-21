@@ -1,0 +1,9 @@
+*
+!bot/
+!bot/package.json
+!bot/package-lock.json
+!bot/tsconfig.json
+!bot/src/
+!bot/src/**
+!schemas/
+!schemas/member-profile.schema.json
