@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import {
   assertMemberProfile,
@@ -11,6 +11,8 @@ import {
 import { processProfilePhoto } from '../image/process-profile-photo.js';
 import { SqliteStore, type ProfileBinding, type ProfileState } from '../storage/sqlite-store.js';
 
+const STARTUP_RECONCILIATION_CONCURRENCY = 4;
+
 export type DiscordActor = {
   interactionId: string;
   guildId: string;
@@ -21,6 +23,7 @@ export type ProfileSnapshot = {
   profileSlug: string;
   profile: MemberProfile;
   bindingStatus: 'provisioning' | 'active' | 'revoked';
+  stateRevision: string;
   lastCommitSha?: string;
   lastDeploymentStatus?: string;
   membersPageUrl?: string;
@@ -126,6 +129,9 @@ export class ProfileService {
   readonly #now: () => Date;
   readonly #newOperationId: () => string;
   readonly #newStageId: () => string;
+  readonly #reconciliationTasks = new Map<string, Promise<ProfileState | undefined>>();
+  readonly #profileOperationTails = new Map<string, Promise<void>>();
+  readonly #profilesNeedingReconciliation = new Set<string>();
 
   constructor(options: {
     store: SqliteStore;
@@ -176,7 +182,10 @@ export class ProfileService {
 
     let state = this.#store.getProfileState(guildId, binding.profileSlug);
 
-    if (!state && this.#repositoryReader) {
+    if (
+      this.#repositoryReader
+      && (!state || this.#profilesNeedingReconciliation.has(profileKey(guildId, binding.profileSlug)))
+    ) {
       state = await this.#reconcileBinding(binding);
     }
 
@@ -191,7 +200,12 @@ export class ProfileService {
       );
     }
 
-    const currentBinding = this.#store.getBinding(guildId, userId) ?? binding;
+    const currentBinding = this.#store.getBinding(guildId, userId);
+
+    if (!currentBinding) {
+      return null;
+    }
+
     return this.#snapshot(currentBinding, state);
   }
 
@@ -207,35 +221,43 @@ export class ProfileService {
       return summary;
     }
 
-    await Promise.all(
-      this.#store.listBindings(this.#guildId).map(async (binding) => {
-        try {
-          const before = this.#store.getProfileState(binding.guildId, binding.profileSlug);
-          const state = await this.#reconcileBinding(binding);
+    const pendingBindings = [...this.#store.listBindings(this.#guildId)];
+    const workers = Array.from(
+      {
+        length: Math.min(STARTUP_RECONCILIATION_CONCURRENCY, pendingBindings.length),
+      },
+      async () => {
+        while (pendingBindings.length > 0) {
+          const binding = pendingBindings.shift()!;
+          try {
+            const before = this.#store.getProfileState(binding.guildId, binding.profileSlug);
+            const state = await this.#reconcileBinding(binding);
 
-          if (!state) {
-            if (!this.#store.getBinding(binding.guildId, binding.discordUserId)) {
-              summary.released += 1;
-            } else {
+            if (!state) {
+              if (!this.#store.getBinding(binding.guildId, binding.discordUserId)) {
+                summary.released += 1;
+              } else {
+                summary.unchanged += 1;
+              }
+            } else if (
+              before?.profileBlobSha === state.profileBlobSha
+              && before?.photoBlobSha === state.photoBlobSha
+              && binding.status !== 'provisioning'
+            ) {
               summary.unchanged += 1;
+            } else {
+              summary.reconciled += 1;
             }
-          } else if (
-            before?.profileBlobSha === state.profileBlobSha
-            && before?.photoBlobSha === state.photoBlobSha
-            && binding.status !== 'provisioning'
-          ) {
-            summary.unchanged += 1;
-          } else {
-            summary.reconciled += 1;
+          } catch (error) {
+            summary.issues.push({
+              profileSlug: binding.profileSlug,
+              message: toErrorMessage(error),
+            });
           }
-        } catch (error) {
-          summary.issues.push({
-            profileSlug: binding.profileSlug,
-            message: toErrorMessage(error),
-          });
         }
-      }),
+      },
     );
+    await Promise.all(workers);
 
     return summary;
   }
@@ -265,23 +287,30 @@ export class ProfileService {
       let published = false;
 
       try {
-        const publishResult = await this.#publisher.publish({
-          operationId,
-          slug,
-          action: 'PROFILE_CREATE',
-          profile: { json: serializeProfile(profile), expectedSha: null },
-        });
-        published = true;
-        const publishedState = this.#publishedStateInput(slug, profile, publishResult);
-        const { binding, state } = this.#store.activateBindingWithProfileState(
+        return await this.#withProfileOperationLock(
           actor.guildId,
-          actor.userId,
-          operationId,
-          publishedState,
+          slug,
+          'mutation',
+          async () => {
+            const publishResult = await this.#publisher.publish({
+              operationId,
+              slug,
+              action: 'PROFILE_CREATE',
+              profile: { json: serializeProfile(profile), expectedSha: null },
+            });
+            published = true;
+            const publishedState = this.#publishedStateInput(slug, profile, publishResult);
+            const { binding, state } = this.#store.activateBindingWithProfileState(
+              actor.guildId,
+              actor.userId,
+              operationId,
+              publishedState,
+            );
+            const result = this.#operationResult(binding, state);
+            this.#audit(actor, slug, 'PROFILE_CREATE', result);
+            return result;
+          },
         );
-        const result = this.#operationResult(binding, state);
-        this.#audit(actor, slug, 'PROFILE_CREATE', result);
-        return result;
       } catch (error) {
         if (!published && isDefinitelyUnpublishedRegistrationFailure(error)) {
           this.#store.removeProvisioningBinding(actor.guildId, actor.userId);
@@ -294,8 +323,14 @@ export class ProfileService {
   async updateOwnProfile(
     actor: DiscordActor,
     patch: EditableProfilePatch,
+    expectedRevision: string,
   ): Promise<ProfileOperationResult> {
-    return this.#mutateOwnProfile(actor, 'PROFILE_UPDATE', (profile) => ({ ...profile, ...patch }));
+    return this.#mutateOwnProfile(
+      actor,
+      'PROFILE_UPDATE',
+      (profile) => ({ ...profile, ...patch }),
+      expectedRevision,
+    );
   }
 
   async prepareOwnPhoto(
@@ -334,9 +369,9 @@ export class ProfileService {
     this.#store.beginInteraction(actor.interactionId, operationId, 'PROFILE_PREPARE_PHOTO');
 
     try {
-      const { binding } = this.#requireOwnActiveState(actor);
+      const { binding, state } = this.#requireOwnActiveState(actor);
       const processed = await processProfilePhoto(Buffer.from(input.bytes));
-      const stagedPhotoId = this.#newStageId();
+      const stagedPhotoId = createStagedPhotoId(this.#newStageId(), profileStateRevision(state));
       const expiresAt = new Date(this.#now().getTime() + 15 * 60 * 1000);
       this.#store.stagePhoto({
         id: stagedPhotoId,
@@ -368,45 +403,79 @@ export class ProfileService {
     stagedPhotoId: string,
   ): Promise<ProfileOperationResult> {
     return this.#runOperation(actor, 'PROFILE_REPLACE_PHOTO', async (operationId) => {
-      const { binding, state, profile } = this.#requireOwnActiveState(actor);
-      const staged = this.#store.claimStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
-
-      if (staged.profileSlug !== binding.profileSlug) {
-        this.#store.releaseStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
-        throw new ProfileServiceError('photo_owner_mismatch', 'The prepared photo does not match this profile.');
-      }
-
-      const nextProfile = normalizeMemberProfile({
-        ...profile,
-        photo: `${binding.profileSlug}.webp`,
-      });
+      const initialBinding = this.#requireBinding(actor.guildId, actor.userId);
+      let recoveryBinding = initialBinding;
 
       try {
-        const publishResult = await this.#publisher.publish({
-          operationId,
-          slug: binding.profileSlug,
-          action: 'PROFILE_REPLACE_PHOTO',
-          profile: { json: serializeProfile(nextProfile), expectedSha: state.profileBlobSha },
-          photo: {
-            kind: 'upsert',
-            bytes: staged.bytes,
-            expectedSha: state.photoBlobSha ?? null,
-          },
-        });
-        const nextState = this.#savePublishedState(
+        return await this.#withProfileOperationLock(
           actor.guildId,
-          binding.profileSlug,
-          nextProfile,
-          publishResult,
-          'upsert',
-          state,
+          initialBinding.profileSlug,
+          'mutation',
+          async () => {
+            const { binding, state, profile } = this.#requireOwnActiveState(actor);
+            this.#assertSameProfileBinding(initialBinding, binding);
+            recoveryBinding = binding;
+            const expectedRevision = stagedPhotoRevision(stagedPhotoId);
+            const staged = this.#store.claimStagedPhoto(
+              actor.guildId,
+              actor.userId,
+              stagedPhotoId,
+            );
+
+            if (staged.profileSlug !== binding.profileSlug) {
+              this.#store.releaseStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+              throw new ProfileServiceError(
+                'photo_owner_mismatch',
+                'The prepared photo does not match this profile.',
+              );
+            }
+
+            if (!expectedRevision || expectedRevision !== profileStateRevision(state)) {
+              this.#store.deleteStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+              throw profileChangedError();
+            }
+
+            const nextProfile = normalizeMemberProfile({
+              ...profile,
+              photo: `${binding.profileSlug}.webp`,
+            });
+
+            try {
+              const publishResult = await this.#publisher.publish({
+                operationId,
+                slug: binding.profileSlug,
+                action: 'PROFILE_REPLACE_PHOTO',
+                profile: { json: serializeProfile(nextProfile), expectedSha: state.profileBlobSha },
+                photo: {
+                  kind: 'upsert',
+                  bytes: staged.bytes,
+                  expectedSha: state.photoBlobSha ?? null,
+                },
+              });
+              const nextState = this.#savePublishedState(
+                actor.guildId,
+                binding.profileSlug,
+                nextProfile,
+                publishResult,
+                'upsert',
+                state,
+              );
+              this.#store.deleteStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+              const result = this.#operationResult(binding, nextState);
+              this.#audit(actor, binding.profileSlug, 'PROFILE_REPLACE_PHOTO', result);
+              return result;
+            } catch (error) {
+              this.#store.releaseStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+              throw error;
+            }
+          },
         );
-        this.#store.deleteStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
-        const result = this.#operationResult(binding, nextState);
-        this.#audit(actor, binding.profileSlug, 'PROFILE_REPLACE_PHOTO', result);
-        return result;
       } catch (error) {
-        this.#store.releaseStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+        this.#markReconciliationNeededAfterAmbiguousPublish(error, recoveryBinding);
+        if (isContentConflict(error) && this.#repositoryReader) {
+          await this.#reconcileBinding(recoveryBinding);
+        }
+
         throw error;
       }
     });
@@ -424,37 +493,82 @@ export class ProfileService {
     this.#audit(actor, staged?.profileSlug, 'PROFILE_DISCARD_PHOTO', {});
   }
 
-  async removeOwnPhoto(actor: DiscordActor): Promise<ProfileOperationResult> {
-    const current = this.#requireOwnActiveState(actor);
+  async removeOwnPhoto(actor: DiscordActor, expectedRevision: string): Promise<ProfileOperationResult> {
+    this.#assertActor(actor);
+    return this.#runOperation(actor, 'PROFILE_REMOVE_PHOTO', async (operationId) => {
+      const initialBinding = this.#requireBinding(actor.guildId, actor.userId);
+      let recoveryBinding = initialBinding;
 
-    if (!current.state.photoBlobSha && current.profile.photo === '') {
-      return this.#runOperation(actor, 'PROFILE_REMOVE_PHOTO', async () => {
-        const result = this.#operationResult(current.binding, current.state);
-        this.#audit(actor, current.binding.profileSlug, 'PROFILE_REMOVE_PHOTO_NOOP', result);
-        return result;
-      });
-    }
+      try {
+        return await this.#withProfileOperationLock(
+          actor.guildId,
+          initialBinding.profileSlug,
+          'mutation',
+          async () => {
+            const { binding, state, profile } = this.#requireOwnActiveState(actor);
+            this.#assertSameProfileBinding(initialBinding, binding);
+            recoveryBinding = binding;
+            this.#assertExpectedRevision(state, expectedRevision);
 
-    if (!current.state.photoBlobSha) {
-      throw new ProfileServiceError(
-        'photo_revision_missing',
-        'The current photo revision is missing. An owner must repair the profile state.',
-      );
-    }
+            if (!state.photoBlobSha && profile.photo === '') {
+              const result = this.#operationResult(binding, state);
+              this.#audit(actor, binding.profileSlug, 'PROFILE_REMOVE_PHOTO_NOOP', result);
+              return result;
+            }
 
-    return this.#mutateOwnProfile(
-      actor,
-      'PROFILE_REMOVE_PHOTO',
-      (profile) => ({ ...profile, photo: '' }),
-      { kind: 'delete', expectedSha: current.state.photoBlobSha },
-    );
+            if (!state.photoBlobSha) {
+              throw new ProfileServiceError(
+                'photo_revision_missing',
+                'The current photo revision is missing. An owner must repair the profile state.',
+              );
+            }
+
+            const nextProfile = normalizeMemberProfile({ ...profile, photo: '' });
+            const publishResult = await this.#publisher.publish({
+              operationId,
+              slug: binding.profileSlug,
+              action: 'PROFILE_REMOVE_PHOTO',
+              profile: { json: serializeProfile(nextProfile), expectedSha: state.profileBlobSha },
+              photo: { kind: 'delete', expectedSha: state.photoBlobSha },
+            });
+            const nextState = this.#savePublishedState(
+              actor.guildId,
+              binding.profileSlug,
+              nextProfile,
+              publishResult,
+              'delete',
+              state,
+            );
+            const result = this.#operationResult(binding, nextState);
+            this.#audit(actor, binding.profileSlug, 'PROFILE_REMOVE_PHOTO', result);
+            return result;
+          },
+        );
+      } catch (error) {
+        this.#markReconciliationNeededAfterAmbiguousPublish(error, recoveryBinding);
+        if (isContentConflict(error) && this.#repositoryReader) {
+          await this.#reconcileBinding(recoveryBinding);
+        }
+
+        throw error;
+      }
+    });
   }
 
-  async setOwnListed(actor: DiscordActor, listed: boolean): Promise<ProfileOperationResult> {
-    return this.#mutateOwnProfile(actor, 'PROFILE_SET_LISTED', (profile) => ({
-      ...profile,
-      listed,
-    }));
+  async setOwnListed(
+    actor: DiscordActor,
+    listed: boolean,
+    expectedRevision: string,
+  ): Promise<ProfileOperationResult> {
+    return this.#mutateOwnProfile(
+      actor,
+      'PROFILE_SET_LISTED',
+      (profile) => ({
+        ...profile,
+        listed,
+      }),
+      expectedRevision,
+    );
   }
 
   async ownerHide(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult> {
@@ -468,24 +582,42 @@ export class ProfileService {
   async ownerRevoke(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult> {
     this.#assertOwner(actor);
     return this.#runOperation(actor, 'PROFILE_OWNER_REVOKE', async () => {
-      const binding = this.#requireBinding(actor.guildId, targetUserId);
-      const state = this.#requireState(actor.guildId, binding.profileSlug);
-      const updated = this.#store.setBindingStatus(actor.guildId, targetUserId, 'revoked');
-      const result = this.#operationResult(updated, state);
-      this.#audit(actor, binding.profileSlug, 'PROFILE_OWNER_REVOKE', result, { targetUserId });
-      return result;
+      const initialBinding = this.#requireBinding(actor.guildId, targetUserId);
+      return this.#withProfileOperationLock(
+        actor.guildId,
+        initialBinding.profileSlug,
+        'mutation',
+        async () => {
+          const binding = this.#requireBinding(actor.guildId, targetUserId);
+          this.#assertSameProfileBinding(initialBinding, binding);
+          const state = this.#requireState(actor.guildId, binding.profileSlug);
+          const updated = this.#store.setBindingStatus(actor.guildId, targetUserId, 'revoked');
+          const result = this.#operationResult(updated, state);
+          this.#audit(actor, binding.profileSlug, 'PROFILE_OWNER_REVOKE', result, { targetUserId });
+          return result;
+        },
+      );
     });
   }
 
   async ownerRestore(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult> {
     this.#assertOwner(actor);
     return this.#runOperation(actor, 'PROFILE_OWNER_RESTORE', async () => {
-      const binding = this.#requireBinding(actor.guildId, targetUserId);
-      const state = this.#requireState(actor.guildId, binding.profileSlug);
-      const updated = this.#store.setBindingStatus(actor.guildId, targetUserId, 'active');
-      const result = this.#operationResult(updated, state);
-      this.#audit(actor, binding.profileSlug, 'PROFILE_OWNER_RESTORE', result, { targetUserId });
-      return result;
+      const initialBinding = this.#requireBinding(actor.guildId, targetUserId);
+      return this.#withProfileOperationLock(
+        actor.guildId,
+        initialBinding.profileSlug,
+        'mutation',
+        async () => {
+          const binding = this.#requireBinding(actor.guildId, targetUserId);
+          this.#assertSameProfileBinding(initialBinding, binding);
+          const state = this.#requireState(actor.guildId, binding.profileSlug);
+          const updated = this.#store.setBindingStatus(actor.guildId, targetUserId, 'active');
+          const result = this.#operationResult(updated, state);
+          this.#audit(actor, binding.profileSlug, 'PROFILE_OWNER_RESTORE', result, { targetUserId });
+          return result;
+        },
+      );
     });
   }
 
@@ -496,15 +628,24 @@ export class ProfileService {
   ): Promise<ProfileOperationResult> {
     this.#assertOwner(actor);
     return this.#runOperation(actor, 'PROFILE_OWNER_TRANSFER', async () => {
-      const source = this.#requireBinding(actor.guildId, fromUserId);
-      const state = this.#requireState(actor.guildId, source.profileSlug);
-      const binding = this.#store.transferBinding(actor.guildId, source.profileSlug, toUserId);
-      const result = this.#operationResult(binding, state);
-      this.#audit(actor, source.profileSlug, 'PROFILE_OWNER_TRANSFER', result, {
-        fromUserId,
-        toUserId,
-      });
-      return result;
+      const initialSource = this.#requireBinding(actor.guildId, fromUserId);
+      return this.#withProfileOperationLock(
+        actor.guildId,
+        initialSource.profileSlug,
+        'mutation',
+        async () => {
+          const source = this.#requireBinding(actor.guildId, fromUserId);
+          this.#assertSameProfileBinding(initialSource, source);
+          const state = this.#requireState(actor.guildId, source.profileSlug);
+          const binding = this.#store.transferBinding(actor.guildId, source.profileSlug, toUserId);
+          const result = this.#operationResult(binding, state);
+          this.#audit(actor, source.profileSlug, 'PROFILE_OWNER_TRANSFER', result, {
+            fromUserId,
+            toUserId,
+          });
+          return result;
+        },
+      );
     });
   }
 
@@ -524,10 +665,18 @@ export class ProfileService {
     actor: DiscordActor,
     action: ProfilePublishInput['action'],
     mutate: (profile: MemberProfile) => MemberProfile,
-    photo?: ProfilePublishInput['photo'],
+    expectedRevision: string,
   ) {
     this.#assertActor(actor);
-    return this.#mutateTargetProfile(actor, actor.userId, action, mutate, photo, true);
+    return this.#mutateTargetProfile(
+      actor,
+      actor.userId,
+      action,
+      mutate,
+      undefined,
+      true,
+      expectedRevision,
+    );
   }
 
   async #mutateTargetProfile(
@@ -537,46 +686,61 @@ export class ProfileService {
     mutate: (profile: MemberProfile) => MemberProfile,
     photo?: ProfilePublishInput['photo'],
     requireActive = false,
+    expectedRevision?: string,
   ): Promise<ProfileOperationResult> {
     return this.#runOperation(actor, action, async (operationId) => {
-      const binding = this.#requireBinding(actor.guildId, targetUserId);
-
-      if (requireActive && binding.status !== 'active') {
-        throw new ProfileServiceError('profile_revoked', 'This profile is currently revoked.');
-      }
-
-      const state = this.#requireState(actor.guildId, binding.profileSlug);
-      const profile = parseProfile(state.profileJson);
-      const nextProfile = normalizeMemberProfile(mutate(profile));
-      let publishResult: ProfilePublishResult;
+      const initialBinding = this.#requireBinding(actor.guildId, targetUserId);
+      let recoveryBinding = initialBinding;
 
       try {
-        publishResult = await this.#publisher.publish({
-          operationId,
-          slug: binding.profileSlug,
-          action,
-          profile: { json: serializeProfile(nextProfile), expectedSha: state.profileBlobSha },
-          ...(photo ? { photo } : {}),
-        });
+        return await this.#withProfileOperationLock(
+          actor.guildId,
+          initialBinding.profileSlug,
+          'mutation',
+          async () => {
+            const binding = this.#requireBinding(actor.guildId, targetUserId);
+            this.#assertSameProfileBinding(initialBinding, binding);
+            recoveryBinding = binding;
+
+            if (requireActive && binding.status !== 'active') {
+              throw new ProfileServiceError('profile_revoked', 'This profile is currently revoked.');
+            }
+
+            const state = this.#requireState(actor.guildId, binding.profileSlug);
+            if (expectedRevision) {
+              this.#assertExpectedRevision(state, expectedRevision);
+            }
+            const profile = parseProfile(state.profileJson);
+            const nextProfile = normalizeMemberProfile(mutate(profile));
+            const publishResult = await this.#publisher.publish({
+              operationId,
+              slug: binding.profileSlug,
+              action,
+              profile: { json: serializeProfile(nextProfile), expectedSha: state.profileBlobSha },
+              ...(photo ? { photo } : {}),
+            });
+            const photoChange = photo?.kind;
+            const nextState = this.#savePublishedState(
+              actor.guildId,
+              binding.profileSlug,
+              nextProfile,
+              publishResult,
+              photoChange,
+              state,
+            );
+            const result = this.#operationResult(binding, nextState);
+            this.#audit(actor, binding.profileSlug, action, result, { targetUserId });
+            return result;
+          },
+        );
       } catch (error) {
+        this.#markReconciliationNeededAfterAmbiguousPublish(error, recoveryBinding);
         if (isContentConflict(error) && this.#repositoryReader) {
-          await this.#reconcileBinding(binding);
+          await this.#reconcileBinding(recoveryBinding);
         }
 
         throw error;
       }
-      const photoChange = photo?.kind;
-      const nextState = this.#savePublishedState(
-        actor.guildId,
-        binding.profileSlug,
-        nextProfile,
-        publishResult,
-        photoChange,
-        state,
-      );
-      const result = this.#operationResult(binding, nextState);
-      this.#audit(actor, binding.profileSlug, action, result, { targetUserId });
-      return result;
     });
   }
 
@@ -593,6 +757,42 @@ export class ProfileService {
   }
 
   async #reconcileBinding(binding: ProfileBinding): Promise<ProfileState | undefined> {
+    const key = profileKey(binding.guildId, binding.profileSlug);
+    const existingTask = this.#reconciliationTasks.get(key);
+
+    if (existingTask) {
+      return existingTask;
+    }
+
+    const task = this.#withProfileOperationLock(
+      binding.guildId,
+      binding.profileSlug,
+      'recovery',
+      () => {
+        const currentBinding = this.#store.getBinding(binding.guildId, binding.discordUserId);
+
+        if (!currentBinding || currentBinding.profileSlug !== binding.profileSlug) {
+          return Promise.resolve(undefined);
+        }
+
+        return this.#reconcileBindingOnce(currentBinding);
+      },
+    ).then((state) => {
+      if (state) {
+        this.#profilesNeedingReconciliation.delete(key);
+      }
+
+      return state;
+    }).finally(() => {
+      if (this.#reconciliationTasks.get(key) === task) {
+        this.#reconciliationTasks.delete(key);
+      }
+    });
+    this.#reconciliationTasks.set(key, task);
+    return task;
+  }
+
+  async #reconcileBindingOnce(binding: ProfileBinding): Promise<ProfileState | undefined> {
     if (!this.#repositoryReader) {
       return this.#store.getProfileState(binding.guildId, binding.profileSlug);
     }
@@ -660,6 +860,63 @@ export class ProfileService {
     }
 
     return this.#store.saveProfileState({ guildId: binding.guildId, ...recoveredInput });
+  }
+
+  async #withProfileOperationLock<T>(
+    guildId: string,
+    profileSlug: string,
+    kind: 'mutation' | 'recovery',
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const key = `${guildId}\0${profileSlug}`;
+    const previous = this.#profileOperationTails.get(key);
+
+    if (kind === 'mutation' && previous) {
+      throw new ProfileServiceError(
+        'profile_busy',
+        'This profile is being recovered or updated. Reopen `/profile` and try again shortly.',
+      );
+    }
+
+    const waitForPrevious = previous ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = waitForPrevious.then(() => current);
+    this.#profileOperationTails.set(key, tail);
+
+    await waitForPrevious;
+
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.#profileOperationTails.get(key) === tail) {
+        this.#profileOperationTails.delete(key);
+      }
+    }
+  }
+
+  #assertSameProfileBinding(expected: ProfileBinding, current: ProfileBinding) {
+    if (expected.profileSlug !== current.profileSlug) {
+      throw new ProfileServiceError(
+        'profile_binding_changed',
+        'The profile binding changed while this operation was waiting. Reopen `/profile`.',
+      );
+    }
+  }
+
+  #assertExpectedRevision(state: ProfileState, expectedRevision: string) {
+    if (profileStateRevision(state) !== expectedRevision) {
+      throw profileChangedError();
+    }
+  }
+
+  #markReconciliationNeededAfterAmbiguousPublish(error: unknown, binding: ProfileBinding) {
+    if (isPublicationTimeout(error)) {
+      this.#profilesNeedingReconciliation.add(profileKey(binding.guildId, binding.profileSlug));
+    }
   }
 
   async #getRecoveredDeploymentStatus(remote: RepositoryProfileSnapshot) {
@@ -813,6 +1070,7 @@ export class ProfileService {
       profileSlug: binding.profileSlug,
       profile: parseProfile(state.profileJson),
       bindingStatus: binding.status,
+      stateRevision: profileStateRevision(state),
       lastDeploymentStatus: state.lastDeploymentStatus,
     };
 
@@ -893,6 +1151,39 @@ function toErrorMessage(error: unknown) {
 
 function isContentConflict(error: unknown) {
   return isRecord(error) && error.code === 'content_conflict';
+}
+
+function isPublicationTimeout(error: unknown) {
+  return isRecord(error) && error.code === 'publication_timeout';
+}
+
+function profileKey(guildId: string, profileSlug: string) {
+  return `${guildId}\0${profileSlug}`;
+}
+
+function profileStateRevision(state: ProfileState) {
+  return createHash('sha256')
+    .update(state.profileBlobSha)
+    .update('\0')
+    .update(state.photoBlobSha ?? '')
+    .digest('hex')
+    .slice(0, 20);
+}
+
+function createStagedPhotoId(baseId: string, revision: string) {
+  const maxBaseLength = 64 - 1 - revision.length;
+  return `${baseId.slice(0, maxBaseLength)}-${revision}`;
+}
+
+function stagedPhotoRevision(stagedPhotoId: string) {
+  return /-([0-9a-f]{20})$/.exec(stagedPhotoId)?.[1];
+}
+
+function profileChangedError() {
+  return new ProfileServiceError(
+    'profile_changed',
+    'The profile changed after this panel was opened. Reopen `/profile` and try again.',
+  );
 }
 
 function isDefinitelyUnpublishedRegistrationFailure(error: unknown) {

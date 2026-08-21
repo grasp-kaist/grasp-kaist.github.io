@@ -19,6 +19,7 @@ const GUILD_ID = '222222222222222222';
 const USER_ID = '333333333333333333';
 const OWNER_ID = '444444444444444444';
 const TARGET_ID = '555555555555555555';
+const STATE_REVISION = '0123456789abcdefabcd';
 
 test('register uses only a local probe before opening a current Label modal', async () => {
   let localProbes = 0;
@@ -139,7 +140,10 @@ test('profile edit button opens its modal from local state without a repository 
 
   const routed = await harness.router.route(componentInteraction('profile:edit-basic'));
   assert.equal(routed.response.type, 9);
-  assert.equal(routed.response.data?.custom_id, 'profile-basic:v1');
+  assert.equal(
+    routed.response.data?.custom_id,
+    `profile-basic:v1:${STATE_REVISION}`,
+  );
   assert.equal(localProbes, 1);
   assert.equal(profileReads, 0);
 });
@@ -186,12 +190,12 @@ test('profile edit modal defers an update and replaces the stale panel with its 
   const updated = snapshot();
   updated.profile.name = 'Updated Member';
   const harness = createHarness({
-    updateOwnProfile: async (actor, patch) => {
-      updateInput = { actor, patch };
+    updateOwnProfile: async (actor, patch, expectedRevision) => {
+      updateInput = { actor, patch, expectedRevision };
       return { snapshot: updated, commitSha: 'updated-commit' };
     },
   });
-  const interaction = modalInteraction('profile-basic:v1', [
+  const interaction = modalInteraction(`profile-basic:v1:${STATE_REVISION}`, [
     labelText('name', 'Updated Member'),
     labelText('position', 'Graduate Student, KAIST'),
   ]);
@@ -204,6 +208,7 @@ test('profile edit modal defers an update and replaces the stale panel with its 
   assert.deepEqual(updateInput, {
     actor: { interactionId: interaction.id, guildId: GUILD_ID, userId: USER_ID },
     patch: { name: 'Updated Member', position: 'Graduate Student, KAIST' },
+    expectedRevision: STATE_REVISION,
   });
   const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
   assert.equal(components[0]?.type, 10);
@@ -213,6 +218,47 @@ test('profile edit modal defers an update and replaces the stale panel with its 
     (component) => component.type === 10,
   );
   assert.match(String(summary?.content), /Updated Member/);
+});
+
+test('text and category forms pass their rendered state revision to the service', async () => {
+  const calls: unknown[] = [];
+  const harness = createHarness({
+    updateOwnProfile: async (_actor, patch, expectedRevision) => {
+      calls.push({ patch, expectedRevision });
+      return {};
+    },
+  });
+  const text = await harness.router.route(
+    modalInteraction(`profile-text:v1:${STATE_REVISION}`, [
+      labelText('details', 'First detail\nSecond detail'),
+      labelText('research_interests', 'Verification'),
+      labelText('contact', ''),
+      labelText('website', 'example.org'),
+    ]),
+  );
+  const category = await harness.router.route(
+    modalInteraction(`profile-category:v1:${STATE_REVISION}`, [
+      {
+        type: 18,
+        component: { type: 3, custom_id: 'category', values: ['2'] },
+      },
+    ]),
+  );
+
+  await text.afterResponse?.();
+  await category.afterResponse?.();
+  assert.deepEqual(calls, [
+    {
+      patch: {
+        details: ['First detail', 'Second detail'],
+        researchInterests: ['Verification'],
+        contact: [],
+        website: 'example.org',
+      },
+      expectedRevision: STATE_REVISION,
+    },
+    { patch: { order: 2 }, expectedRevision: STATE_REVISION },
+  ]);
 });
 
 test('photo modal resolves and downloads the selected attachment only after deferring', async () => {
@@ -298,6 +344,54 @@ test('photo confirmation defers an update and service revalidates the staged ID'
   assert.deepEqual(harness.edits[0]?.payload.attachments, []);
   const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
   assert.equal(components.some((component) => component.type === 17), true);
+});
+
+test('direct profile actions pass the panel state revision to the service', async () => {
+  const calls: unknown[] = [];
+  const harness = createHarness({
+    removeOwnPhoto: async (actor, expectedRevision) => {
+      calls.push({ action: 'remove', actor, expectedRevision });
+      return {};
+    },
+    setOwnListed: async (actor, listed, expectedRevision) => {
+      calls.push({ action: 'listed', actor, listed, expectedRevision });
+      return {};
+    },
+  });
+
+  const remove = await harness.router.route(
+    componentInteraction(`profile:remove-photo:${STATE_REVISION}`),
+  );
+  const listed = await harness.router.route(
+    componentInteraction(`profile:set-listed:1:${STATE_REVISION}`),
+  );
+  assert.equal(remove.response.type, 6);
+  assert.equal(listed.response.type, 6);
+  assert.deepEqual(calls, []);
+
+  await remove.afterResponse?.();
+  await listed.afterResponse?.();
+  assert.deepEqual(calls, [
+    {
+      action: 'remove',
+      actor: {
+        interactionId: '999999999999999999',
+        guildId: GUILD_ID,
+        userId: USER_ID,
+      },
+      expectedRevision: STATE_REVISION,
+    },
+    {
+      action: 'listed',
+      actor: {
+        interactionId: '999999999999999999',
+        guildId: GUILD_ID,
+        userId: USER_ID,
+      },
+      listed: true,
+      expectedRevision: STATE_REVISION,
+    },
+  ]);
 });
 
 test('photo cancellation discards only the staged photo named by the button', async () => {
@@ -408,6 +502,7 @@ function defaultService(): ProfileService {
 function snapshot(): ProfileSnapshot {
   return {
     profileSlug: 'taein-oh',
+    stateRevision: STATE_REVISION,
     bindingStatus: 'active',
     profile: createEmptyProfile({
       name: 'Taein Oh',

@@ -4,6 +4,9 @@ import test from 'node:test';
 import { createEmptyProfile } from '../src/domain/member-profile.js';
 import { guildCommands, registerGuildCommands } from '../src/discord/commands.js';
 import {
+  categoryModalResponse,
+  editBasicModalResponse,
+  editTextModalResponse,
   IS_COMPONENTS_V2_FLAG,
   photoUploadModalResponse,
   preparedPhotoPreviewEdit,
@@ -11,6 +14,8 @@ import {
   registerModalResponse,
 } from '../src/discord/payloads.js';
 import type { ProfileSnapshot } from '../src/discord/types.js';
+
+const STATE_REVISION = '0123456789abcdefabcd';
 
 test('guild commands expose fixed category choices and no destructive delete command', () => {
   const register = guildCommands.find((command) => command.name === 'register');
@@ -103,6 +108,30 @@ test('profile panel is ephemeral Components V2 with bounded action rows', () => 
       (row) => (row.components as Array<Record<string, unknown>>).length <= 5,
     ),
   );
+
+  const actionCustomIds = rows.flatMap((row) =>
+    (row.components as Array<Record<string, unknown>>).map((button) => button.custom_id),
+  );
+  assert.ok(actionCustomIds.includes(`profile:remove-photo:${STATE_REVISION}`));
+  assert.ok(actionCustomIds.includes(`profile:set-listed:1:${STATE_REVISION}`));
+});
+
+test('profile edit modals bind submissions to the rendered state revision', () => {
+  const current = snapshot();
+
+  assert.equal(
+    editBasicModalResponse(current).data?.custom_id,
+    `profile-basic:v1:${STATE_REVISION}`,
+  );
+  assert.equal(
+    editTextModalResponse(current).data?.custom_id,
+    `profile-text:v1:${STATE_REVISION}`,
+  );
+  assert.equal(
+    categoryModalResponse(current).data?.custom_id,
+    `profile-category:v1:${STATE_REVISION}`,
+  );
+  assert.equal(photoUploadModalResponse().data?.custom_id, 'profile-photo:v1');
 });
 
 test('prepared photo preview attaches WebP and binds confirm/cancel to its token', () => {
@@ -139,6 +168,7 @@ test('prepared photo preview attaches WebP and binds confirm/cancel to its token
 function snapshot(): ProfileSnapshot {
   return {
     profileSlug: 'example',
+    stateRevision: STATE_REVISION,
     bindingStatus: 'active',
     profile: createEmptyProfile({
       name: 'Example Member',

@@ -10,6 +10,7 @@ export type ProfileBindingStatus = 'provisioning' | 'active' | 'revoked';
 
 export type ProfileSnapshot = {
   profileSlug: string;
+  stateRevision: string;
   profile: MemberProfile;
   bindingStatus: ProfileBindingStatus;
   lastCommitSha?: string;
@@ -58,6 +59,7 @@ export type ProfileService = {
   updateOwnProfile(
     actor: DiscordActor,
     patch: EditableProfilePatch,
+    expectedRevision: string,
   ): Promise<ProfileOperationResult>;
   prepareOwnPhoto(
     actor: DiscordActor,
@@ -65,8 +67,15 @@ export type ProfileService = {
   ): Promise<PreparedProfilePhoto>;
   confirmOwnPhoto(actor: DiscordActor, stagedPhotoId: string): Promise<ProfileOperationResult>;
   discardOwnPhoto(actor: DiscordActor, stagedPhotoId: string): Promise<void>;
-  removeOwnPhoto(actor: DiscordActor): Promise<ProfileOperationResult>;
-  setOwnListed(actor: DiscordActor, listed: boolean): Promise<ProfileOperationResult>;
+  removeOwnPhoto(
+    actor: DiscordActor,
+    expectedRevision: string,
+  ): Promise<ProfileOperationResult>;
+  setOwnListed(
+    actor: DiscordActor,
+    listed: boolean,
+    expectedRevision: string,
+  ): Promise<ProfileOperationResult>;
   ownerHide(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult>;
   ownerRevoke(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult>;
   ownerRestore(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult>;

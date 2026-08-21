@@ -13,6 +13,7 @@ export const IS_COMPONENTS_V2_FLAG = 1 << 15;
 
 const PROFILE_ACCENT_COLOR = 0x315795;
 const PHOTO_TOKEN_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const PROFILE_REVISION_PATTERN = /^[0-9a-f]{20}$/;
 
 export function pongResponse(): DiscordInteractionResponse {
   return { type: 1 };
@@ -99,10 +100,11 @@ export function registerModalResponse(order: MemberOrder): DiscordInteractionRes
 }
 
 export function editBasicModalResponse(snapshot: ProfileSnapshot): DiscordInteractionResponse {
+  const revision = assertProfileRevision(snapshot.stateRevision);
   return {
     type: 9,
     data: {
-      custom_id: 'profile-basic:v1',
+      custom_id: `profile-basic:v1:${revision}`,
       title: 'Edit name and position',
       components: [
         {
@@ -137,10 +139,11 @@ export function editBasicModalResponse(snapshot: ProfileSnapshot): DiscordIntera
 }
 
 export function editTextModalResponse(snapshot: ProfileSnapshot): DiscordInteractionResponse {
+  const revision = assertProfileRevision(snapshot.stateRevision);
   return {
     type: 9,
     data: {
-      custom_id: 'profile-text:v1',
+      custom_id: `profile-text:v1:${revision}`,
       title: 'Edit profile information',
       components: [
         paragraphInput('Details', 'details', snapshot.profile.details, 2_000),
@@ -169,10 +172,11 @@ export function editTextModalResponse(snapshot: ProfileSnapshot): DiscordInterac
 }
 
 export function categoryModalResponse(snapshot: ProfileSnapshot): DiscordInteractionResponse {
+  const revision = assertProfileRevision(snapshot.stateRevision);
   return {
     type: 9,
     data: {
-      custom_id: 'profile-category:v1',
+      custom_id: `profile-category:v1:${revision}`,
       title: 'Member category',
       components: [
         {
@@ -240,6 +244,7 @@ export function profilePanelEdit(
 }
 
 function profilePanelComponents(snapshot: ProfileSnapshot, notice?: string) {
+  const revision = assertProfileRevision(snapshot.stateRevision);
   const category = memberCategories.find(({ order }) => order === snapshot.profile.order)?.label;
   const profile = snapshot.profile;
   const statusText = snapshot.bindingStatus === 'active' ? '' : `\nStatus: **${snapshot.bindingStatus}**`;
@@ -274,10 +279,10 @@ function profilePanelComponents(snapshot: ProfileSnapshot, notice?: string) {
       {
         type: 1,
         components: [
-          button('Remove photo', 'profile:remove-photo', 4),
+          button('Remove photo', `profile:remove-photo:${revision}`, 4),
           button(
             profile.listed ? 'Hide from website' : 'Show on website',
-            `profile:set-listed:${profile.listed ? '0' : '1'}`,
+            `profile:set-listed:${profile.listed ? '0' : '1'}:${revision}`,
             profile.listed ? 2 : 3,
           ),
         ],
@@ -399,6 +404,14 @@ export function photoFlowFinishedEdit(message: string): DiscordMessagePayload {
 export function assertPhotoToken(value: string) {
   if (!PHOTO_TOKEN_PATTERN.test(value)) {
     throw new Error('Prepared photo token must be 1-64 URL-safe characters.');
+  }
+
+  return value;
+}
+
+function assertProfileRevision(value: string) {
+  if (!PROFILE_REVISION_PATTERN.test(value)) {
+    throw new Error('Profile state revision must be 20 lowercase hexadecimal characters.');
   }
 
   return value;

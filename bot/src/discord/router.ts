@@ -251,20 +251,28 @@ export class DiscordInteractionRouter {
 
     const actor = this.#actor(interaction, userId);
 
-    if (customId === 'profile:remove-photo') {
+    const removePhotoMatch = customId.match(/^profile:remove-photo:([0-9a-f]{20})$/);
+
+    if (removePhotoMatch) {
+      const expectedRevision = removePhotoMatch[1]!;
       return this.#deferredMutation(
         interaction,
-        () => this.#service.removeOwnPhoto(actor),
+        () => this.#service.removeOwnPhoto(actor, expectedRevision),
         'Your profile photo was removed.',
         true,
       );
     }
 
-    if (customId === 'profile:set-listed:0' || customId === 'profile:set-listed:1') {
-      const listed = customId.endsWith(':1');
+    const setListedMatch = customId.match(
+      /^profile:set-listed:([01]):([0-9a-f]{20})$/,
+    );
+
+    if (setListedMatch) {
+      const listed = setListedMatch[1] === '1';
+      const expectedRevision = setListedMatch[2]!;
       return this.#deferredMutation(
         interaction,
-        () => this.#service.setOwnListed(actor, listed),
+        () => this.#service.setOwnListed(actor, listed, expectedRevision),
         listed
           ? 'Your profile is now shown on the Members page.'
           : 'Your profile is now hidden from the Members page.',
@@ -315,6 +323,15 @@ export class DiscordInteractionRouter {
     const customId = interaction.data?.custom_id;
     const actor = this.#actor(interaction, userId);
     const registrationMatch = customId?.match(/^register:v1:([0-5])$/);
+    const basicProfileMatch = customId?.match(
+      /^profile-basic:v1:([0-9a-f]{20})$/,
+    );
+    const textProfileMatch = customId?.match(
+      /^profile-text:v1:([0-9a-f]{20})$/,
+    );
+    const categoryProfileMatch = customId?.match(
+      /^profile-category:v1:([0-9a-f]{20})$/,
+    );
 
     if (registrationMatch) {
       const order = Number(registrationMatch[1]);
@@ -334,18 +351,25 @@ export class DiscordInteractionRouter {
       );
     }
 
-    if (customId === 'profile-basic:v1') {
+    if (basicProfileMatch) {
+      const expectedRevision = basicProfileMatch[1]!;
       const name = limitedRequiredText(interaction, 'name', 80);
       const position = limitedRequiredText(interaction, 'position', 160);
       return this.#deferredMutation(
         interaction,
-        () => this.#service.updateOwnProfile(actor, { name, position }),
+        () =>
+          this.#service.updateOwnProfile(
+            actor,
+            { name, position },
+            expectedRevision,
+          ),
         'Your name and position were updated.',
         true,
       );
     }
 
-    if (customId === 'profile-text:v1') {
+    if (textProfileMatch) {
+      const expectedRevision = textProfileMatch[1]!;
       const details = limitedOptionalText(interaction, 'details', 2_000);
       const researchInterests = limitedOptionalText(
         interaction,
@@ -357,22 +381,27 @@ export class DiscordInteractionRouter {
       return this.#deferredMutation(
         interaction,
         () =>
-          this.#service.updateOwnProfile(actor, {
-            details: splitModalLines(details),
-            researchInterests: splitModalLines(researchInterests),
-            contact: splitModalLines(contact),
-            website,
-          }),
+          this.#service.updateOwnProfile(
+            actor,
+            {
+              details: splitModalLines(details),
+              researchInterests: splitModalLines(researchInterests),
+              contact: splitModalLines(contact),
+              website,
+            },
+            expectedRevision,
+          ),
         'Your profile information was updated.',
         true,
       );
     }
 
-    if (customId === 'profile-category:v1') {
+    if (categoryProfileMatch) {
+      const expectedRevision = categoryProfileMatch[1]!;
       const order = getModalMemberOrder(interaction);
       return this.#deferredMutation(
         interaction,
-        () => this.#service.updateOwnProfile(actor, { order }),
+        () => this.#service.updateOwnProfile(actor, { order }, expectedRevision),
         'Your member category was updated.',
         true,
       );

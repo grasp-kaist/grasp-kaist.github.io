@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { assertMemberProfile, type MemberProfile } from '../domain/member-profile.js';
 
@@ -9,6 +10,7 @@ const OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SHA_PATTERN = /^[0-9a-f]{40}$/i;
 
 export const PROFILE_PUBLISH_REQUEST_TIMEOUT_MS = 10_000;
+export const PROFILE_PUBLISH_TIMEOUT_MS = 810_000;
 
 export type GitHubResponse = {
   data: unknown;
@@ -19,6 +21,7 @@ export type GitHubResponse = {
 export type GitHubRequest = (
   route: string,
   parameters: Record<string, unknown>,
+  signal?: AbortSignal,
 ) => Promise<GitHubResponse>;
 
 export type ProfilePublishAction =
@@ -101,6 +104,7 @@ export type PublisherErrorCode =
   | 'deploy_failed'
   | 'deploy_timeout'
   | 'pages_timeout'
+  | 'publication_timeout'
   | 'github_response_invalid';
 
 export class ProfilePublisherError extends Error {
@@ -120,13 +124,14 @@ export type GitHubProfilePublisherOptions = {
   defaultBranch?: string;
   validateWorkflow?: string;
   deployWorkflow?: string;
-  sleep?: (milliseconds: number) => Promise<void>;
+  sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   now?: () => number;
   pollIntervalMs?: number;
   workflowDiscoveryTimeoutMs?: number;
   validationTimeoutMs?: number;
   deployTimeoutMs?: number;
   pagesTimeoutMs?: number;
+  publishTimeoutMs?: number;
   maxConflictAttempts?: number;
   stateStore?: PublishStateStore;
   onWarning?: (message: string, error: unknown) => void;
@@ -139,13 +144,14 @@ type NormalizedOptions = {
   defaultBranch: string;
   validateWorkflow: string;
   deployWorkflow: string;
-  sleep: (milliseconds: number) => Promise<void>;
+  sleep: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   now: () => number;
   pollIntervalMs: number;
   workflowDiscoveryTimeoutMs: number;
   validationTimeoutMs: number;
   deployTimeoutMs: number;
   pagesTimeoutMs: number;
+  publishTimeoutMs: number;
   maxConflictAttempts: number;
   stateStore?: PublishStateStore;
   onWarning: (message: string, error: unknown) => void;
@@ -191,8 +197,31 @@ export class GitHubProfilePublisher {
   }
 
   async publish(input: ProfilePublishInput): Promise<PublishResult> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      controller.abort(publicationTimeoutError());
+    }, this.options.publishTimeoutMs);
+
+    try {
+      return await this.publishWithSignal(input, controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw publicationTimeoutReason(controller.signal, error);
+      }
+
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async publishWithSignal(
+    input: ProfilePublishInput,
+    signal: AbortSignal,
+  ): Promise<PublishResult> {
     const prepared = prepareInput(input);
     const prior = await this.options.stateStore?.load(prepared.operationId);
+    signal.throwIfAborted();
 
     if (prior) {
       assertMatchingCheckpoint(prior, prepared);
@@ -206,6 +235,7 @@ export class GitHubProfilePublisher {
         prior.attempts,
         prior.profileBlobSha,
         prior.photoBlobSha,
+        signal,
       );
       await this.saveCompleted(prepared, resumed);
       return resumed;
@@ -215,7 +245,7 @@ export class GitHubProfilePublisher {
       let temporaryRef: string | undefined;
 
       try {
-        const candidate = await this.createCandidate(prepared);
+        const candidate = await this.createCandidate(prepared, signal);
 
         if (!candidate.headSha) {
           const noChange = resultWithOptionalPhoto({
@@ -223,12 +253,13 @@ export class GitHubProfilePublisher {
             attempts: attempt,
             profileBlobSha: candidate.profileBlobSha,
           }, candidate.photoBlobSha);
+          signal.throwIfAborted();
           await this.saveCompleted(prepared, noChange);
           return noChange;
         }
 
         temporaryRef = temporaryBranchName(prepared, attempt);
-        await this.createTemporaryRef(temporaryRef, candidate.headSha);
+        await this.createTemporaryRef(temporaryRef, candidate.headSha, signal);
         await this.awaitWorkflow({
           workflow: this.options.validateWorkflow,
           branch: temporaryRef,
@@ -237,9 +268,9 @@ export class GitHubProfilePublisher {
           failureErrorCode: 'validation_failed',
           timeoutErrorCode: 'validation_timeout',
           completionTimeoutMs: this.options.validationTimeoutMs,
-        });
+        }, signal);
 
-        await this.promoteMain(candidate.baseSha, candidate.headSha);
+        await this.promoteMain(candidate.baseSha, candidate.headSha, signal);
         await this.saveMainUpdated(prepared, candidate, attempt);
         await this.cleanupTemporaryRef(temporaryRef);
         temporaryRef = undefined;
@@ -249,6 +280,7 @@ export class GitHubProfilePublisher {
           attempt,
           candidate.profileBlobSha,
           candidate.photoBlobSha,
+          signal,
         );
         await this.saveCompleted(prepared, result);
         return result;
@@ -274,24 +306,25 @@ export class GitHubProfilePublisher {
     throw new ProfilePublisherError('main_conflict', 'Publication attempts were exhausted.');
   }
 
-  private async createCandidate(input: PreparedInput): Promise<Candidate> {
-    const baseSha = await this.getBranchSha(this.options.defaultBranch);
+  private async createCandidate(input: PreparedInput, signal: AbortSignal): Promise<Candidate> {
+    const baseSha = await this.getBranchSha(this.options.defaultBranch, signal);
     const commit = await this.requestData(
       'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
       { commit_sha: baseSha },
+      signal,
     );
     const baseTreeSha = requireNestedString(commit, ['tree', 'sha'], 'base commit tree SHA');
 
-    const currentProfileSha = await this.getContentSha(input.profilePath, baseSha);
+    const currentProfileSha = await this.getContentSha(input.profilePath, baseSha, signal);
     assertExpectedSha(input.profilePath, input.profile.expectedSha, currentProfileSha);
 
     let currentPhotoSha: string | null | undefined;
     if (input.photo) {
-      currentPhotoSha = await this.getContentSha(input.photoPath, baseSha);
+      currentPhotoSha = await this.getContentSha(input.photoPath, baseSha, signal);
       assertExpectedSha(input.photoPath, input.photo.expectedSha, currentPhotoSha);
     }
 
-    const profileBlobSha = await this.createBlob(input.profile.json, 'utf-8');
+    const profileBlobSha = await this.createBlob(input.profile.json, 'utf-8', signal);
     const treeEntries: Record<string, unknown>[] = [
       {
         path: input.profilePath,
@@ -311,7 +344,11 @@ export class GitHubProfilePublisher {
 
     let photoBlobSha: string | null | undefined;
     if (input.photo?.kind === 'upsert') {
-      photoBlobSha = await this.createBlob(Buffer.from(input.photo.bytes).toString('base64'), 'base64');
+      photoBlobSha = await this.createBlob(
+        Buffer.from(input.photo.bytes).toString('base64'),
+        'base64',
+        signal,
+      );
       treeEntries.push({
         path: input.photoPath,
         mode: '100644',
@@ -339,7 +376,7 @@ export class GitHubProfilePublisher {
     const tree = await this.requestData('POST /repos/{owner}/{repo}/git/trees', {
       base_tree: baseTreeSha,
       tree: treeEntries,
-    });
+    }, signal);
     const treeSha = requireStringField(tree, 'sha', 'new tree SHA');
 
     if (treeSha === baseTreeSha) {
@@ -358,9 +395,9 @@ export class GitHubProfilePublisher {
       message: `Profile: ${input.action.toLowerCase().replaceAll('_', ' ')} ${input.slug}\n\nProfile-Operation: ${input.operationId}`,
       tree: treeSha,
       parents: [baseSha],
-    });
+    }, signal);
     const headSha = requireStringField(createdCommit, 'sha', 'created commit SHA');
-    await this.assertExpectedDiff(baseSha, headSha, expectedDiff);
+    await this.assertExpectedDiff(baseSha, headSha, expectedDiff, signal);
 
     return candidateWithOptionalPhoto({
       baseSha,
@@ -374,10 +411,12 @@ export class GitHubProfilePublisher {
     baseSha: string,
     headSha: string,
     expected: DiffExpectation[],
+    signal: AbortSignal,
   ) {
     const comparison = await this.requestData(
       'GET /repos/{owner}/{repo}/compare/{basehead}',
       { basehead: `${baseSha}...${headSha}` },
+      signal,
     );
     const status = optionalStringField(comparison, 'status');
     const aheadBy = optionalNumberField(comparison, 'ahead_by');
@@ -418,23 +457,27 @@ export class GitHubProfilePublisher {
     }
   }
 
-  private async createBlob(content: string, encoding: 'utf-8' | 'base64') {
+  private async createBlob(
+    content: string,
+    encoding: 'utf-8' | 'base64',
+    signal: AbortSignal,
+  ) {
     const blob = await this.requestData('POST /repos/{owner}/{repo}/git/blobs', {
       content,
       encoding,
-    });
+    }, signal);
     return requireStringField(blob, 'sha', 'blob SHA');
   }
 
-  private async createTemporaryRef(branch: string, headSha: string) {
+  private async createTemporaryRef(branch: string, headSha: string, signal: AbortSignal) {
     await this.requestData('POST /repos/{owner}/{repo}/git/refs', {
       ref: `refs/heads/${branch}`,
       sha: headSha,
-    });
+    }, signal);
   }
 
-  private async promoteMain(baseSha: string, headSha: string) {
-    const currentSha = await this.getBranchSha(this.options.defaultBranch);
+  private async promoteMain(baseSha: string, headSha: string, signal: AbortSignal) {
+    const currentSha = await this.getBranchSha(this.options.defaultBranch, signal);
 
     if (currentSha === headSha) {
       return;
@@ -445,10 +488,10 @@ export class GitHubProfilePublisher {
     }
 
     try {
-      await this.updateMain(headSha);
+      await this.updateMain(headSha, signal);
       return;
     } catch (firstError) {
-      const afterFirstFailure = await this.getBranchSha(this.options.defaultBranch);
+      const afterFirstFailure = await this.getBranchSha(this.options.defaultBranch, signal);
 
       if (afterFirstFailure === headSha) {
         return;
@@ -468,9 +511,9 @@ export class GitHubProfilePublisher {
       }
 
       try {
-        await this.updateMain(headSha);
+        await this.updateMain(headSha, signal);
       } catch (secondError) {
-        const afterSecondFailure = await this.getBranchSha(this.options.defaultBranch);
+        const afterSecondFailure = await this.getBranchSha(this.options.defaultBranch, signal);
 
         if (afterSecondFailure === headSha) {
           return;
@@ -489,19 +532,20 @@ export class GitHubProfilePublisher {
     }
   }
 
-  private async updateMain(headSha: string) {
+  private async updateMain(headSha: string, signal: AbortSignal) {
     await this.requestData('PATCH /repos/{owner}/{repo}/git/refs/{ref}', {
       ref: `heads/${this.options.defaultBranch}`,
       sha: headSha,
       force: false,
-    });
+    }, signal);
   }
 
   private async observeDeployment(
     commitSha: string,
     attempts: number,
     profileBlobSha: string,
-    photoBlobSha?: string | null,
+    photoBlobSha: string | null | undefined,
+    signal: AbortSignal,
   ): Promise<PublishResult> {
     try {
       const deployRun = await this.awaitWorkflow({
@@ -512,8 +556,8 @@ export class GitHubProfilePublisher {
         failureErrorCode: 'deploy_failed',
         timeoutErrorCode: 'deploy_timeout',
         completionTimeoutMs: this.options.deployTimeoutMs,
-      });
-      const pageStatus = await this.awaitPagesDeployment(commitSha);
+      }, signal);
+      const pageStatus = await this.awaitPagesDeployment(commitSha, signal);
       const deployed = resultWithOptionalPhoto({
         status: 'deployed',
         attempts,
@@ -542,7 +586,7 @@ export class GitHubProfilePublisher {
     failureErrorCode: 'validation_failed' | 'deploy_failed';
     timeoutErrorCode: 'validation_timeout' | 'deploy_timeout';
     completionTimeoutMs: number;
-  }): Promise<WorkflowRun> {
+  }, signal: AbortSignal): Promise<WorkflowRun> {
     const discoveryDeadline = this.options.now() + this.options.workflowDiscoveryTimeoutMs;
     let found: WorkflowRun | undefined;
 
@@ -556,6 +600,7 @@ export class GitHubProfilePublisher {
           head_sha: input.headSha,
           per_page: 10,
         },
+        signal,
       );
       const workflowRuns = listed.workflow_runs;
 
@@ -576,7 +621,7 @@ export class GitHubProfilePublisher {
         break;
       }
 
-      await this.options.sleep(this.options.pollIntervalMs);
+      await this.pollSleep(signal);
     }
 
     if (!found) {
@@ -592,6 +637,7 @@ export class GitHubProfilePublisher {
       const runData = await this.requestData(
         'GET /repos/{owner}/{repo}/actions/runs/{run_id}',
         { run_id: found.id },
+        signal,
       );
       const run = parseWorkflowRun(runData);
 
@@ -610,7 +656,7 @@ export class GitHubProfilePublisher {
         return run;
       }
 
-      await this.options.sleep(this.options.pollIntervalMs);
+      await this.pollSleep(signal);
     }
 
     throw new ProfilePublisherError(
@@ -619,7 +665,7 @@ export class GitHubProfilePublisher {
     );
   }
 
-  private async awaitPagesDeployment(commitSha: string) {
+  private async awaitPagesDeployment(commitSha: string, signal: AbortSignal) {
     const deadline = this.options.now() + this.options.pagesTimeoutMs;
     let lastStatus = 'not-created';
 
@@ -628,6 +674,7 @@ export class GitHubProfilePublisher {
         const data = await this.requestData(
           'GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}',
           { pages_deployment_id: commitSha },
+          signal,
         );
         lastStatus = optionalStringField(data, 'status') ?? 'unknown';
 
@@ -640,7 +687,7 @@ export class GitHubProfilePublisher {
         }
       }
 
-      await this.options.sleep(this.options.pollIntervalMs);
+      await this.pollSleep(signal);
     }
 
     throw new ProfilePublisherError(
@@ -649,20 +696,25 @@ export class GitHubProfilePublisher {
     );
   }
 
-  private async getBranchSha(branch: string) {
+  private async getBranchSha(branch: string, signal: AbortSignal) {
     const reference = await this.requestData(
       'GET /repos/{owner}/{repo}/git/ref/{ref}',
       { ref: `heads/${branch}` },
+      signal,
     );
     return requireNestedString(reference, ['object', 'sha'], `${branch} ref SHA`);
   }
 
-  private async getContentSha(path: string, ref: string): Promise<string | null> {
+  private async getContentSha(
+    path: string,
+    ref: string,
+    signal: AbortSignal,
+  ): Promise<string | null> {
     try {
       const data = await this.requestData('GET /repos/{owner}/{repo}/contents/{path}', {
         path,
         ref,
-      });
+      }, signal);
 
       if (optionalStringField(data, 'type') !== 'file') {
         throw invalidGitHubResponse(`${path} is not a regular file.`);
@@ -679,10 +731,12 @@ export class GitHubProfilePublisher {
   }
 
   private async cleanupTemporaryRef(branch: string) {
+    const signal = AbortSignal.timeout(PROFILE_PUBLISH_REQUEST_TIMEOUT_MS);
+
     try {
       await this.request('DELETE /repos/{owner}/{repo}/git/refs/{ref}', {
         ref: `heads/${branch}`,
-      });
+      }, signal);
     } catch (error) {
       if (getErrorStatus(error) !== 404) {
         this.options.onWarning(`Could not delete temporary branch ${branch}.`, error);
@@ -732,8 +786,18 @@ export class GitHubProfilePublisher {
     }
   }
 
-  private async requestData(route: string, parameters: Record<string, unknown>) {
-    const response = await this.request(route, parameters);
+  private async pollSleep(signal: AbortSignal) {
+    signal.throwIfAborted();
+    await this.options.sleep(this.options.pollIntervalMs, signal);
+    signal.throwIfAborted();
+  }
+
+  private async requestData(
+    route: string,
+    parameters: Record<string, unknown>,
+    signal: AbortSignal,
+  ) {
+    const response = await this.request(route, parameters, signal);
 
     if (!isRecord(response.data)) {
       throw invalidGitHubResponse(`${route} returned a non-object response.`);
@@ -742,7 +806,12 @@ export class GitHubProfilePublisher {
     return response.data;
   }
 
-  private async request(route: string, parameters: Record<string, unknown>) {
+  private async request(
+    route: string,
+    parameters: Record<string, unknown>,
+    signal: AbortSignal,
+  ) {
+    signal.throwIfAborted();
     return this.options.request(route, {
       owner: this.options.owner,
       repo: this.options.repo,
@@ -751,7 +820,7 @@ export class GitHubProfilePublisher {
         accept: 'application/vnd.github+json',
         'x-github-api-version': API_VERSION,
       },
-    });
+    }, signal);
   }
 }
 
@@ -760,9 +829,8 @@ function normalizeOptions(options: GitHubProfilePublisherOptions): NormalizedOpt
     throw new ProfilePublisherError('invalid_input', 'GitHub owner and repo are required.');
   }
 
-  // Together with the runtime's per-request timeout, these limits keep two
-  // complete validation attempts and deployment observation below Discord's
-  // 15-minute interaction-token window, including webhook-edit headroom.
+  // The global publication deadline is authoritative. Phase deadlines remain
+  // narrower so a stalled workflow fails with the most specific available code.
   return {
     request: options.request,
     owner: options.owner.trim(),
@@ -770,7 +838,7 @@ function normalizeOptions(options: GitHubProfilePublisherOptions): NormalizedOpt
     defaultBranch: options.defaultBranch?.trim() || 'main',
     validateWorkflow: options.validateWorkflow?.trim() || 'validate-profile-bot.yml',
     deployWorkflow: options.deployWorkflow?.trim() || 'deploy.yml',
-    sleep: options.sleep ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))),
+    sleep: options.sleep ?? ((milliseconds, signal) => delay(milliseconds, undefined, { signal })),
     now: options.now ?? Date.now,
     pollIntervalMs: positiveInteger(options.pollIntervalMs, 2_000, 'pollIntervalMs'),
     workflowDiscoveryTimeoutMs: positiveInteger(
@@ -781,6 +849,7 @@ function normalizeOptions(options: GitHubProfilePublisherOptions): NormalizedOpt
     validationTimeoutMs: positiveInteger(options.validationTimeoutMs, 120_000, 'validationTimeoutMs'),
     deployTimeoutMs: positiveInteger(options.deployTimeoutMs, 150_000, 'deployTimeoutMs'),
     pagesTimeoutMs: positiveInteger(options.pagesTimeoutMs, 30_000, 'pagesTimeoutMs'),
+    publishTimeoutMs: publicationTimeout(options.publishTimeoutMs),
     maxConflictAttempts: conflictAttemptCount(options.maxConflictAttempts),
     ...(options.stateStore ? { stateStore: options.stateStore } : {}),
     onWarning: options.onWarning ?? (() => undefined),
@@ -932,6 +1001,17 @@ function positiveInteger(value: number | undefined, fallback: number, name: stri
   return selected;
 }
 
+function publicationTimeout(value: number | undefined) {
+  const selected = positiveInteger(value, PROFILE_PUBLISH_TIMEOUT_MS, 'publishTimeoutMs');
+  if (selected > PROFILE_PUBLISH_TIMEOUT_MS) {
+    throw new ProfilePublisherError(
+      'invalid_input',
+      `publishTimeoutMs cannot exceed ${PROFILE_PUBLISH_TIMEOUT_MS}.`,
+    );
+  }
+  return selected;
+}
+
 function conflictAttemptCount(value: number | undefined) {
   const selected = positiveInteger(value, 2, 'maxConflictAttempts');
   if (selected > 2) {
@@ -954,6 +1034,24 @@ function getErrorStatus(error: unknown) {
 
 function invalidGitHubResponse(message: string) {
   return new ProfilePublisherError('github_response_invalid', message);
+}
+
+function publicationTimeoutError(cause?: unknown) {
+  return new ProfilePublisherError(
+    'publication_timeout',
+    'Profile publication exceeded its safety deadline.',
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+function isPublicationTimeoutError(error: unknown) {
+  return error instanceof ProfilePublisherError && error.code === 'publication_timeout';
+}
+
+function publicationTimeoutReason(signal: AbortSignal, cause?: unknown) {
+  return isPublicationTimeoutError(signal.reason)
+    ? signal.reason
+    : publicationTimeoutError(cause);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

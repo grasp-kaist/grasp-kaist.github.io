@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   GitHubProfilePublisher,
   PROFILE_PUBLISH_REQUEST_TIMEOUT_MS,
+  PROFILE_PUBLISH_TIMEOUT_MS,
   ProfilePublisherError,
   type GitHubRequest,
   type ProfilePublishInput,
@@ -31,15 +32,19 @@ type ScriptStep = {
 };
 
 class ScriptedGitHub {
-  readonly calls: Array<{ route: string; parameters: Record<string, unknown> }> = [];
+  readonly calls: Array<{
+    route: string;
+    parameters: Record<string, unknown>;
+    signal?: AbortSignal;
+  }> = [];
   readonly steps: ScriptStep[];
 
   constructor(steps: ScriptStep[]) {
     this.steps = [...steps];
   }
 
-  readonly request: GitHubRequest = async (route, parameters) => {
-    this.calls.push({ route, parameters });
+  readonly request: GitHubRequest = async (route, parameters, signal) => {
+    this.calls.push({ route, parameters, ...(signal ? { signal } : {}) });
     const step = this.steps.shift();
     assert.ok(step, `Unexpected GitHub request: ${route}`);
     assert.equal(route, step.route);
@@ -293,6 +298,16 @@ test('publishes a profile through validation, a non-force main update, and Pages
   });
   github.assertDone();
 
+  const cleanupCall = github.calls.find(
+    (call) => call.route === 'DELETE /repos/{owner}/{repo}/git/refs/{ref}',
+  );
+  const operationCalls = github.calls.filter((call) => call !== cleanupCall);
+  const operationSignal = operationCalls[0]?.signal;
+  assert.ok(operationSignal, 'publisher requests must receive an operation signal');
+  assert.equal(operationCalls.every((call) => call.signal === operationSignal), true);
+  assert.ok(cleanupCall?.signal, 'temporary-ref cleanup must receive a signal');
+  assert.notEqual(cleanupCall.signal, operationSignal, 'cleanup must use a fresh signal');
+
   const mainUpdated = store.history.find((checkpoint) => checkpoint.stage === 'main_updated');
   assert.ok(mainUpdated);
   store.checkpoints.set(input.operationId, mainUpdated);
@@ -378,6 +393,156 @@ test('does not update main when remote validation fails and still deletes the te
     github.calls.some((call) => call.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}'),
     false,
   );
+  github.assertDone();
+});
+
+test('publication timeout aborts polling, cleans up separately, and never continues to main', async () => {
+  const calls: Array<{ route: string; signal?: AbortSignal }> = [];
+  let operationSignal: AbortSignal | undefined;
+  let pollSignal: AbortSignal | undefined;
+  let cleanupSignal: AbortSignal | undefined;
+  const request: GitHubRequest = async (route, _parameters, signal) => {
+    calls.push({ route, ...(signal ? { signal } : {}) });
+
+    if (route === 'DELETE /repos/{owner}/{repo}/git/refs/{ref}') {
+      cleanupSignal = signal;
+      return { data: {} };
+    }
+
+    operationSignal ??= signal;
+    assert.equal(signal, operationSignal);
+
+    switch (route) {
+      case 'GET /repos/{owner}/{repo}/git/ref/{ref}':
+        return { data: refData(A) };
+      case 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}':
+        return { data: commitData(T0) };
+      case 'GET /repos/{owner}/{repo}/contents/{path}':
+        return { data: { type: 'file', sha: J } };
+      case 'POST /repos/{owner}/{repo}/git/blobs':
+        return { data: { sha: P } };
+      case 'POST /repos/{owner}/{repo}/git/trees':
+        return { data: { sha: T1 } };
+      case 'POST /repos/{owner}/{repo}/git/commits':
+        return { data: { sha: C } };
+      case 'GET /repos/{owner}/{repo}/compare/{basehead}':
+        return {
+          data: {
+            status: 'ahead',
+            ahead_by: 1,
+            total_commits: 1,
+            files: [{ filename: 'src/data/members/example-member.json', status: 'modified' }],
+          },
+        };
+      case 'POST /repos/{owner}/{repo}/git/refs':
+        return { data: {} };
+      case 'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs':
+        return { data: { workflow_runs: [] } };
+      default:
+        throw new Error(`Unexpected GitHub request: ${route}`);
+    }
+  };
+  const publisher = new GitHubProfilePublisher({
+    request,
+    owner: 'grasp-kaist',
+    repo: 'grasp-kaist.github.io',
+    pollIntervalMs: 60_000,
+    workflowDiscoveryTimeoutMs: 120_000,
+    publishTimeoutMs: 30,
+    sleep: async (_milliseconds, signal) => {
+      pollSignal = signal;
+      await new Promise<void>((_resolve, reject) => {
+        if (signal.aborted) {
+          reject(signal.reason);
+          return;
+        }
+
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+
+  await assert.rejects(
+    publisher.publish(publishInput()),
+    (error: unknown) =>
+      error instanceof ProfilePublisherError
+      && error.code === 'publication_timeout',
+  );
+
+  assert.ok(operationSignal);
+  assert.equal(pollSignal, operationSignal, 'poll sleep must receive the operation signal');
+  assert.ok(cleanupSignal);
+  assert.notEqual(cleanupSignal, operationSignal, 'cleanup after timeout must use a fresh signal');
+  assert.equal(cleanupSignal.aborted, false);
+  assert.equal(
+    calls.some((call) => call.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}'),
+    false,
+  );
+
+  const callCountAtRejection = calls.length;
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(calls.length, callCountAtRejection, 'no GitHub work may continue after rejection');
+});
+
+test('timeout after main update records a completed deploy failure with the published commit', async () => {
+  const branch = 'bot/profile/example-member/operation-001/a1';
+  const store = new MemoryPublishStateStore();
+  const github = new ScriptedGitHub([
+    { route: 'GET /repos/{owner}/{repo}/git/ref/{ref}', data: refData(A) },
+    { route: 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}', data: commitData(T0) },
+    { route: 'GET /repos/{owner}/{repo}/contents/{path}', data: { type: 'file', sha: J } },
+    { route: 'POST /repos/{owner}/{repo}/git/blobs', data: { sha: P } },
+    { route: 'POST /repos/{owner}/{repo}/git/trees', data: { sha: T1 } },
+    { route: 'POST /repos/{owner}/{repo}/git/commits', data: { sha: C } },
+    {
+      route: 'GET /repos/{owner}/{repo}/compare/{basehead}',
+      data: {
+        status: 'ahead',
+        ahead_by: 1,
+        total_commits: 1,
+        files: [{ filename: 'src/data/members/example-member.json', status: 'modified' }],
+      },
+    },
+    { route: 'POST /repos/{owner}/{repo}/git/refs', data: {} },
+    ...validationSteps(branch, C),
+    { route: 'GET /repos/{owner}/{repo}/git/ref/{ref}', data: refData(A) },
+    { route: 'PATCH /repos/{owner}/{repo}/git/refs/{ref}', data: refData(C) },
+    { route: 'DELETE /repos/{owner}/{repo}/git/refs/{ref}', data: {} },
+    {
+      route: 'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs',
+      data: { workflow_runs: [] },
+    },
+  ]);
+  const publisher = createPublisher(github, {
+    stateStore: store,
+    workflowDiscoveryTimeoutMs: 120_000,
+    publishTimeoutMs: 30,
+    sleep: async (_milliseconds, signal) => {
+      await new Promise<void>((_resolve, reject) => {
+        if (signal.aborted) {
+          reject(signal.reason);
+          return;
+        }
+
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+
+  const result = await publisher.publish(publishInput());
+
+  assert.equal(result.status, 'published_deploy_failed');
+  assert.equal(result.commitSha, C);
+  assert.match(result.failure ?? '', /exceeded its safety deadline/);
+  assert.deepEqual(store.history.map((checkpoint) => checkpoint.stage), [
+    'main_updated',
+    'completed',
+  ]);
+  const completed = store.history[1];
+  assert.equal(completed?.stage, 'completed');
+  if (completed?.stage === 'completed') {
+    assert.deepEqual(completed.result, result);
+  }
   github.assertDone();
 });
 
@@ -538,6 +703,8 @@ test('default publication time limits reserve Discord webhook-edit headroom', ()
   assert.equal(publisher.options.validationTimeoutMs, 120_000);
   assert.equal(publisher.options.deployTimeoutMs, 150_000);
   assert.equal(publisher.options.pagesTimeoutMs, 30_000);
+  assert.equal(publisher.options.publishTimeoutMs, PROFILE_PUBLISH_TIMEOUT_MS);
+  assert.equal(PROFILE_PUBLISH_TIMEOUT_MS, 810_000);
   assert.equal(publisher.options.maxConflictAttempts, 2);
   github.assertDone();
 });

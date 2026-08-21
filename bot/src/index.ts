@@ -1,5 +1,4 @@
-import { serve } from '@hono/node-server';
-import { App as GitHubApp } from 'octokit';
+import { App as GitHubApp, Octokit } from 'octokit';
 
 import { loadConfig } from './config.js';
 import {
@@ -13,13 +12,19 @@ import {
 import {
   GitHubProfilePublisher,
   GitHubProfileReader,
-  PROFILE_PUBLISH_REQUEST_TIMEOUT_MS,
   ProfilePublisherError,
   SqlitePublishStateStore,
   type GitHubRequest,
+  createBoundedGitHubFetch,
+  withGitHubRequestLimits,
 } from './github/index.js';
 import { createHttpApp } from './http-app.js';
 import { ProfilePhotoError } from './image/process-profile-photo.js';
+import {
+  closeHttpServerWithin,
+  startHttpBeforeRecovery,
+  startOnNextTurn,
+} from './runtime-startup.js';
 import { ProfileService, ProfileServiceError } from './service/profile-service.js';
 import { SqliteStore } from './storage/sqlite-store.js';
 
@@ -27,18 +32,21 @@ const config = loadConfig();
 const store = new SqliteStore(config.databasePath);
 const stagedRecovery = store.recoverInterruptedStagedPhotos();
 const publishStateStore = new SqlitePublishStateStore(config.databasePath);
+const PublisherOctokit = Octokit.defaults({
+  retry: { enabled: false },
+  throttle: { enabled: false },
+  request: { fetch: createBoundedGitHubFetch() },
+});
 const githubApp = new GitHubApp({
   appId: config.github.appId,
   privateKey: config.github.privateKey,
+  Octokit: PublisherOctokit,
 });
 const installationOctokit = await githubApp.getInstallationOctokit(
   config.github.installationId,
 );
-const githubRequest: GitHubRequest = async (route, parameters) => {
-  const requestParameters = {
-    ...parameters,
-    request: { signal: AbortSignal.timeout(PROFILE_PUBLISH_REQUEST_TIMEOUT_MS) },
-  };
+const githubRequest: GitHubRequest = async (route, parameters, operationSignal) => {
+  const requestParameters = withGitHubRequestLimits(parameters, operationSignal);
   const response = await installationOctokit.request(
     route as Parameters<typeof installationOctokit.request>[0],
     requestParameters as Parameters<typeof installationOctokit.request>[1],
@@ -74,14 +82,6 @@ const profileService = new ProfileService({
   ownerUserId: config.discord.ownerUserId,
   membersPageUrl: config.membersPageUrl,
 });
-const reconciliation = await profileService.reconcileKnownProfiles();
-
-for (const issue of reconciliation.issues) {
-  reportError(
-    new Error(issue.message),
-    `Profile reconciliation failed for ${issue.profileSlug}`,
-  );
-}
 const router = new DiscordInteractionRouter({
   config: {
     applicationId: config.discord.applicationId,
@@ -103,7 +103,11 @@ const app = createHttpApp({
   interactionHandler,
   scheduleAfterResponse: scheduleAfterResponseTask,
 });
-const server = serve({ fetch: app.fetch, port: config.port });
+const { server, recovery: startupRecovery } = startHttpBeforeRecovery({
+  fetch: app.fetch,
+  port: config.port,
+  recover: reconcileProfilesAtStartup,
+});
 const stagedPhotoCleanupTimer = setInterval(() => {
   store.deleteExpiredStagedPhotos();
 }, 60_000);
@@ -120,32 +124,65 @@ let shuttingDown = false;
 process.once('SIGINT', () => void shutdown('SIGINT'));
 process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
+trackInFlight(startupRecovery, 'Startup profile reconciliation failed', true);
+
 function scheduleAfterResponseTask(result: DiscordHttpInteractionResult) {
   if (!result.afterResponse) {
     return;
   }
 
-  setImmediate(() => {
-    const task = result.afterResponse!()
-      .catch((error) => reportError(error, 'Deferred Discord operation failed'))
-      .finally(() => inFlightTasks.delete(task));
-    inFlightTasks.add(task);
-  });
+  trackInFlight(
+    startOnNextTurn(result.afterResponse),
+    'Deferred Discord operation failed',
+  );
 }
 
-async function shutdown(signal: string) {
+function trackInFlight(task: Promise<void>, context: string, fatal = false) {
+  const tracked = task
+    .catch((error) => {
+      reportError(error, context);
+      if (fatal) {
+        setImmediate(() => void shutdown(context, 1));
+      }
+    })
+    .finally(() => inFlightTasks.delete(tracked));
+  inFlightTasks.add(tracked);
+}
+
+async function reconcileProfilesAtStartup() {
+  const reconciliation = await profileService.reconcileKnownProfiles();
+
+  for (const issue of reconciliation.issues) {
+    reportError(
+      new Error(issue.message),
+      `Profile reconciliation failed for ${issue.profileSlug}`,
+    );
+  }
+
+  process.stdout.write(
+    `Startup profile recovery complete: ${reconciliation.reconciled} reconciled, ${reconciliation.released} released, ${reconciliation.issues.length} issue(s).\n`,
+  );
+}
+
+async function shutdown(reason: string, exitCode = 0) {
   if (shuttingDown) {
     return;
   }
 
   shuttingDown = true;
   clearInterval(stagedPhotoCleanupTimer);
-  process.stdout.write(`Received ${signal}; stopping new HTTP requests.\n`);
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-  }).catch((error) => reportError(error, 'HTTP server shutdown failed'));
-
   const deadline = Date.now() + 25_000;
+  process.stdout.write(`Stopping new HTTP requests (${reason}).\n`);
+  const closeResult = await closeHttpServerWithin(server, 5_000);
+  if (closeResult.error) {
+    reportError(closeResult.error, 'HTTP server shutdown failed');
+  }
+  if (closeResult.timedOut) {
+    reportError(
+      new Error('Active HTTP connections exceeded the 5 second close window and were terminated.'),
+      'HTTP server shutdown deadline expired',
+    );
+  }
 
   while (inFlightTasks.size > 0 && Date.now() < deadline) {
     await Promise.race([
@@ -164,7 +201,7 @@ async function shutdown(signal: string) {
 
   publishStateStore.close();
   store.close();
-  process.exit(0);
+  process.exit(exitCode);
 }
 
 function formatUserError(error: unknown) {
@@ -190,6 +227,8 @@ function formatUserError(error: unknown) {
         return 'The website changed repeatedly during publication. Please try again.';
       case 'main_update_rejected':
         return 'GitHub did not allow the validated fast-forward update.';
+      case 'publication_timeout':
+        return 'GitHub reached the safe time limit. Reopen `/profile` so recovery can verify the result.';
       default:
         return 'GitHub could not safely publish this profile operation.';
     }
