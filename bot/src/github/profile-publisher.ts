@@ -8,6 +8,8 @@ const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SHA_PATTERN = /^[0-9a-f]{40}$/i;
 
+export const PROFILE_PUBLISH_REQUEST_TIMEOUT_MS = 10_000;
+
 export type GitHubResponse = {
   data: unknown;
   status?: number;
@@ -758,6 +760,9 @@ function normalizeOptions(options: GitHubProfilePublisherOptions): NormalizedOpt
     throw new ProfilePublisherError('invalid_input', 'GitHub owner and repo are required.');
   }
 
+  // Together with the runtime's per-request timeout, these limits keep two
+  // complete validation attempts and deployment observation below Discord's
+  // 15-minute interaction-token window, including webhook-edit headroom.
   return {
     request: options.request,
     owner: options.owner.trim(),
@@ -770,12 +775,12 @@ function normalizeOptions(options: GitHubProfilePublisherOptions): NormalizedOpt
     pollIntervalMs: positiveInteger(options.pollIntervalMs, 2_000, 'pollIntervalMs'),
     workflowDiscoveryTimeoutMs: positiveInteger(
       options.workflowDiscoveryTimeoutMs,
-      20_000,
+      10_000,
       'workflowDiscoveryTimeoutMs',
     ),
     validationTimeoutMs: positiveInteger(options.validationTimeoutMs, 120_000, 'validationTimeoutMs'),
-    deployTimeoutMs: positiveInteger(options.deployTimeoutMs, 240_000, 'deployTimeoutMs'),
-    pagesTimeoutMs: positiveInteger(options.pagesTimeoutMs, 45_000, 'pagesTimeoutMs'),
+    deployTimeoutMs: positiveInteger(options.deployTimeoutMs, 150_000, 'deployTimeoutMs'),
+    pagesTimeoutMs: positiveInteger(options.pagesTimeoutMs, 30_000, 'pagesTimeoutMs'),
     maxConflictAttempts: conflictAttemptCount(options.maxConflictAttempts),
     ...(options.stateStore ? { stateStore: options.stateStore } : {}),
     onWarning: options.onWarning ?? (() => undefined),
@@ -928,9 +933,9 @@ function positiveInteger(value: number | undefined, fallback: number, name: stri
 }
 
 function conflictAttemptCount(value: number | undefined) {
-  const selected = positiveInteger(value, 3, 'maxConflictAttempts');
-  if (selected > 3) {
-    throw new ProfilePublisherError('invalid_input', 'maxConflictAttempts cannot exceed 3.');
+  const selected = positiveInteger(value, 2, 'maxConflictAttempts');
+  if (selected > 2) {
+    throw new ProfilePublisherError('invalid_input', 'maxConflictAttempts cannot exceed 2.');
   }
   return selected;
 }

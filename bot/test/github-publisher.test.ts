@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   GitHubProfilePublisher,
+  PROFILE_PUBLISH_REQUEST_TIMEOUT_MS,
   ProfilePublisherError,
   type GitHubRequest,
   type ProfilePublishInput,
@@ -508,5 +509,35 @@ test('rejects unsafe slugs before making any GitHub request', async () => {
     createPublisher(github).publish(publishInput({ slug: '../someone-else' })),
     (error: unknown) => error instanceof ProfilePublisherError && error.code === 'invalid_input',
   );
+  github.assertDone();
+});
+
+test('caps automatic main-conflict retries to preserve the Discord response window', () => {
+  const github = new ScriptedGitHub([]);
+
+  assert.throws(
+    () => createPublisher(github, { maxConflictAttempts: 3 }),
+    (error: unknown) =>
+      error instanceof ProfilePublisherError
+      && error.code === 'invalid_input'
+      && /cannot exceed 2/.test(error.message),
+  );
+  github.assertDone();
+});
+
+test('default publication time limits reserve Discord webhook-edit headroom', () => {
+  const github = new ScriptedGitHub([]);
+  const publisher = new GitHubProfilePublisher({
+    request: github.request,
+    owner: 'grasp-kaist',
+    repo: 'grasp-kaist.github.io',
+  });
+
+  assert.equal(PROFILE_PUBLISH_REQUEST_TIMEOUT_MS, 10_000);
+  assert.equal(publisher.options.workflowDiscoveryTimeoutMs, 10_000);
+  assert.equal(publisher.options.validationTimeoutMs, 120_000);
+  assert.equal(publisher.options.deployTimeoutMs, 150_000);
+  assert.equal(publisher.options.pagesTimeoutMs, 30_000);
+  assert.equal(publisher.options.maxConflictAttempts, 2);
   github.assertDone();
 });
