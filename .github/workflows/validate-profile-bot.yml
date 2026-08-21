@@ -1,0 +1,111 @@
+name: Validate profile bot commit
+
+on:
+  push:
+    branches:
+      - 'bot/profile/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-profile-bot-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the candidate commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Restrict the candidate diff to one member profile
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          branch="${GITHUB_REF_NAME}"
+          remainder="${branch#bot/profile/}"
+          branch_pattern='^([a-z0-9]+(-[a-z0-9]+)*)/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/a([1-3])$'
+
+          if [[ "${branch}" == "${remainder}" ]]; then
+            echo "Invalid profile bot branch: ${branch}" >&2
+            exit 1
+          fi
+
+          if [[ "${remainder}" =~ ${branch_pattern} ]]; then
+            slug="${BASH_REMATCH[1]}"
+          else
+            echo "Invalid profile bot branch: ${branch}" >&2
+            exit 1
+          fi
+
+          parent_count="$(git rev-list --parents -n 1 HEAD | awk '{ print NF - 1 }')"
+          if [[ "${parent_count}" != "1" ]]; then
+            echo "Profile bot commits must have exactly one parent." >&2
+            exit 1
+          fi
+
+          json_path="src/data/members/${slug}.json"
+          photo_path="src/data/members/${slug}.webp"
+          changed_count=0
+
+          while IFS=$'\t' read -r status path; do
+            [[ -n "${path}" ]] || continue
+            changed_count=$((changed_count + 1))
+            if [[ "${path}" != "${json_path}" && "${path}" != "${photo_path}" ]]; then
+              echo "Unexpected profile bot path: ${path}" >&2
+              exit 1
+            fi
+
+            if [[ "${status}" != "A" && "${status}" != "M" && "${status}" != "D" ]]; then
+              echo "Unexpected profile bot change status ${status}: ${path}" >&2
+              exit 1
+            fi
+
+            if [[ "${path}" == "${json_path}" && "${status}" == "D" ]]; then
+              echo "Profile bot commits may not delete ${json_path}." >&2
+              exit 1
+            fi
+          done < <(git diff-tree --no-commit-id --name-status --no-renames -r HEAD^ HEAD)
+
+          if (( changed_count < 1 || changed_count > 2 )); then
+            echo "Profile bot commits must change one or two allowed files." >&2
+            exit 1
+          fi
+
+          if [[ ! -f "${json_path}" ]]; then
+            echo "Candidate profile JSON is missing: ${json_path}" >&2
+            exit 1
+          fi
+
+          echo "slug=${slug}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            bot/package-lock.json
+
+      - name: Install website dependencies
+        run: npm ci
+
+      - name: Install profile bot validation dependencies
+        run: npm ci --prefix bot
+
+      - name: Validate member data
+        run: npm run validate:profiles
+
+      - name: Validate bot-managed profile and photo relation
+        run: node bot/scripts/validate-profile-candidate.mjs "${{ steps.candidate.outputs.slug }}"
+
+      - name: Build the site
+        run: npm run build
