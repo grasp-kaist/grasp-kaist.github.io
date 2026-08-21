@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+.secrets/
+*.key
+*.pem
+data/
+dist/
+node_modules/
