@@ -35,14 +35,20 @@ https://github.com/grasp-kaist/grasp-kaist.github.io/tree/main/src/data/members
 
 ## Member JSON Format
 
-A member JSON file looks like this:
+A member JSON file uses the following canonical format. All nine fields must be present, including fields that are empty.
 
 ```json
 {
+  "listed": true,
   "order": 4,
   "name": "Example",
   "position": "Undergraduate Student, School of Computing, KAIST",
-  "details": [],
+  "details": [
+    "B.S. in Computer Science, Example University"
+  ],
+  "researchInterests": [
+    "Graph algorithms"
+  ],
   "contact": [
     "example@kaist",
     "+82-10-1234-5678"
@@ -53,6 +59,16 @@ A member JSON file looks like this:
 ```
 
 ### Fields
+
+`listed` controls whether the profile appears on the Members page:
+
+```json
+{
+  "listed": false
+}
+```
+
+This is only a display setting. The JSON file, photo, and Git history remain public even while `listed` is `false`.
 
 `order` controls the display order on the Members page.
 
@@ -69,12 +85,20 @@ Use the following convention:
 
 Members with the same `order` value are sorted alphabetically by `name`.
 
-`name`, `position`, `contact`, and `website` should contain your public-facing information.
+`name` and `position` are required non-empty strings containing public-facing information.
 
-`contact` may be a single string or an array of strings. Use an array when listing multiple contacts so each item appears on its own line. Since contact information can be sensitive when exposed to web crawlers, consider writing it in a lightly obfuscated form, such as `example (at) gmail.com`. The Members page has a note explaining that `@kaist` should be read as `@kaist.ac.kr`, so you may also use that convention. Please also think carefully before adding a personal phone number.
+`details`, `researchInterests`, and `contact` are always arrays of strings. Use one array item for each line or research interest. Use an empty array when there is nothing to show.
 
 ```json
 {
+  "details": [
+    "B.S. in Mathematical Sciences, KAIST",
+    "Advisor: Example Professor"
+  ],
+  "researchInterests": [
+    "Graph theory",
+    "Algorithms"
+  ],
   "contact": [
     "example@kaist",
     "+82-10-1234-5678"
@@ -82,33 +106,23 @@ Members with the same `order` value are sorted alphabetically by `name`.
 }
 ```
 
-If you do not want to show a field such as `contact` or `website`, do not delete the field. Leave it as an empty string:
+Since contact information can be sensitive when exposed to web crawlers, consider writing it in a lightly obfuscated form, such as `example (at) gmail.com`. The Members page has a note explaining that `@kaist` should be read as `@kaist.ac.kr`, so you may also use that convention. Please think carefully before adding a personal phone number.
+
+`contact` also supports safe Markdown-style links using `http://`, `https://`, or `mailto:` targets:
 
 ```json
 {
-  "website": ""
-}
-```
-
-`details` is a field for any additional information you would like to include. It is intentionally flexible, since it is unclear whether people will want to list degrees, previous affiliations, research interests, advisors, or other information. Use it freely. Like `contact`, it can contain multiple entries.
-
-For example:
-
-```json
-{
-  "details": [
-    "B.S. in Mathematical Sciences, KAIST",
-    "Advisor: Example Professor",
-    "Research interests: graph theory and algorithms"
+  "contact": [
+    "[Email](mailto:example@kaist.ac.kr)"
   ]
 }
 ```
 
-If you do not want to show details, leave it as an empty array:
+`website` is a free-form string. A bare domain such as `example.com` is displayed as an `https://` link, and explicit `http://` or `https://` URLs remain links. Unsafe schemes such as `javascript:` and values that cannot be interpreted as URLs are displayed as plain text instead. Leave the field as an empty string when there is no website.
 
 ```json
 {
-  "details": []
+  "website": ""
 }
 ```
 
@@ -128,15 +142,29 @@ The matching image file should be placed in the same folder:
 src/data/members/example.png
 ```
 
-If you do not want to show a photo, leave `photo` as an empty string or remove the `photo` field. If the `photo` field is empty or the referenced file is missing, the default placeholder is shown.
+If you do not want to show a photo, leave `photo` as an empty string. The field should not be removed. If `photo` is empty, the default placeholder is shown.
 
 Supported image formats are:
 
 ```text
-.jpg, .jpeg, .png, .webp, .svg
+.jpg, .jpeg, .png, .webp
 ```
 
 A 4:5 portrait ratio is recommended. Images with other ratios may be cropped to fit the displayed photo area.
+
+The profile schema is stored at `schemas/member-profile.schema.json`. Validate profile files and referenced photos with:
+
+```bash
+npm run validate:profiles
+```
+
+`npm run build` runs this validation automatically before building the site.
+
+Run the profile contract and website-link tests with:
+
+```bash
+npm run test:profiles
+```
 
 ## Updating Teaching Courses
 
@@ -253,4 +281,4 @@ src/pages/student-seminar.astro
 src/pages/ongoing-study-groups.astro
 ```
 
-The site is static. There is no backend, login, database, server route, or external CMS.
+The GitHub Pages site itself is static and has no login, database, or server routes. Profile automation, when deployed, runs as a separate service and only publishes validated member data to this repository.

@@ -1,9 +1,13 @@
 {
+  "listed": true,
   "order": 4,
   "name": "Taein Oh",
   "position": "Undergraduate Student, Department of Mathematical Sciences, KAIST",
   "details": [],
-  "contact": "octanec8h18@kaist",
+  "researchInterests": [],
+  "contact": [
+    "octanec8h18@kaist"
+  ],
   "website": "https://octane-kr.github.io/",
   "photo": "taein-oh.png"
 }

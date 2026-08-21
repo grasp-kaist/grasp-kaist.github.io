@@ -2,23 +2,26 @@
 import { basename as posixBasename, extname as posixExtname } from 'node:path/posix';
 import { basename as winBasename } from 'node:path/win32';
 import BaseLayout from '../layouts/BaseLayout.astro';
+import { getListedMembers, getWebsitePresentation } from '../lib/member-profile.mjs';
 
 type Member = {
+  listed: boolean;
   order: number;
   name: string;
   position: string;
-  details?: unknown;
-  contact?: unknown;
-  researchInterests?: unknown;
-  website?: unknown;
-  photo?: unknown;
+  details: string[];
+  contact: string[];
+  researchInterests: string[];
+  website: string;
+  photo: string;
 };
 
 type MemberWithPhotoUrl = Member & {
   detailsList: string[];
   contactLines: ContactPart[][];
   researchInterestsList: string[];
-  websiteUrl?: string;
+  websiteText?: string;
+  websiteHref?: string;
   photoUrl?: string;
 };
 
@@ -26,8 +29,8 @@ type ContactPart =
   | { type: 'text'; value: string }
   | { type: 'link'; href: string; value: string };
 
-const allowedPhotoExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp', '.svg']);
-const photoModules = import.meta.glob<string>('../data/members/*.{jpg,jpeg,png,webp,svg}', {
+const allowedPhotoExtensions = new Set(['.jpg', '.jpeg', '.png', '.webp']);
+const photoModules = import.meta.glob<string>('../data/members/*.{jpg,jpeg,png,webp}', {
   eager: true,
   query: '?url',
   import: 'default',
@@ -80,36 +83,8 @@ function parseContactLine(contact: string): ContactPart[] {
   return parts.length ? parts : [{ type: 'text', value: contact }];
 }
 
-function getContactLines(value: unknown): ContactPart[][] {
-  if (Array.isArray(value)) {
-    return value.map((line) => getOptionalString(line)).filter((line): line is string => {
-      return Boolean(line);
-    }).map(parseContactLine);
-  }
-
-  const contact = getOptionalString(value);
-  return contact ? [parseContactLine(contact)] : [];
-}
-
-function getDetails(value: unknown) {
-  if (Array.isArray(value)) {
-    return value.map((line) => getOptionalString(line)).filter((line): line is string => {
-      return Boolean(line);
-    });
-  }
-
-  const details = getOptionalString(value);
-  return details ? [details] : [];
-}
-
-function getResearchInterests(value: unknown) {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.filter((interest): interest is string => {
-    return typeof interest === 'string' && interest.trim().length > 0;
-  }).map((interest) => interest.trim());
+function getContactLines(value: string[]): ContactPart[][] {
+  return value.map(parseContactLine);
 }
 
 function getMemberPhotoUrl(member: Member) {
@@ -132,7 +107,7 @@ function getMemberPhotoUrl(member: Member) {
 
   if (!allowedPhotoExtensions.has(extension)) {
     console.warn(
-      `Invalid member photo extension for ${member.name}: "${photo}". Allowed extensions: .jpg, .jpeg, .png, .webp, .svg. Using placeholder.`,
+      `Invalid member photo extension for ${member.name}: "${photo}". Allowed extensions: .jpg, .jpeg, .png, .webp. Using placeholder.`,
     );
     return undefined;
   }
@@ -148,19 +123,26 @@ function getMemberPhotoUrl(member: Member) {
 }
 
 const modules = import.meta.glob('../data/members/*.json', { eager: true });
-const members: MemberWithPhotoUrl[] = Object.values(modules).map((module) => {
-  const member = (module as { default: Member }).default;
-  return {
-    ...member,
-    detailsList: getDetails(member.details),
-    contactLines: getContactLines(member.contact),
-    researchInterestsList: getResearchInterests(member.researchInterests),
-    websiteUrl: getOptionalString(member.website),
-    photoUrl: getMemberPhotoUrl(member),
-  };
-}).sort((a, b) => {
-  return a.order - b.order || a.name.localeCompare(b.name);
+const memberProfiles = Object.values(modules).map((module) => {
+  return (module as { default: Member }).default;
 });
+const members: MemberWithPhotoUrl[] = getListedMembers(memberProfiles)
+  .map((member) => {
+    const website = getWebsitePresentation(member.website);
+
+    return {
+      ...member,
+      detailsList: member.details,
+      contactLines: getContactLines(member.contact),
+      researchInterestsList: member.researchInterests,
+      websiteText: website?.text,
+      websiteHref: website?.href,
+      photoUrl: getMemberPhotoUrl(member),
+    };
+  })
+  .sort((a, b) => {
+    return a.order - b.order || a.name.localeCompare(b.name);
+  });
 ---
 
 <BaseLayout title="Members" description="Members of GRASP Lab at KAIST.">
@@ -211,13 +193,17 @@ const members: MemberWithPhotoUrl[] = Object.values(modules).map((module) => {
                     </dd>
                   </div>
                 ) : null}
-                {member.websiteUrl && (
+                {member.websiteText && (
                   <div>
                     <dt>Website</dt>
                     <dd>
-                      <a class="member-profile__url" href={member.websiteUrl}>
-                        {member.websiteUrl}
-                      </a>
+                      {member.websiteHref ? (
+                        <a class="member-profile__url" href={member.websiteHref}>
+                          {member.websiteText}
+                        </a>
+                      ) : (
+                        <span class="member-profile__url">{member.websiteText}</span>
+                      )}
                     </dd>
                   </div>
                 )}

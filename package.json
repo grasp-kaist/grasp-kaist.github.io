@@ -7,11 +7,16 @@
   },
   "scripts": {
     "dev": "astro dev",
-    "build": "astro build",
+    "validate:profiles": "node scripts/validate-member-profiles.mjs",
+    "test:profiles": "node --test tests/member-profile.test.mjs",
+    "build": "npm run validate:profiles && astro build",
     "preview": "astro preview",
     "astro": "astro"
   },
   "dependencies": {
     "astro": "^6.4.6"
+  },
+  "devDependencies": {
+    "ajv": "^8.20.0"
   }
 }

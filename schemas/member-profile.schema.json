@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grasp-kaist.github.io/schemas/member-profile.schema.json",
+  "title": "GRASP member profile",
+  "description": "Canonical public member profile stored in src/data/members.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "listed",
+    "order",
+    "name",
+    "position",
+    "details",
+    "researchInterests",
+    "contact",
+    "website",
+    "photo"
+  ],
+  "properties": {
+    "listed": {
+      "type": "boolean",
+      "description": "Whether this profile appears on the Members page. The source file remains public either way."
+    },
+    "order": {
+      "type": "integer",
+      "enum": [0, 1, 2, 3, 4, 5]
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "position": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^\\S(?:.*\\S)?$"
+    },
+    "details": {
+      "$ref": "#/$defs/nonEmptyStringList"
+    },
+    "researchInterests": {
+      "$ref": "#/$defs/nonEmptyStringList"
+    },
+    "contact": {
+      "$ref": "#/$defs/nonEmptyStringList"
+    },
+    "website": {
+      "$ref": "#/$defs/optionalTrimmedString"
+    },
+    "photo": {
+      "type": "string",
+      "pattern": "^(?:|[A-Za-z0-9][A-Za-z0-9._-]*\\.(?:jpg|jpeg|png|webp))$",
+      "description": "An optional file name in src/data/members. Paths and SVG files are not accepted."
+    }
+  },
+  "$defs": {
+    "nonEmptyStringList": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^\\S(?:.*\\S)?$"
+      }
+    },
+    "optionalTrimmedString": {
+      "type": "string",
+      "pattern": "^(?:|\\S(?:.*\\S)?)$"
+    }
+  }
+}
