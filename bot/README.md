@@ -29,7 +29,7 @@ npm run build
 
 따라서 개발과 자동 테스트를 끝내는 데는 Discord 서버 설치 권한이 필요하지 않다. 실제 서버 설치와 명령 등록은 배포 직전에 서버 관리 권한이 있는 사람이 진행하면 된다.
 
-로컬에서 서비스를 실행하려면 `.env.example`을 `.env`로 복사해 값을 채우고 셸 환경변수로 불러온 다음 `npm run dev`를 실행한다. `.env`, GitHub App PEM 파일, 토큰은 절대 커밋하지 않는다.
+로컬에서 서비스를 실행하려면 `.env.example`을 `.env`로 복사해 값을 채운 다음 `npm run dev`를 실행한다. `dev`와 `register:commands` 스크립트는 로컬 `.env`를 자동으로 읽는다. `.env`, GitHub App PEM 파일, 토큰은 절대 커밋하지 않는다.
 
 ## 실제 배포 순서
 
