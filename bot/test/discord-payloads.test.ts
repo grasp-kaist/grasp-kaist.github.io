@@ -17,6 +17,8 @@ import {
 import type { ProfileSnapshot } from '../src/discord/types.js';
 
 const STATE_REVISION = '0123456789abcdefabcd';
+const EDIT_REVISION = '11111111111111111111';
+const DRAFT_EDIT_REVISION = '22222222222222222222';
 
 test('guild commands expose only register and profile with fixed category choices', () => {
   const register = guildCommands.find((command) => command.name === 'register');
@@ -92,7 +94,7 @@ test('sandbox UI states clearly that the live website is not being changed', () 
     .filter((component) => component.type === 1)
     .flatMap((row) => row.components as Array<Record<string, unknown>>)
     .map((button) => button.label);
-  assert.ok(labels.includes('Mark listed (sandbox)'));
+  assert.ok(labels.includes('Edit profile'));
 });
 
 test('profile panel is ephemeral Components V2 with bounded action rows', () => {
@@ -115,7 +117,7 @@ test('profile panel is ephemeral Components V2 with bounded action rows', () => 
   const rows = containerComponents.filter(
     (component) => component.type === 1,
   );
-  assert.ok(rows.length >= 2);
+  assert.equal(rows.length, 1);
   assert.ok(
     rows.every(
       (row) => (row.components as Array<Record<string, unknown>>).length <= 5,
@@ -125,8 +127,9 @@ test('profile panel is ephemeral Components V2 with bounded action rows', () => 
   const actionCustomIds = rows.flatMap((row) =>
     (row.components as Array<Record<string, unknown>>).map((button) => button.custom_id),
   );
-  assert.ok(actionCustomIds.includes(`profile:remove-photo:${STATE_REVISION}`));
-  assert.ok(actionCustomIds.includes(`profile:set-listed:1:${STATE_REVISION}`));
+  assert.deepEqual(actionCustomIds, ['profile:edit']);
+  assert.equal(JSON.stringify(actionCustomIds).includes('set-listed'), false);
+  assert.equal(JSON.stringify(actionCustomIds).includes('remove-photo'), false);
 });
 
 test('profile edit modals bind submissions to the current published or draft revision', () => {
@@ -179,6 +182,14 @@ test('profile edit modals bind submissions to the current published or draft rev
     contact?.description,
     'To deter scraping, obfuscate contact details if needed. For @kaist.ac.kr, use only @kaist.',
   );
+
+  const categoryComponents = categoryModalResponse(current).data?.components as Array<
+    Record<string, unknown>
+  >;
+  const visibility = categoryComponents.find(
+    (component) => component.label === 'Members page visibility',
+  );
+  assert.equal((visibility?.component as Record<string, unknown>).type, 3);
 });
 
 test('profile edit modals save drafts and do not contain an immediate publish confirmation', () => {
@@ -195,7 +206,7 @@ test('profile edit modals save drafts and do not contain an immediate publish co
       components.some((component) => component.label === 'Confirm save and publish'),
       false,
     );
-    assert.match(String(components[0]?.content), /updates your draft only/i);
+    assert.match(String(components[0]?.content), /updates your pending changes only/i);
     assert.match(String(components[0]?.content), /Save changes/);
   }
 
@@ -215,6 +226,7 @@ test('a draft panel previews draft values and exposes one explicit final save', 
     isPublishing: false,
     stale: false,
   };
+  current.editRevision = DRAFT_EDIT_REVISION;
 
   const response = profilePanelResponse(current);
   const container = (response.data?.components as Array<Record<string, unknown>>)[0]!;
@@ -223,7 +235,7 @@ test('a draft panel previews draft values and exposes one explicit final save', 
     .filter((component) => component.type === 10)
     .map((component) => String(component.content))
     .join('\n');
-  assert.match(text, /Draft changes.*not published/i);
+  assert.match(text, /Pending changes.*not published/i);
   assert.match(text, /Draft Member/);
   assert.match(text, /M\\\.S\\\. Student/);
 
@@ -231,12 +243,25 @@ test('a draft panel previews draft values and exposes one explicit final save', 
     .filter((component) => component.type === 1)
     .flatMap((row) => row.components as Array<Record<string, unknown>>);
   const byLabel = (label: string) => buttons.find((button) => button.label === label);
-  assert.equal(byLabel('Save changes')?.custom_id, `profile:save-draft:${draftRevision}`);
+  assert.equal(byLabel('Save changes')?.custom_id, `profile:save-edits:${DRAFT_EDIT_REVISION}`);
   assert.equal(byLabel('Save changes')?.disabled, undefined);
-  assert.equal(byLabel('Discard draft')?.custom_id, `profile:discard-draft:${draftRevision}`);
-  assert.equal(byLabel('Change photo')?.disabled, true);
+  assert.equal(byLabel('Discard changes')?.custom_id, `profile:discard-edits:${DRAFT_EDIT_REVISION}`);
+  assert.equal(byLabel('Change photo')?.disabled, undefined);
   assert.equal(byLabel('Remove photo')?.disabled, true);
-  assert.equal(byLabel('Show on website')?.disabled, true);
+  assert.equal(byLabel('Category & visibility')?.disabled, undefined);
+});
+
+test('an unchanged edit panel can return to the compact profile view', () => {
+  const response = profilePanelResponse(snapshot(), undefined, 'production', true);
+  const container = (response.data?.components as Array<Record<string, unknown>>)[0]!;
+  const buttons = (container.components as Array<Record<string, unknown>>)
+    .filter((component) => component.type === 1)
+    .flatMap((row) => row.components as Array<Record<string, unknown>>);
+
+  assert.equal(
+    buttons.find((button) => button.label === 'Back')?.custom_id,
+    'profile:view',
+  );
 });
 
 test('prepared photo preview attaches WebP and binds confirm/cancel to its token', () => {
@@ -258,6 +283,12 @@ test('prepared photo preview attaches WebP and binds confirm/cancel to its token
   assert.equal(preview.files[0]?.filename, 'profile-preview.webp');
 
   const components = preview.payload.components as Array<Record<string, unknown>>;
+  const previewText = components
+    .filter((component) => component.type === 10)
+    .map((component) => String(component.content))
+    .join('\n');
+  assert.match(previewText, /not be published until.*Save changes/i);
+
   const gallery = components.find((component) => component.type === 12)!;
   assert.equal(
     ((gallery.items as Array<Record<string, unknown>>)[0]?.media as Record<string, unknown>).url,
@@ -266,7 +297,7 @@ test('prepared photo preview attaches WebP and binds confirm/cancel to its token
   const row = components.find((component) => component.type === 1)!;
   assert.deepEqual(
     (row.components as Array<Record<string, unknown>>).map((button) => button.custom_id),
-    ['profile:photo-confirm:stage_abc-123', 'profile:photo-cancel:stage_abc-123'],
+    ['profile:photo-use:stage_abc-123', 'profile:photo-cancel:stage_abc-123'],
   );
 });
 
@@ -290,6 +321,7 @@ function snapshot(): ProfileSnapshot {
   return {
     profileSlug: 'example',
     stateRevision: STATE_REVISION,
+    editRevision: EDIT_REVISION,
     bindingStatus: 'active',
     profile: createEmptyProfile({
       name: 'Example Member',

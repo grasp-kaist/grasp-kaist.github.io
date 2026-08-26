@@ -5,6 +5,7 @@ import {
   DiscordInputError,
   getGuildUserId,
   getModalMemberOrder,
+  getSingleModalValue,
   getOptionalModalText,
   getRequiredMemberOrderOption,
   getRequiredModalText,
@@ -28,6 +29,7 @@ import {
   preparedPhotoPreviewEdit,
   profilePanelResponse,
   profilePanelEdit,
+  profilePanelUpdateResponse,
   registerModalResponse,
 } from './payloads.js';
 import type {
@@ -175,6 +177,28 @@ export class DiscordInteractionRouter {
       throw new DiscordInputError('Unsupported profile component.');
     }
 
+    if (customId === 'profile:edit') {
+      return {
+        response: profilePanelUpdateResponse(
+          this.#requireActiveProfileLocal(userId),
+          undefined,
+          this.#config.publicationMode,
+          true,
+        ),
+      };
+    }
+
+    if (customId === 'profile:view') {
+      return {
+        response: profilePanelUpdateResponse(
+          this.#requireActiveProfileLocal(userId),
+          undefined,
+          this.#config.publicationMode,
+          false,
+        ),
+      };
+    }
+
     if (customId === 'profile:edit-basic') {
       return { response: editBasicModalResponse(this.#requireActiveProfileLocal(userId)) };
     }
@@ -194,71 +218,48 @@ export class DiscordInteractionRouter {
 
     const actor = this.#actor(interaction, userId);
 
-    const saveDraftMatch = customId.match(/^profile:save-draft:([0-9a-f]{20})$/);
+    const saveDraftMatch = customId.match(/^profile:save-edits:([0-9a-f]{20})$/);
 
     if (saveDraftMatch) {
-      const expectedDraftRevision = saveDraftMatch[1]!;
+      const expectedEditRevision = saveDraftMatch[1]!;
       return this.#deferredMutation(
         interaction,
-        () => this.#service.saveOwnProfileDraft(actor, expectedDraftRevision),
+        () => this.#service.saveOwnProfileEdits(actor, expectedEditRevision),
         this.#config.publicationMode === 'sandbox'
-          ? 'Your draft was saved in the sandbox. The website was not changed.'
-          : 'Your draft was published.',
+          ? 'All profile changes were saved together in the sandbox. The website was not changed.'
+          : 'All profile changes were published together.',
         true,
       );
     }
 
-    const discardDraftMatch = customId.match(/^profile:discard-draft:([0-9a-f]{20})$/);
+    const discardDraftMatch = customId.match(/^profile:discard-edits:([0-9a-f]{20})$/);
 
     if (discardDraftMatch) {
       return this.#deferredProfilePanelMutation(
         interaction,
-        () => this.#service.discardOwnProfileDraft(actor, discardDraftMatch[1]!),
-        () => 'Draft discarded. The published profile was not changed.',
+        () => this.#service.discardOwnProfileEdits(actor, discardDraftMatch[1]!),
+        () => 'Pending changes discarded. The published profile was not changed.',
       );
     }
 
-    const removePhotoMatch = customId.match(/^profile:remove-photo:([0-9a-f]{20})$/);
+    const removePhotoMatch = customId.match(/^profile:stage-remove-photo:([0-9a-f]{20})$/);
 
     if (removePhotoMatch) {
-      const expectedRevision = removePhotoMatch[1]!;
-      return this.#deferredMutation(
+      const expectedEditRevision = removePhotoMatch[1]!;
+      return this.#deferredProfilePanelMutation(
         interaction,
-        () => this.#service.removeOwnPhoto(actor, expectedRevision),
-        'Your profile photo was removed.',
-        true,
+        () => this.#service.stageOwnPhotoRemoval(actor, expectedEditRevision),
+        () => 'Photo removal added to your pending changes. Nothing has been published yet.',
       );
     }
 
-    const setListedMatch = customId.match(
-      /^profile:set-listed:([01]):([0-9a-f]{20})$/,
-    );
-
-    if (setListedMatch) {
-      const listed = setListedMatch[1] === '1';
-      const expectedRevision = setListedMatch[2]!;
-      return this.#deferredMutation(
-        interaction,
-        () => this.#service.setOwnListed(actor, listed, expectedRevision),
-        this.#config.publicationMode === 'sandbox'
-          ? `Sandbox listing flag set to ${listed ? 'listed' : 'hidden'}. The website was not changed.`
-          : listed
-            ? 'Your profile is now shown on the Members page.'
-            : 'Your profile is now hidden from the Members page.',
-        true,
-      );
-    }
-
-    const confirmToken = getPhotoActionToken(customId, 'profile:photo-confirm:');
+    const confirmToken = getPhotoActionToken(customId, 'profile:photo-use:');
 
     if (confirmToken) {
-      return this.#deferredMutation(
+      return this.#deferredProfilePanelMutation(
         interaction,
-        () => this.#service.confirmOwnPhoto(actor, confirmToken),
-        this.#config.publicationMode === 'sandbox'
-          ? 'Your profile photo was saved in the sandbox. The website was not changed.'
-          : 'Your profile photo was published.',
-        true,
+        () => this.#service.acceptOwnPhoto(actor, confirmToken),
+        () => 'New photo added to your pending changes. Nothing has been published yet.',
       );
     }
 
@@ -281,6 +282,7 @@ export class DiscordInteractionRouter {
                     snapshot,
                     'Profile photo change cancelled.',
                     this.#config.publicationMode,
+                    true,
                   )
                 : photoFlowFinishedEdit('Profile photo change cancelled.'),
             );
@@ -382,11 +384,15 @@ export class DiscordInteractionRouter {
     if (categoryProfileMatch) {
       const expectedRevision = categoryProfileMatch[1]!;
       const order = getModalMemberOrder(interaction);
+      const visibility = getSingleModalValue(interaction, 'visibility');
+      if (visibility !== 'listed' && visibility !== 'hidden') {
+        throw new DiscordInputError('Profile visibility must be shown or hidden.');
+      }
       return this.#deferredProfilePanelMutation(
         interaction,
         () => this.#service.stageOwnProfileDraft(
           actor,
-          { order },
+          { order, listed: visibility === 'listed' },
           expectedRevision,
         ),
         draftStageNotice,
@@ -459,6 +465,7 @@ export class DiscordInteractionRouter {
               snapshot,
               notice(snapshot),
               this.#config.publicationMode,
+              true,
             ),
           );
         } catch (error) {
@@ -527,9 +534,9 @@ function isExpectedPendingError(error: unknown) {
 }
 
 function draftStageNotice(snapshot: ProfileSnapshot) {
-  return snapshot.draft
-    ? 'Draft updated. Nothing has been published yet.'
-    : 'No draft changes to save. Your published profile was not changed.';
+  return snapshot.draft || snapshot.pendingPhoto
+    ? 'Pending changes updated. Nothing has been published yet.'
+    : 'No pending changes to save. Your published profile was not changed.';
 }
 
 function limitedRequiredText(

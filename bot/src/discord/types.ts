@@ -11,11 +11,19 @@ export type ProfileBindingStatus = 'provisioning' | 'active';
 export type ProfileSnapshot = {
   profileSlug: string;
   stateRevision: string;
+  editRevision: string;
   profile: MemberProfile;
   draft?: {
     profile: MemberProfile;
     revision: string;
     baseStateRevision: string;
+    isPublishing: boolean;
+    stale: boolean;
+  };
+  pendingPhoto?: {
+    stagedPhotoId: string;
+    width: number;
+    height: number;
     isPublishing: boolean;
     stale: boolean;
   };
@@ -48,6 +56,7 @@ export type EditableProfilePatch = Partial<
     | 'researchInterests'
     | 'contact'
     | 'website'
+    | 'listed'
   >
 >;
 
@@ -83,11 +92,24 @@ export type ProfileService = {
     actor: DiscordActor,
     expectedDraftRevision: string,
   ): Promise<ProfileOperationResult>;
+  saveOwnProfileEdits(
+    actor: DiscordActor,
+    expectedEditRevision: string,
+  ): Promise<ProfileOperationResult>;
+  discardOwnProfileEdits(
+    actor: DiscordActor,
+    expectedEditRevision: string,
+  ): ProfileSnapshot;
   prepareOwnPhoto(
     actor: DiscordActor,
     input: { bytes: Uint8Array; filename: string; contentType?: string },
   ): Promise<PreparedProfilePhoto>;
   confirmOwnPhoto(actor: DiscordActor, stagedPhotoId: string): Promise<ProfileOperationResult>;
+  acceptOwnPhoto(actor: DiscordActor, stagedPhotoId: string): ProfileSnapshot;
+  stageOwnPhotoRemoval(
+    actor: DiscordActor,
+    expectedEditRevision: string,
+  ): ProfileSnapshot;
   discardOwnPhoto(actor: DiscordActor, stagedPhotoId: string): Promise<void>;
   removeOwnPhoto(
     actor: DiscordActor,

@@ -132,6 +132,7 @@ export type StagedPhoto = {
   width: number;
   height: number;
   status: 'prepared' | 'publishing';
+  selectedAt?: string;
   createdAt: string;
   expiresAt: string;
 };
@@ -620,7 +621,8 @@ export class SqliteStore {
       this.#database
         .prepare(
           `DELETE FROM staged_photos
-           WHERE guild_id = ? AND discord_user_id = ? AND status = 'prepared'`,
+           WHERE guild_id = ? AND discord_user_id = ? AND status = 'prepared'
+             AND selected_at IS NULL`,
         )
         .run(input.guildId, input.discordUserId);
 
@@ -651,7 +653,7 @@ export class SqliteStore {
     const row = this.#database
       .prepare(
         `SELECT id, guild_id, discord_user_id, profile_slug, photo_bytes,
-                width, height, status, created_at, expires_at
+                width, height, status, selected_at, created_at, expires_at
          FROM staged_photos
          WHERE id = ? AND guild_id = ? AND discord_user_id = ?`,
       )
@@ -680,6 +682,56 @@ export class SqliteStore {
     }
 
     return mapStagedPhoto(row);
+  }
+
+  getSelectedStagedPhoto(guildId: string, discordUserId: string) {
+    const row = this.#database
+      .prepare(
+        `SELECT id, guild_id, discord_user_id, profile_slug, photo_bytes,
+                width, height, status, selected_at, created_at, expires_at
+         FROM staged_photos
+         WHERE guild_id = ? AND discord_user_id = ? AND selected_at IS NOT NULL
+         ORDER BY selected_at DESC, created_at DESC, id DESC
+         LIMIT 1`,
+      )
+      .get(guildId, discordUserId) as StagedPhotoRow | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    return row.status === 'publishing'
+      ? mapStagedPhoto(row)
+      : this.getStagedPhoto(guildId, discordUserId, row.id);
+  }
+
+  selectStagedPhoto(guildId: string, discordUserId: string, id: string) {
+    return this.#transaction(() => {
+      const staged = this.getStagedPhoto(guildId, discordUserId, id);
+
+      if (!staged || staged.status !== 'prepared') {
+        throw new Error('The staged photo is missing, expired, or already being published.');
+      }
+
+      this.#database
+        .prepare(
+          `DELETE FROM staged_photos
+           WHERE guild_id = ? AND discord_user_id = ? AND id <> ? AND status = 'prepared'`,
+        )
+        .run(guildId, discordUserId, id);
+
+      const selectedAt = this.#timestamp();
+      const result = this.#database
+        .prepare(
+          `UPDATE staged_photos
+           SET selected_at = ?
+           WHERE id = ? AND guild_id = ? AND discord_user_id = ? AND status = 'prepared'`,
+        )
+        .run(selectedAt, id, guildId, discordUserId);
+      assertChanged(result, 'The staged photo changed before it could be selected.');
+
+      return this.getStagedPhoto(guildId, discordUserId, id)!;
+    });
   }
 
   claimStagedPhoto(guildId: string, discordUserId: string, id: string) {
@@ -1582,6 +1634,7 @@ export class SqliteStore {
         width INTEGER NOT NULL CHECK (width > 0),
         height INTEGER NOT NULL CHECK (height > 0),
         status TEXT NOT NULL CHECK (status IN ('prepared', 'publishing')),
+        selected_at TEXT,
         created_at TEXT NOT NULL,
         expires_at TEXT NOT NULL
       );
@@ -1653,6 +1706,13 @@ export class SqliteStore {
     const publicationJobColumns = this.#database
       .prepare('PRAGMA table_info(profile_publish_jobs)')
       .all() as unknown as Array<{ name: string }>;
+    const stagedPhotoColumns = this.#database
+      .prepare('PRAGMA table_info(staged_photos)')
+      .all() as unknown as Array<{ name: string }>;
+
+    if (!stagedPhotoColumns.some((column) => column.name === 'selected_at')) {
+      this.#database.exec('ALTER TABLE staged_photos ADD COLUMN selected_at TEXT');
+    }
 
     if (publicationJobColumns.some((column) => column.name === 'admin_action')) {
       const removedAt = this.#timestamp();
@@ -1801,6 +1861,7 @@ type StagedPhotoRow = {
   width: number;
   height: number;
   status: 'prepared' | 'publishing';
+  selected_at: string | null;
   created_at: string;
   expires_at: string;
 };
@@ -1920,6 +1981,7 @@ function mapStagedPhoto(row: StagedPhotoRow): StagedPhoto {
     width: row.width,
     height: row.height,
     status: row.status,
+    ...(row.selected_at ? { selectedAt: row.selected_at } : {}),
     createdAt: row.created_at,
     expiresAt: row.expires_at,
   };

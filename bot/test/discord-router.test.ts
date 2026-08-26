@@ -19,6 +19,8 @@ const GUILD_ID = '222222222222222222';
 const USER_ID = '333333333333333333';
 const STATE_REVISION = '0123456789abcdefabcd';
 const DRAFT_REVISION = 'fedcba9876543210fedc';
+const EDIT_REVISION = '11111111111111111111';
+const DRAFT_EDIT_REVISION = '22222222222222222222';
 
 test('register uses only a local probe before opening a current Label modal', async () => {
   let localProbes = 0;
@@ -141,7 +143,7 @@ test('profile explains registration delay when no usable profile is available', 
   );
 });
 
-test('profile edit button opens its modal from local state without a repository read', async () => {
+test('profile edit hub and section modal open from local state without a repository read', async () => {
   let localProbes = 0;
   let profileReads = 0;
   const harness = createHarness({
@@ -155,13 +157,24 @@ test('profile edit button opens its modal from local state without a repository 
     },
   });
 
+  const hub = await harness.router.route(componentInteraction('profile:edit'));
+  assert.equal(hub.response.type, 7);
+  const hubComponents = hub.response.data?.components as Array<Record<string, unknown>>;
+  assert.equal(JSON.stringify(hubComponents).includes('profile:save-edits:'), true);
+
+  const view = await harness.router.route(componentInteraction('profile:view'));
+  assert.equal(view.response.type, 7);
+  const viewComponents = view.response.data?.components as Array<Record<string, unknown>>;
+  assert.equal(JSON.stringify(viewComponents).includes('profile:edit'), true);
+  assert.equal(JSON.stringify(viewComponents).includes('profile:save-edits:'), false);
+
   const routed = await harness.router.route(componentInteraction('profile:edit-basic'));
   assert.equal(routed.response.type, 9);
   assert.equal(
     routed.response.data?.custom_id,
     `profile-basic:v1:${STATE_REVISION}`,
   );
-  assert.equal(localProbes, 1);
+  assert.equal(localProbes, 3);
   assert.equal(profileReads, 0);
 });
 
@@ -294,6 +307,10 @@ test('text and category forms merge into drafts without publishing', async () =>
         type: 18,
         component: { type: 3, custom_id: 'category', values: ['2'] },
       },
+      {
+        type: 18,
+        component: { type: 3, custom_id: 'visibility', values: ['listed'] },
+      },
     ]),
   );
 
@@ -313,26 +330,26 @@ test('text and category forms merge into drafts without publishing', async () =>
       },
       expectedRevision: STATE_REVISION,
     },
-    { patch: { order: 2 }, expectedRevision: STATE_REVISION },
+    { patch: { order: 2, listed: true }, expectedRevision: STATE_REVISION },
   ]);
 });
 
 test('Save changes is the only profile-edit action that invokes publication', async () => {
   let saved: unknown;
   const harness = createHarness({
-    saveOwnProfileDraft: async (actor, expectedDraftRevision) => {
-      saved = { actor, expectedDraftRevision };
+    saveOwnProfileEdits: async (actor, expectedEditRevision) => {
+      saved = { actor, expectedEditRevision };
       return { queued: true, operationId: 'draft-operation', deploymentStatus: 'queued' };
     },
   });
-  const interaction = componentInteraction(`profile:save-draft:${DRAFT_REVISION}`);
+  const interaction = componentInteraction(`profile:save-edits:${DRAFT_EDIT_REVISION}`);
   const routed = await harness.router.route(interaction);
   assert.equal(routed.response.type, 6);
   assert.equal(saved, undefined);
   await routed.afterResponse?.();
   assert.deepEqual(saved, {
     actor: { interactionId: interaction.id, guildId: GUILD_ID, userId: USER_ID },
-    expectedDraftRevision: DRAFT_REVISION,
+    expectedEditRevision: DRAFT_EDIT_REVISION,
   });
   const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
   assert.match(String(components[0]?.content), /GitHub may be temporarily unavailable/i);
@@ -343,11 +360,11 @@ test('a profile publication already in progress is shown as waiting, not failed'
     code: 'publication_pending',
   });
   const harness = createHarness({
-    saveOwnProfileDraft: async () => {
+    saveOwnProfileEdits: async () => {
       throw pendingError;
     },
   });
-  const interaction = componentInteraction(`profile:save-draft:${DRAFT_REVISION}`);
+  const interaction = componentInteraction(`profile:save-edits:${DRAFT_EDIT_REVISION}`);
 
   const routed = await harness.router.route(interaction);
   await routed.afterResponse?.();
@@ -360,15 +377,15 @@ test('a profile publication already in progress is shown as waiting, not failed'
   assert.deepEqual(harness.errors, []);
 });
 
-test('Discard draft clears only the selected revision without publishing', async () => {
+test('Discard changes clears the selected edit session without publishing', async () => {
   let discarded: unknown;
   const harness = createHarness({
-    discardOwnProfileDraft: (actor, expectedDraftRevision) => {
-      discarded = { actor, expectedDraftRevision };
+    discardOwnProfileEdits: (actor, expectedEditRevision) => {
+      discarded = { actor, expectedEditRevision };
       return snapshot();
     },
   });
-  const interaction = componentInteraction(`profile:discard-draft:${DRAFT_REVISION}`);
+  const interaction = componentInteraction(`profile:discard-edits:${DRAFT_EDIT_REVISION}`);
 
   const routed = await harness.router.route(interaction);
 
@@ -377,13 +394,13 @@ test('Discard draft clears only the selected revision without publishing', async
   await routed.afterResponse?.();
   assert.deepEqual(discarded, {
     actor: { interactionId: interaction.id, guildId: GUILD_ID, userId: USER_ID },
-    expectedDraftRevision: DRAFT_REVISION,
+    expectedEditRevision: DRAFT_EDIT_REVISION,
   });
   const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
-  assert.match(String(components[0]?.content), /Draft discarded/i);
+  assert.match(String(components[0]?.content), /Pending changes discarded/i);
 });
 
-test('an unchanged profile form says there is no draft to save', async () => {
+test('an unchanged profile form says there are no pending changes to save', async () => {
   const harness = createHarness({
     stageOwnProfileDraft: () => snapshot(),
   });
@@ -398,8 +415,9 @@ test('an unchanged profile form says there is no draft to save', async () => {
   await routed.afterResponse?.();
 
   const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
-  assert.match(String(components[0]?.content), /No draft changes to save/i);
-  assert.equal(JSON.stringify(components).includes('profile:save-draft:'), false);
+  assert.match(String(components[0]?.content), /No pending changes to save/i);
+  const saveButton = findButton(components, 'Save changes');
+  assert.equal(saveButton?.disabled, true);
 });
 
 test('photo modal resolves and downloads the selected attachment only after deferring', async () => {
@@ -462,19 +480,19 @@ test('photo modal resolves and downloads the selected attachment only after defe
   const row = previewComponents.find((component) => component.type === 1)!;
   assert.deepEqual(
     (row.components as Array<Record<string, unknown>>).map((button) => button.custom_id),
-    ['profile:photo-confirm:stage_123', 'profile:photo-cancel:stage_123'],
+    ['profile:photo-use:stage_123', 'profile:photo-cancel:stage_123'],
   );
 });
 
-test('photo confirmation defers an update and service revalidates the staged ID', async () => {
+test('using a prepared photo only adds it to pending changes', async () => {
   let confirmed: string | undefined;
   const harness = createHarness({
-    confirmOwnPhoto: async (_actor, stagedPhotoId) => {
+    acceptOwnPhoto: (_actor, stagedPhotoId) => {
       confirmed = stagedPhotoId;
-      return { snapshot: snapshot(), commitSha: 'photo-commit' };
+      return snapshotWithDraft({ photo: 'taein-oh.webp' });
     },
   });
-  const interaction = componentInteraction('profile:photo-confirm:stage_123');
+  const interaction = componentInteraction('profile:photo-use:stage_123');
 
   const routed = await harness.router.route(interaction);
   assert.equal(routed.response.type, 6);
@@ -487,50 +505,47 @@ test('photo confirmation defers an update and service revalidates the staged ID'
   assert.equal(components.some((component) => component.type === 17), true);
 });
 
-test('direct profile actions pass the panel state revision to the service', async () => {
+test('photo removal is staged while legacy direct-publish buttons are rejected', async () => {
   const calls: unknown[] = [];
   const harness = createHarness({
-    removeOwnPhoto: async (actor, expectedRevision) => {
-      calls.push({ action: 'remove', actor, expectedRevision });
+    stageOwnPhotoRemoval: (actor, expectedEditRevision) => {
+      calls.push({ action: 'stage-remove', actor, expectedEditRevision });
+      return snapshotWithDraft({ photo: '' });
+    },
+    removeOwnPhoto: async () => {
+      calls.push({ action: 'legacy-remove-published' });
       return {};
     },
-    setOwnListed: async (actor, listed, expectedRevision) => {
-      calls.push({ action: 'listed', actor, listed, expectedRevision });
+    setOwnListed: async () => {
+      calls.push({ action: 'legacy-listed-published' });
       return {};
     },
   });
 
   const remove = await harness.router.route(
+    componentInteraction(`profile:stage-remove-photo:${EDIT_REVISION}`),
+  );
+  const legacyRemove = await harness.router.route(
     componentInteraction(`profile:remove-photo:${STATE_REVISION}`),
   );
-  const listed = await harness.router.route(
+  const legacyListed = await harness.router.route(
     componentInteraction(`profile:set-listed:1:${STATE_REVISION}`),
   );
   assert.equal(remove.response.type, 6);
-  assert.equal(listed.response.type, 6);
+  assert.equal(legacyRemove.response.type, 4);
+  assert.equal(legacyListed.response.type, 4);
   assert.deepEqual(calls, []);
 
   await remove.afterResponse?.();
-  await listed.afterResponse?.();
   assert.deepEqual(calls, [
     {
-      action: 'remove',
+      action: 'stage-remove',
       actor: {
         interactionId: '999999999999999999',
         guildId: GUILD_ID,
         userId: USER_ID,
       },
-      expectedRevision: STATE_REVISION,
-    },
-    {
-      action: 'listed',
-      actor: {
-        interactionId: '999999999999999999',
-        guildId: GUILD_ID,
-        userId: USER_ID,
-      },
-      listed: true,
-      expectedRevision: STATE_REVISION,
+      expectedEditRevision: EDIT_REVISION,
     },
   ]);
 });
@@ -598,6 +613,8 @@ function defaultService(): ProfileService {
     stageOwnProfileDraft: () => snapshotWithDraft({}),
     discardOwnProfileDraft: () => snapshot(),
     saveOwnProfileDraft: async () => ({}),
+    discardOwnProfileEdits: () => snapshot(),
+    saveOwnProfileEdits: async () => ({}),
     prepareOwnPhoto: async () => ({
       stagedPhotoId: 'stage_default',
       previewBytes: new Uint8Array([1]),
@@ -605,6 +622,8 @@ function defaultService(): ProfileService {
       height: 1,
     }),
     confirmOwnPhoto: async () => ({}),
+    acceptOwnPhoto: () => snapshotWithDraft({ photo: 'taein-oh.webp' }),
+    stageOwnPhotoRemoval: () => snapshotWithDraft({ photo: '' }),
     discardOwnPhoto: async () => undefined,
     removeOwnPhoto: async () => ({}),
     setOwnListed: async () => ({}),
@@ -615,6 +634,7 @@ function snapshot(): ProfileSnapshot {
   return {
     profileSlug: 'taein-oh',
     stateRevision: STATE_REVISION,
+    editRevision: EDIT_REVISION,
     bindingStatus: 'active',
     profile: createEmptyProfile({
       name: 'Taein Oh',
@@ -635,7 +655,28 @@ function snapshotWithDraft(
     isPublishing: false,
     stale: false,
   };
+  current.editRevision = DRAFT_EDIT_REVISION;
   return current;
+}
+
+function findButton(components: Array<Record<string, unknown>>, label: string) {
+  for (const component of components) {
+    const children = component.components as Array<Record<string, unknown>> | undefined;
+    if (!children) {
+      continue;
+    }
+    for (const child of children) {
+      if (child.label === label) {
+        return child;
+      }
+      const nested = child.components as Array<Record<string, unknown>> | undefined;
+      const match = nested?.find((button) => button.label === label);
+      if (match) {
+        return match;
+      }
+    }
+  }
+  return undefined;
 }
 
 function commandInteraction(

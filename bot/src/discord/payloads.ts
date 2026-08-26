@@ -197,7 +197,7 @@ export function categoryModalResponse(snapshot: ProfileSnapshot): DiscordInterac
     type: 9,
     data: {
       custom_id: `profile-category:v1:${revision}`,
-      title: 'Member category',
+      title: 'Category and visibility',
       components: [
         draftOnlyNotice(),
         {
@@ -214,6 +214,29 @@ export function categoryModalResponse(snapshot: ProfileSnapshot): DiscordInterac
               value: String(order),
               default: order === profile.order,
             })),
+          },
+        },
+        {
+          type: 18,
+          label: 'Members page visibility',
+          component: {
+            type: 3,
+            custom_id: 'visibility',
+            min_values: 1,
+            max_values: 1,
+            required: true,
+            options: [
+              {
+                label: 'Show on the Members page',
+                value: 'listed',
+                default: profile.listed,
+              },
+              {
+                label: 'Hide from the Members page',
+                value: 'hidden',
+                default: !profile.listed,
+              },
+            ],
           },
         },
       ],
@@ -249,13 +272,14 @@ export function photoUploadModalResponse(): DiscordInteractionResponse {
 export function profilePanelResponse(
   snapshot: ProfileSnapshot,
   publicationMode: 'sandbox' | 'production' = 'production',
+  editing = hasPendingEdits(snapshot),
 ): DiscordInteractionResponse {
   return {
     type: 4,
     data: {
       flags: EPHEMERAL_FLAG | IS_COMPONENTS_V2_FLAG,
       allowed_mentions: { parse: [] },
-      components: profilePanelComponents(snapshot, undefined, publicationMode),
+      components: profilePanelComponents(snapshot, undefined, publicationMode, editing),
     },
   };
 }
@@ -264,18 +288,20 @@ export function profilePanelEdit(
   snapshot: ProfileSnapshot,
   notice?: string,
   publicationMode: 'sandbox' | 'production' = 'production',
+  editing = hasPendingEdits(snapshot),
 ): DiscordMessagePayload {
-  return v2Edit(profilePanelComponents(snapshot, notice, publicationMode), []);
+  return v2Edit(profilePanelComponents(snapshot, notice, publicationMode, editing), []);
 }
 
 export function profilePanelUpdateResponse(
   snapshot: ProfileSnapshot,
   notice?: string,
   publicationMode: 'sandbox' | 'production' = 'production',
+  editing = true,
 ): DiscordInteractionResponse {
   return {
     type: 7,
-    data: v2Edit(profilePanelComponents(snapshot, notice, publicationMode), []),
+    data: v2Edit(profilePanelComponents(snapshot, notice, publicationMode, editing), []),
   };
 }
 
@@ -283,10 +309,18 @@ function profilePanelComponents(
   snapshot: ProfileSnapshot,
   notice: string | undefined,
   publicationMode: 'sandbox' | 'production',
+  editing: boolean,
 ) {
-  const revision = assertProfileRevision(snapshot.stateRevision);
+  const editRevision = assertProfileRevision(snapshot.editRevision);
   const draft = snapshot.draft;
+  const pendingPhoto = snapshot.pendingPhoto;
   const profile = draft?.profile ?? snapshot.profile;
+  const missingPendingPhoto = Boolean(
+    draft
+    && !pendingPhoto
+    && draft.profile.photo !== ''
+    && draft.profile.photo !== snapshot.profile.photo,
+  );
   const category = memberCategories.find(({ order }) => order === profile.order)?.label;
   const statusText = snapshot.bindingStatus === 'active' ? '' : `\nStatus: **${snapshot.bindingStatus}**`;
   const summary = [
@@ -302,71 +336,74 @@ function profilePanelComponents(
     snapshot.lastCommitSha
       ? `${publicationMode === 'sandbox' ? 'Sandbox revision' : 'Last commit'}: \`${escapeInlineCode(snapshot.lastCommitSha.slice(0, 12))}\``
       : '',
+    pendingPhoto
+      ? `Pending photo: **new photo ready (${pendingPhoto.width}×${pendingPhoto.height})**`
+      : missingPendingPhoto
+        ? 'Pending photo: **upload it again before saving**'
+      : draft && draft.profile.photo === '' && snapshot.profile.photo !== ''
+        ? 'Pending photo: **remove current photo**'
+        : '',
   ]
     .filter(Boolean)
     .join('\n');
 
   const containerChildren: Record<string, unknown>[] = [];
 
-  if (draft) {
-    const draftStatus = draft.isPublishing
-      ? '## Draft is being published\nEditing is temporarily unavailable. Run `/profile` again shortly.'
-      : draft.stale
-        ? '## Draft needs review\nThe published profile changed. Discard this draft and edit again.'
-        : '## Draft changes — not published\nThe preview below contains your draft. The website still shows the last published version.';
-    containerChildren.push({ type: 10, content: draftStatus });
+  const hasPending = hasPendingEdits(snapshot);
+  const publishing = Boolean(draft?.isPublishing || pendingPhoto?.isPublishing);
+  const stale = Boolean(draft?.stale || pendingPhoto?.stale);
+
+  if (editing || hasPending) {
+    const editStatus = publishing
+      ? '## Changes are being published\nEditing is temporarily unavailable. Run `/profile` again shortly.'
+      : stale
+        ? '## Changes need review\nThe published profile changed. Discard these changes and edit again.'
+        : missingPendingPhoto
+          ? '## Photo needs attention\nThe prepared photo expired. Use **Change photo** to upload it again, or **Remove photo** to cancel that photo change.'
+        : hasPending
+          ? '## Pending changes — not published\nReview the preview below, then use **Save changes** once to publish everything together.'
+          : '## Edit profile\nChange any sections you need, then use **Save changes** once.';
+    containerChildren.push({ type: 10, content: editStatus });
   }
 
   containerChildren.push({ type: 10, content: summary });
 
   if (snapshot.bindingStatus === 'active') {
-    const editLocked = Boolean(draft?.isPublishing || draft?.stale);
-    const directMutationLocked = Boolean(draft);
-    containerChildren.push(
-      {
-        type: 1,
-        components: [
-          button('Name & position', 'profile:edit-basic', 1, editLocked),
-          button('Profile details', 'profile:edit-text', 2, editLocked),
-          button('Category', 'profile:edit-category', 2, editLocked),
-          button('Change photo', 'profile:replace-photo', 2, directMutationLocked),
-        ],
-      },
-      {
-        type: 1,
-        components: [
-          button('Remove photo', `profile:remove-photo:${revision}`, 4, directMutationLocked),
-          button(
-            publicationMode === 'sandbox'
-              ? (profile.listed ? 'Mark hidden (sandbox)' : 'Mark listed (sandbox)')
-              : (profile.listed ? 'Hide from website' : 'Show on website'),
-            `profile:set-listed:${profile.listed ? '0' : '1'}:${revision}`,
-            profile.listed ? 2 : 3,
-            directMutationLocked,
-          ),
-        ],
-      },
-    );
-
-    if (draft) {
-      const draftRevision = assertProfileRevision(draft.revision);
+    if (!editing && !hasPending) {
       containerChildren.push({
         type: 1,
         components: [
-          button(
-            'Save changes',
-            `profile:save-draft:${draftRevision}`,
-            3,
-            draft.isPublishing || draft.stale,
-          ),
-          button(
-            'Discard draft',
-            `profile:discard-draft:${draftRevision}`,
-            4,
-            draft.isPublishing,
-          ),
+          button('Edit profile', 'profile:edit', 1),
         ],
       });
+    } else {
+      const editLocked = publishing || stale;
+      const hasPhoto = Boolean(pendingPhoto || profile.photo || snapshot.profile.photo);
+      containerChildren.push(
+        {
+          type: 1,
+          components: [
+            button('Name & position', 'profile:edit-basic', 1, editLocked),
+            button('Profile details', 'profile:edit-text', 2, editLocked),
+            button('Category & visibility', 'profile:edit-category', 2, editLocked),
+            button('Change photo', 'profile:replace-photo', 2, editLocked),
+          ],
+        },
+        {
+          type: 1,
+          components: [
+            button('Remove photo', `profile:stage-remove-photo:${editRevision}`, 4, editLocked || !hasPhoto),
+            button(
+              'Save changes',
+              `profile:save-edits:${editRevision}`,
+              3,
+              editLocked || missingPendingPhoto || !hasPending,
+            ),
+            button('Discard changes', `profile:discard-edits:${editRevision}`, 2, publishing || !hasPending),
+            ...(!hasPending ? [button('Back', 'profile:view', 2)] : []),
+          ],
+        },
+      );
     }
   }
 
@@ -467,7 +504,8 @@ export function preparedPhotoPreviewEdit(prepared: PreparedProfilePhoto): {
       type: 10,
       content:
         `## Profile photo preview\n` +
-        `${prepared.width}×${prepared.height} WebP. Save this result?`,
+        `${prepared.width}×${prepared.height} WebP. Use this result in your pending changes? `
+        + 'It will not be published until you use **Save changes**.',
     },
     {
       type: 12,
@@ -481,7 +519,7 @@ export function preparedPhotoPreviewEdit(prepared: PreparedProfilePhoto): {
     {
       type: 1,
       components: [
-        button('Save photo', `profile:photo-confirm:${stagedPhotoId}`, 3),
+        button('Use this photo', `profile:photo-use:${stagedPhotoId}`, 3),
         button('Cancel', `profile:photo-cancel:${stagedPhotoId}`, 2),
       ],
     },
@@ -551,8 +589,12 @@ function paragraphInput(
 function draftOnlyNotice() {
   return {
     type: 10,
-    content: 'Submitting this form updates your draft only. Use **Save changes** on the profile panel to publish it.',
+    content: 'Submitting this form updates your pending changes only. Use **Save changes** on the profile panel to publish everything together.',
   };
+}
+
+function hasPendingEdits(snapshot: ProfileSnapshot) {
+  return Boolean(snapshot.draft || snapshot.pendingPhoto);
 }
 
 function editableProfile(snapshot: ProfileSnapshot) {

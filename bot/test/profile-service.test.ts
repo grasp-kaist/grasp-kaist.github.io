@@ -498,6 +498,303 @@ test('saving a profile draft publishes the full editable draft exactly once', as
   }
 });
 
+test('fields, visibility, and a selected photo publish together in one profile update', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    const draft = service.stageOwnProfileDraft(
+      actor('stage-combined-fields'),
+      { details: ['Combined edit'], listed: true },
+      currentRevision(service),
+    );
+    const source = await sharp({
+      create: { width: 900, height: 1200, channels: 3, background: '#336699' },
+    })
+      .png()
+      .toBuffer();
+    const preview = await service.prepareOwnPhoto(actor('prepare-combined-photo'), {
+      bytes: source,
+      filename: 'portrait.png',
+    });
+    const accepted = service.acceptOwnPhoto(
+      actor('accept-combined-photo'),
+      preview.stagedPhotoId,
+    );
+
+    assert.equal(publisher.calls.length, 1, 'draft editing and photo selection must not publish');
+    assert.equal(accepted.draft?.profile.listed, true);
+    assert.equal(accepted.draft?.profile.photo, 'example-member.webp');
+    assert.equal(accepted.pendingPhoto?.stagedPhotoId, preview.stagedPhotoId);
+    assert.notEqual(accepted.editRevision, draft.editRevision);
+
+    const saved = await service.saveOwnProfileEdits(
+      actor('save-combined-edit'),
+      accepted.editRevision,
+    );
+    const call = publisher.calls[1];
+    const publishedProfile = JSON.parse(call!.profile.json);
+
+    assert.equal(publisher.calls.length, 2);
+    assert.equal(call?.action, 'PROFILE_UPDATE');
+    assert.equal(call?.photo?.kind, 'upsert');
+    assert.deepEqual(publishedProfile.details, ['Combined edit']);
+    assert.equal(publishedProfile.listed, true);
+    assert.equal(publishedProfile.photo, 'example-member.webp');
+    assert.equal(saved.snapshot?.draft, undefined);
+    assert.equal(saved.snapshot?.pendingPhoto, undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test('photo-only replacement remains pending even when the profile JSON is unchanged', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    const firstBytes = await sharp({
+      create: { width: 400, height: 500, channels: 3, background: '#111111' },
+    }).png().toBuffer();
+    const first = await service.prepareOwnPhoto(actor('prepare-first-photo'), {
+      bytes: firstBytes,
+      filename: 'first.png',
+    });
+    await service.confirmOwnPhoto(actor('publish-first-photo'), first.stagedPhotoId);
+
+    const replacementBytes = await sharp({
+      create: { width: 400, height: 500, channels: 3, background: '#eeeeee' },
+    }).png().toBuffer();
+    const replacement = await service.prepareOwnPhoto(actor('prepare-replacement-photo'), {
+      bytes: replacementBytes,
+      filename: 'replacement.png',
+    });
+    const accepted = service.acceptOwnPhoto(
+      actor('accept-replacement-photo'),
+      replacement.stagedPhotoId,
+    );
+
+    assert.equal(accepted.draft, undefined);
+    assert.equal(accepted.pendingPhoto?.stagedPhotoId, replacement.stagedPhotoId);
+    assert.equal(publisher.calls.length, 2);
+
+    await service.saveOwnProfileEdits(
+      actor('save-replacement-photo'),
+      accepted.editRevision,
+    );
+
+    assert.equal(publisher.calls.length, 3);
+    assert.equal(publisher.calls[2]?.action, 'PROFILE_UPDATE');
+    assert.equal(publisher.calls[2]?.photo?.kind, 'upsert');
+  } finally {
+    store.close();
+  }
+});
+
+test('cancelling a new photo preview keeps the previously selected photo', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    const firstBytes = await sharp({
+      create: { width: 400, height: 500, channels: 3, background: '#112233' },
+    }).png().toBuffer();
+    const first = await service.prepareOwnPhoto(actor('prepare-selected-photo'), {
+      bytes: firstBytes,
+      filename: 'first.png',
+    });
+    service.acceptOwnPhoto(actor('accept-selected-photo'), first.stagedPhotoId);
+
+    const secondBytes = await sharp({
+      create: { width: 400, height: 500, channels: 3, background: '#445566' },
+    }).png().toBuffer();
+    const second = await service.prepareOwnPhoto(actor('prepare-cancelled-photo'), {
+      bytes: secondBytes,
+      filename: 'second.png',
+    });
+    await service.discardOwnPhoto(actor('cancel-second-photo'), second.stagedPhotoId);
+
+    const afterCancel = service.getOwnProfileLocal(guildId, 'member').snapshot!;
+    assert.equal(publisher.calls.length, 1);
+    assert.equal(afterCancel.pendingPhoto?.stagedPhotoId, first.stagedPhotoId);
+    assert.ok(store.getStagedPhoto(guildId, 'member', first.stagedPhotoId));
+    assert.equal(store.getStagedPhoto(guildId, 'member', second.stagedPhotoId), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test('photo removal joins field changes and publishes once on Save changes', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    const source = await sharp({
+      create: { width: 400, height: 500, channels: 3, background: '#abcdef' },
+    }).png().toBuffer();
+    const preview = await service.prepareOwnPhoto(actor('prepare-photo-for-removal'), {
+      bytes: source,
+      filename: 'portrait.png',
+    });
+    await service.confirmOwnPhoto(actor('publish-photo-for-removal'), preview.stagedPhotoId);
+
+    const draft = service.stageOwnProfileDraft(
+      actor('stage-field-before-removal'),
+      { researchInterests: ['Unified editing'] },
+      currentRevision(service),
+    );
+    const removed = service.stageOwnPhotoRemoval(
+      actor('stage-photo-removal'),
+      draft.editRevision,
+    );
+    assert.equal(publisher.calls.length, 2);
+    assert.equal(removed.draft?.profile.photo, '');
+
+    await service.saveOwnProfileEdits(actor('save-photo-removal'), removed.editRevision);
+    const call = publisher.calls[2];
+
+    assert.equal(call?.action, 'PROFILE_UPDATE');
+    assert.deepEqual(call?.photo, { kind: 'delete', expectedSha: 'photo-2' });
+    assert.deepEqual(JSON.parse(call!.profile.json).researchInterests, ['Unified editing']);
+  } finally {
+    store.close();
+  }
+});
+
+test('discarding an edit session removes both profile fields and the selected photo', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    service.stageOwnProfileDraft(
+      actor('stage-discard-fields'),
+      { website: 'discard.example' },
+      currentRevision(service),
+    );
+    const source = await sharp({
+      create: { width: 400, height: 500, channels: 3, background: '#777777' },
+    }).png().toBuffer();
+    const preview = await service.prepareOwnPhoto(actor('prepare-discard-photo'), {
+      bytes: source,
+      filename: 'discard.png',
+    });
+    const accepted = service.acceptOwnPhoto(actor('accept-discard-photo'), preview.stagedPhotoId);
+
+    const discarded = service.discardOwnProfileEdits(
+      actor('discard-edit-session'),
+      accepted.editRevision,
+    );
+
+    assert.equal(publisher.calls.length, 1);
+    assert.equal(discarded.draft, undefined);
+    assert.equal(discarded.pendingPhoto, undefined);
+    assert.equal(store.getProfileDraft(guildId, 'member'), undefined);
+    assert.equal(store.getStagedPhoto(guildId, 'member', preview.stagedPhotoId), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test('a failed queued combined save keeps all pending changes for one retry', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    service.stageOwnProfileDraft(
+      actor('stage-queued-combined-fields'),
+      { contact: ['member@kaist'], listed: true },
+      currentRevision(service),
+    );
+    const source = await sharp({
+      create: { width: 400, height: 500, channels: 3, background: '#246824' },
+    }).png().toBuffer();
+    const preview = await service.prepareOwnPhoto(actor('prepare-queued-combined-photo'), {
+      bytes: source,
+      filename: 'portrait.png',
+    });
+    const accepted = service.acceptOwnPhoto(
+      actor('accept-queued-combined-photo'),
+      preview.stagedPhotoId,
+    );
+
+    publisher.queueNext = true;
+    const queued = await service.saveOwnProfileEdits(
+      actor('queue-combined-save'),
+      accepted.editRevision,
+    );
+    const job = enqueueRecordedPublisherCall(store, publisher, 1);
+    const lease = store.claimPublicationJobs({
+      workerId: 'worker-combined',
+      leaseToken: 'lease-combined',
+      leaseExpiresAt: new Date('2026-08-21T00:05:00.000Z'),
+    })[0]!;
+    store.applyPublicationBatchFailure({
+      workerId: 'worker-combined',
+      leaseToken: 'lease-combined',
+      jobs: [{ operationId: lease.operationId, leaseGeneration: lease.leaseGeneration }],
+      errorJson: JSON.stringify({ code: 'validation_failed' }),
+    });
+
+    assert.equal(queued.queued, true);
+    assert.equal(job.operationId, lease.operationId);
+    const retryable = service.getOwnProfileLocal(guildId, 'member').snapshot!;
+    assert.equal(retryable.draft?.profile.listed, true);
+    assert.deepEqual(retryable.draft?.profile.contact, ['member@kaist']);
+    assert.equal(retryable.pendingPhoto?.stagedPhotoId, preview.stagedPhotoId);
+    assert.equal(retryable.pendingPhoto?.isPublishing, false);
+
+    publisher.queueNext = true;
+    const retryQueued = await service.saveOwnProfileEdits(
+      actor('retry-combined-save'),
+      retryable.editRevision,
+    );
+    const retryJob = enqueueRecordedPublisherCall(store, publisher, 2);
+    const retryLease = store.claimPublicationJobs({
+      workerId: 'worker-combined-retry',
+      leaseToken: 'lease-combined-retry',
+      leaseExpiresAt: new Date('2026-08-21T00:05:00.000Z'),
+    })[0]!;
+    const resultJson = JSON.stringify({
+      status: 'deployed',
+      commitSha: 'combined-commit',
+      profileBlobSha: 'combined-profile-sha',
+      photoBlobSha: 'combined-photo-sha',
+      attempts: 1,
+    });
+    store.recordPublicationBatchSuccess({
+      workerId: 'worker-combined-retry',
+      leaseToken: 'lease-combined-retry',
+      results: [{
+        operationId: retryLease.operationId,
+        leaseGeneration: retryLease.leaseGeneration,
+        resultJson,
+      }],
+    });
+    store.applyRecordedPublicationBatchSuccess({
+      results: [{
+        operationId: retryJob.operationId,
+        resultJson,
+        state: {
+          profileSlug: retryJob.profileSlug,
+          profileJson: retryJob.profileJson,
+          profileBlobSha: 'combined-profile-sha',
+          photoBlobSha: 'combined-photo-sha',
+          lastCommitSha: 'combined-commit',
+          lastDeploymentStatus: 'deployed',
+        },
+      }],
+    });
+    const completed = service.getOwnProfileLocal(guildId, 'member').snapshot!;
+    assert.equal(retryQueued.queued, true);
+    assert.equal(publisher.calls.length, 3);
+    assert.equal(completed.draft, undefined);
+    assert.equal(completed.pendingPhoto, undefined);
+    assert.equal(completed.profile.listed, true);
+  } finally {
+    store.close();
+  }
+});
+
 test('queued draft publication survives failure and clears after an applied success', async () => {
   const { store, publisher, service } = createFixture();
 

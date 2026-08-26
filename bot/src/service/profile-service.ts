@@ -20,6 +20,7 @@ import {
 } from '../storage/sqlite-store.js';
 
 const STARTUP_RECONCILIATION_CONCURRENCY = 4;
+const STAGED_PHOTO_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export type DiscordActor = {
   interactionId: string;
@@ -32,6 +33,7 @@ export type ProfileSnapshot = {
   profile: MemberProfile;
   bindingStatus: 'provisioning' | 'active';
   stateRevision: string;
+  editRevision: string;
   lastCommitSha?: string;
   lastDeploymentStatus?: string;
   membersPageUrl?: string;
@@ -39,6 +41,13 @@ export type ProfileSnapshot = {
     profile: MemberProfile;
     revision: string;
     baseStateRevision: string;
+    isPublishing: boolean;
+    stale: boolean;
+  };
+  pendingPhoto?: {
+    stagedPhotoId: string;
+    width: number;
+    height: number;
     isPublishing: boolean;
     stale: boolean;
   };
@@ -67,6 +76,7 @@ export type EditableProfilePatch = Partial<
     | 'researchInterests'
     | 'contact'
     | 'website'
+    | 'listed'
   >
 >;
 
@@ -404,6 +414,14 @@ export class ProfileService {
     patch: EditableProfilePatch,
     expectedRevision: string,
   ): ProfileSnapshot {
+    return this.#stageOwnProfileDraft(actor, patch, expectedRevision);
+  }
+
+  #stageOwnProfileDraft(
+    actor: DiscordActor,
+    patch: Partial<MemberProfile>,
+    expectedRevision: string,
+  ): ProfileSnapshot {
     this.#assertActor(actor);
     const binding = this.#requireBinding(actor.guildId, actor.userId);
     this.#assertProfileAvailableForDraftEdit(binding);
@@ -543,6 +561,236 @@ export class ProfileService {
     );
   }
 
+  acceptOwnPhoto(actor: DiscordActor, stagedPhotoId: string): ProfileSnapshot {
+    this.#assertActor(actor);
+    const binding = this.#requireBinding(actor.guildId, actor.userId);
+    this.#assertProfileAvailableForDraftEdit(binding);
+    if (binding.status !== 'active') {
+      throw new ProfileServiceError(
+        'profile_not_active',
+        'This profile is not active yet. Try again shortly.',
+      );
+    }
+
+    const state = this.#requireState(actor.guildId, binding.profileSlug);
+    const staged = this.#store.getStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+    if (!staged || staged.status !== 'prepared') {
+      throw new ProfileServiceError('photo_expired', 'The prepared photo has expired. Upload it again.');
+    }
+    if (staged.profileSlug !== binding.profileSlug) {
+      throw new ProfileServiceError(
+        'photo_owner_mismatch',
+        'The prepared photo does not match this profile.',
+      );
+    }
+    if (stagedPhotoRevision(stagedPhotoId) !== profileStateRevision(state)) {
+      this.#store.deleteStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+      throw profileChangedError();
+    }
+
+    this.#store.selectStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+    const snapshot = this.#snapshot(binding, state);
+    const profile = snapshot.draft?.profile ?? snapshot.profile;
+    if (profile.photo === `${binding.profileSlug}.webp`) {
+      return snapshot;
+    }
+
+    return this.#stageOwnProfileDraft(
+      actor,
+      { photo: `${binding.profileSlug}.webp` },
+      snapshot.draft?.revision ?? snapshot.stateRevision,
+    );
+  }
+
+  stageOwnPhotoRemoval(actor: DiscordActor, expectedEditRevision: string): ProfileSnapshot {
+    this.#assertActor(actor);
+    const binding = this.#requireBinding(actor.guildId, actor.userId);
+    this.#assertProfileAvailableForDraftEdit(binding);
+    const state = this.#requireState(actor.guildId, binding.profileSlug);
+    const snapshot = this.#snapshot(binding, state);
+
+    if (snapshot.editRevision !== expectedEditRevision) {
+      throw profileEditsChangedError();
+    }
+
+    if (snapshot.pendingPhoto) {
+      this.#store.deleteStagedPhoto(
+        actor.guildId,
+        actor.userId,
+        snapshot.pendingPhoto.stagedPhotoId,
+      );
+    }
+
+    return this.#stageOwnProfileDraft(
+      actor,
+      { photo: '' },
+      snapshot.draft?.revision ?? snapshot.stateRevision,
+    );
+  }
+
+  discardOwnProfileEdits(actor: DiscordActor, expectedEditRevision: string): ProfileSnapshot {
+    this.#assertActor(actor);
+    const binding = this.#requireBinding(actor.guildId, actor.userId);
+    this.#assertProfileAvailableForDraftEdit(binding);
+    const state = this.#requireState(actor.guildId, binding.profileSlug);
+    const snapshot = this.#snapshot(binding, state);
+
+    if (snapshot.editRevision !== expectedEditRevision) {
+      throw profileEditsChangedError();
+    }
+    if (!snapshot.draft && !snapshot.pendingPhoto) {
+      throw new ProfileServiceError('edits_missing', 'There are no pending profile changes to discard.');
+    }
+
+    if (
+      snapshot.draft
+      && !this.#store.deleteProfileDraft(actor.guildId, actor.userId, snapshot.draft.revision)
+    ) {
+      throw profileDraftChangedError();
+    }
+    if (snapshot.pendingPhoto) {
+      this.#store.deleteStagedPhoto(
+        actor.guildId,
+        actor.userId,
+        snapshot.pendingPhoto.stagedPhotoId,
+      );
+    }
+
+    return this.#snapshot(binding, state);
+  }
+
+  async saveOwnProfileEdits(
+    actor: DiscordActor,
+    expectedEditRevision: string,
+  ): Promise<ProfileOperationResult> {
+    return this.#runOperation(actor, 'PROFILE_UPDATE', async (operationId) => {
+      const initialBinding = this.#requireBinding(actor.guildId, actor.userId);
+      let recoveryBinding = initialBinding;
+      let claimedPhotoId: string | undefined;
+
+      try {
+        return await this.#withProfileOperationLock(
+          actor.guildId,
+          initialBinding.profileSlug,
+          'mutation',
+          async () => {
+            const binding = this.#requireBinding(actor.guildId, actor.userId);
+            this.#assertSameProfileBinding(initialBinding, binding);
+            this.#assertNoPendingPublication(binding);
+            recoveryBinding = binding;
+
+            if (binding.status !== 'active') {
+              throw new ProfileServiceError(
+                'profile_not_active',
+                'This profile is not active yet. Try again shortly.',
+              );
+            }
+
+            const state = this.#requireState(actor.guildId, binding.profileSlug);
+            const snapshot = this.#snapshot(binding, state);
+            if (snapshot.editRevision !== expectedEditRevision) {
+              throw profileEditsChangedError();
+            }
+            if (!snapshot.draft && !snapshot.pendingPhoto) {
+              throw new ProfileServiceError('edits_missing', 'There are no pending profile changes to save.');
+            }
+            if (snapshot.draft?.stale || snapshot.pendingPhoto?.stale) {
+              throw profileChangedError();
+            }
+
+            const currentProfile = parseProfile(state.profileJson);
+            let nextProfile = snapshot.draft?.profile ?? currentProfile;
+            let photo: ProfilePublishInput['photo'];
+
+            if (snapshot.pendingPhoto) {
+              const staged = this.#store.claimStagedPhoto(
+                actor.guildId,
+                actor.userId,
+                snapshot.pendingPhoto.stagedPhotoId,
+              );
+              claimedPhotoId = staged.id;
+              nextProfile = normalizeMemberProfile({
+                ...nextProfile,
+                photo: `${binding.profileSlug}.webp`,
+              });
+              photo = {
+                kind: 'upsert',
+                bytes: staged.bytes,
+                expectedSha: state.photoBlobSha ?? null,
+              };
+            } else if (nextProfile.photo === '' && state.photoBlobSha) {
+              photo = { kind: 'delete', expectedSha: state.photoBlobSha };
+            } else if (nextProfile.photo !== currentProfile.photo) {
+              throw new ProfileServiceError(
+                'photo_expired',
+                'The prepared photo is no longer available. Upload it again or remove the photo change.',
+              );
+            }
+
+            const profileJson = serializeProfile(nextProfile);
+            const publishResult = await this.#publisher.publish({
+              operationId,
+              slug: binding.profileSlug,
+              action: 'PROFILE_UPDATE',
+              profile: { json: profileJson, expectedSha: state.profileBlobSha },
+              ...(photo ? { photo } : {}),
+            }, this.#publishContext(
+              actor,
+              actor.userId,
+              'PROFILE_UPDATE',
+              claimedPhotoId ? { stagedPhotoId: claimedPhotoId } : {},
+            ));
+
+            if (publishResult.status === 'queued') {
+              return this.#queuedResult(publishResult.operationId);
+            }
+            if (publishResult.stateApplied) {
+              return this.#currentOperationResult(
+                actor.guildId,
+                actor.userId,
+                binding.profileSlug,
+              );
+            }
+
+            const photoChange = photo?.kind;
+            const nextState = this.#savePublishedState(
+              actor.guildId,
+              binding.profileSlug,
+              nextProfile,
+              publishResult,
+              photoChange,
+              state,
+            );
+            this.#store.clearProfileDraftIfProfileMatches(
+              actor.guildId,
+              actor.userId,
+              binding.profileSlug,
+              profileJson,
+            );
+            if (claimedPhotoId) {
+              this.#store.deleteStagedPhoto(actor.guildId, actor.userId, claimedPhotoId);
+              claimedPhotoId = undefined;
+            }
+            const result = this.#operationResult(binding, nextState);
+            this.#audit(actor, binding.profileSlug, 'PROFILE_UPDATE', result, {
+              combinedProfileEdit: true,
+            });
+            return result;
+          },
+        );
+      } catch (error) {
+        if (claimedPhotoId) {
+          this.#store.releaseStagedPhoto(actor.guildId, actor.userId, claimedPhotoId);
+        }
+        this.#markReconciliationNeededAfterAmbiguousPublish(error, recoveryBinding);
+        if (isContentConflict(error) && this.#repositoryReader) {
+          await this.#reconcileBinding(recoveryBinding);
+        }
+        throw error;
+      }
+    });
+  }
+
   async prepareOwnPhoto(
     actor: DiscordActor,
     input: { bytes: Uint8Array; filename: string; contentType?: string },
@@ -579,10 +827,18 @@ export class ProfileService {
     this.#store.beginInteraction(actor.interactionId, operationId, 'PROFILE_PREPARE_PHOTO');
 
     try {
-      const { binding, state } = this.#requireOwnActiveState(actor);
+      const binding = this.#requireBinding(actor.guildId, actor.userId);
+      this.#assertProfileAvailableForDraftEdit(binding);
+      if (binding.status !== 'active') {
+        throw new ProfileServiceError(
+          'profile_not_active',
+          'This profile is not active yet. Try again shortly.',
+        );
+      }
+      const state = this.#requireState(actor.guildId, binding.profileSlug);
       const processed = await processProfilePhoto(Buffer.from(input.bytes));
       const stagedPhotoId = createStagedPhotoId(this.#newStageId(), profileStateRevision(state));
-      const expiresAt = new Date(this.#now().getTime() + 15 * 60 * 1000);
+      const expiresAt = new Date(this.#now().getTime() + STAGED_PHOTO_TTL_MS);
       this.#store.stagePhoto({
         id: stagedPhotoId,
         guildId: actor.guildId,
@@ -1526,6 +1782,7 @@ export class ProfileService {
       profile,
       bindingStatus: binding.status,
       stateRevision,
+      editRevision: stateRevision,
       lastDeploymentStatus: state.lastDeploymentStatus,
     };
 
@@ -1551,6 +1808,26 @@ export class ProfileService {
         };
       }
     }
+
+    const selectedPhoto = this.#store.getSelectedStagedPhoto(
+      binding.guildId,
+      binding.discordUserId,
+    );
+    if (selectedPhoto?.profileSlug === binding.profileSlug) {
+      snapshot.pendingPhoto = {
+        stagedPhotoId: selectedPhoto.id,
+        width: selectedPhoto.width,
+        height: selectedPhoto.height,
+        isPublishing: selectedPhoto.status === 'publishing',
+        stale: stagedPhotoRevision(selectedPhoto.id) !== stateRevision,
+      };
+    }
+
+    snapshot.editRevision = profileEditRevision(
+      stateRevision,
+      snapshot.draft?.revision,
+      snapshot.pendingPhoto?.stagedPhotoId,
+    );
 
     if (state.lastCommitSha) {
       snapshot.lastCommitSha = state.lastCommitSha;
@@ -1674,6 +1951,22 @@ function profileDraftRevision(
     .slice(0, 20);
 }
 
+function profileEditRevision(
+  stateRevision: string,
+  draftRevision = '',
+  stagedPhotoId = '',
+) {
+  return createHash('sha256')
+    .update('profile-edit\0')
+    .update(stateRevision)
+    .update('\0')
+    .update(draftRevision)
+    .update('\0')
+    .update(stagedPhotoId)
+    .digest('hex')
+    .slice(0, 20);
+}
+
 function editableProfilePatch(profile: MemberProfile): EditableProfilePatch {
   return {
     name: profile.name,
@@ -1683,6 +1976,7 @@ function editableProfilePatch(profile: MemberProfile): EditableProfilePatch {
     researchInterests: profile.researchInterests,
     contact: profile.contact,
     website: profile.website,
+    listed: profile.listed,
   };
 }
 
@@ -1706,6 +2000,13 @@ function profileDraftChangedError() {
   return new ProfileServiceError(
     'draft_changed',
     'The profile draft changed after this form was opened. Reopen `/profile` and try again.',
+  );
+}
+
+function profileEditsChangedError() {
+  return new ProfileServiceError(
+    'edits_changed',
+    'The pending profile changes changed after this panel was opened. Reopen `/profile` and try again.',
   );
 }
 

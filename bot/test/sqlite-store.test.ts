@@ -128,6 +128,51 @@ test('legacy profile-admin state is retired without leaving a blocked binding or
   }
 });
 
+test('existing staged-photo tables gain the selected edit marker automatically', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'grasp-photo-selection-migration-'));
+  const databasePath = join(directory, 'legacy.sqlite');
+  const legacy = new DatabaseSync(databasePath);
+  legacy.exec(`
+    CREATE TABLE staged_photos (
+      id TEXT PRIMARY KEY,
+      guild_id TEXT NOT NULL,
+      discord_user_id TEXT NOT NULL,
+      profile_slug TEXT NOT NULL,
+      photo_bytes BLOB NOT NULL,
+      width INTEGER NOT NULL CHECK (width > 0),
+      height INTEGER NOT NULL CHECK (height > 0),
+      status TEXT NOT NULL CHECK (status IN ('prepared', 'publishing')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+  `);
+  legacy.close();
+
+  const migrated = new SqliteStore(databasePath, { now: () => fixedDate });
+  try {
+    migrated.reserveBinding('guild', 'user-1', 'member-a');
+    migrated.activateBinding('guild', 'user-1');
+    migrated.stagePhoto({
+      id: 'selected-after-migration',
+      guildId: 'guild',
+      discordUserId: 'user-1',
+      profileSlug: 'member-a',
+      bytes: Buffer.from('webp'),
+      width: 400,
+      height: 500,
+      expiresAt: new Date('2026-08-22T00:00:00.000Z'),
+    });
+    migrated.selectStagedPhoto('guild', 'user-1', 'selected-after-migration');
+    assert.equal(
+      migrated.getSelectedStagedPhoto('guild', 'user-1')?.id,
+      'selected-after-migration',
+    );
+  } finally {
+    migrated.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('online SQLite backups are verified read-only and preserve durable queue bytes', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'grasp-profile-backup-'));
   const sourcePath = join(directory, 'source.sqlite');
@@ -336,6 +381,10 @@ test('photo staging enforces owner, expiry, and one publisher claim', () => {
     });
 
     assert.equal(store.getStagedPhoto('guild', 'other-user', 'stage-a'), undefined);
+    assert.equal(store.getSelectedStagedPhoto('guild', 'user-1'), undefined);
+    const selected = store.selectStagedPhoto('guild', 'user-1', 'stage-a');
+    assert.ok(selected.selectedAt);
+    assert.equal(store.getSelectedStagedPhoto('guild', 'user-1')?.id, 'stage-a');
     assert.equal(store.claimStagedPhoto('guild', 'user-1', 'stage-a').status, 'publishing');
     assert.throws(() => store.claimStagedPhoto('guild', 'user-1', 'stage-a'));
 
