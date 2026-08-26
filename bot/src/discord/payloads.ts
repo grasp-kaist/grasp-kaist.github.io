@@ -38,17 +38,22 @@ export function deferUpdateResponse(): DiscordInteractionResponse {
   return { type: 6 };
 }
 
-export function registerModalResponse(order: MemberOrder): DiscordInteractionResponse {
+export function registerModalResponse(
+  order: MemberOrder,
+  publicationMode: 'sandbox' | 'production' = 'production',
+): DiscordInteractionResponse {
+  const sandbox = publicationMode === 'sandbox';
   return {
     type: 9,
     data: {
-      custom_id: `register:v1:${order}`,
+      custom_id: `register:v1:${publicationMode}:${order}`,
       title: 'Create GRASP profile',
       components: [
         {
           type: 10,
-          content:
-            'Your profile information and photo will be stored in a public GitHub repository.',
+          content: sandbox
+            ? 'Test mode: your profile and photo will be stored only in the bot sandbox. The GRASP website will not change.'
+            : 'Your profile information and photo will be stored in a public GitHub repository.',
         },
         {
           type: 18,
@@ -88,7 +93,9 @@ export function registerModalResponse(order: MemberOrder): DiscordInteractionRes
             required: true,
             options: [
               {
-                label: 'I understand that this information will be public.',
+                label: sandbox
+                  ? 'I understand that this is sandbox test data.'
+                  : 'I understand that this information will be public.',
                 value: 'accepted',
               },
             ],
@@ -225,13 +232,16 @@ export function photoUploadModalResponse(): DiscordInteractionResponse {
   };
 }
 
-export function profilePanelResponse(snapshot: ProfileSnapshot): DiscordInteractionResponse {
+export function profilePanelResponse(
+  snapshot: ProfileSnapshot,
+  publicationMode: 'sandbox' | 'production' = 'production',
+): DiscordInteractionResponse {
   return {
     type: 4,
     data: {
       flags: EPHEMERAL_FLAG | IS_COMPONENTS_V2_FLAG,
       allowed_mentions: { parse: [] },
-      components: profilePanelComponents(snapshot),
+      components: profilePanelComponents(snapshot, undefined, publicationMode),
     },
   };
 }
@@ -239,11 +249,16 @@ export function profilePanelResponse(snapshot: ProfileSnapshot): DiscordInteract
 export function profilePanelEdit(
   snapshot: ProfileSnapshot,
   notice?: string,
+  publicationMode: 'sandbox' | 'production' = 'production',
 ): DiscordMessagePayload {
-  return v2Edit(profilePanelComponents(snapshot, notice), []);
+  return v2Edit(profilePanelComponents(snapshot, notice, publicationMode), []);
 }
 
-function profilePanelComponents(snapshot: ProfileSnapshot, notice?: string) {
+function profilePanelComponents(
+  snapshot: ProfileSnapshot,
+  notice: string | undefined,
+  publicationMode: 'sandbox' | 'production',
+) {
   const revision = assertProfileRevision(snapshot.stateRevision);
   const category = memberCategories.find(({ order }) => order === snapshot.profile.order)?.label;
   const profile = snapshot.profile;
@@ -252,12 +267,14 @@ function profilePanelComponents(snapshot: ProfileSnapshot, notice?: string) {
     `## ${escapeDiscordMarkdown(profile.name)}`,
     escapeDiscordMarkdown(profile.position),
     category ? `Category: ${escapeDiscordMarkdown(category)}` : '',
-    `Website listing: **${profile.listed ? 'shown' : 'hidden'}**${statusText}`,
+    publicationMode === 'sandbox'
+      ? `Sandbox listing flag: **${profile.listed ? 'listed' : 'hidden'}**${statusText}`
+      : `Website listing: **${profile.listed ? 'shown' : 'hidden'}**${statusText}`,
     snapshot.lastDeploymentStatus
-      ? `Last deployment: **${escapeDiscordMarkdown(snapshot.lastDeploymentStatus)}**`
+      ? `${publicationMode === 'sandbox' ? 'Last sandbox save' : 'Last deployment'}: **${escapeDiscordMarkdown(snapshot.lastDeploymentStatus)}**`
       : '',
     snapshot.lastCommitSha
-      ? `Last commit: \`${escapeInlineCode(snapshot.lastCommitSha.slice(0, 12))}\``
+      ? `${publicationMode === 'sandbox' ? 'Sandbox revision' : 'Last commit'}: \`${escapeInlineCode(snapshot.lastCommitSha.slice(0, 12))}\``
       : '',
   ]
     .filter(Boolean)
@@ -281,7 +298,9 @@ function profilePanelComponents(snapshot: ProfileSnapshot, notice?: string) {
         components: [
           button('Remove photo', `profile:remove-photo:${revision}`, 4),
           button(
-            profile.listed ? 'Hide from website' : 'Show on website',
+            publicationMode === 'sandbox'
+              ? (profile.listed ? 'Mark hidden (sandbox)' : 'Mark listed (sandbox)')
+              : (profile.listed ? 'Hide from website' : 'Show on website'),
             `profile:set-listed:${profile.listed ? '0' : '1'}:${revision}`,
             profile.listed ? 2 : 3,
           ),
@@ -317,9 +336,10 @@ function profilePanelComponents(snapshot: ProfileSnapshot, notice?: string) {
 export function operationCompleteEdit(
   message: string,
   result?: ProfileOperationResult,
+  publicationMode: 'sandbox' | 'production' = 'production',
 ): DiscordMessagePayload {
   if (result?.snapshot) {
-    return profilePanelEdit(result.snapshot, message);
+    return profilePanelEdit(result.snapshot, message, publicationMode);
   }
 
   const details = [
@@ -358,7 +378,7 @@ export function preparedPhotoPreviewEdit(prepared: PreparedProfilePhoto): {
       type: 10,
       content:
         `## Profile photo preview\n` +
-        `${prepared.width}×${prepared.height} WebP. Publish this result?`,
+        `${prepared.width}×${prepared.height} WebP. Save this result?`,
     },
     {
       type: 12,
@@ -372,7 +392,7 @@ export function preparedPhotoPreviewEdit(prepared: PreparedProfilePhoto): {
     {
       type: 1,
       components: [
-        button('Publish photo', `profile:photo-confirm:${stagedPhotoId}`, 3),
+        button('Save photo', `profile:photo-confirm:${stagedPhotoId}`, 3),
         button('Cancel', `profile:photo-cancel:${stagedPhotoId}`, 2),
       ],
     },

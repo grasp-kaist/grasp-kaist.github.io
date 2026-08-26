@@ -79,7 +79,7 @@ export type ProfilePublishInput = {
 };
 
 export type ProfilePublishResult = {
-  status: 'deployed' | 'no_change' | 'published_deploy_failed';
+  status: 'deployed' | 'no_change' | 'published_deploy_failed' | 'sandbox';
   commitSha?: string;
   profileBlobSha: string;
   photoBlobSha?: string | null;
@@ -1095,7 +1095,7 @@ export class ProfileService {
 
   #assertGuild(guildId: string) {
     if (guildId !== this.#guildId) {
-      throw new ProfileServiceError('wrong_guild', 'This bot can only be used in the configured GRASP server.');
+      throw new ProfileServiceError('wrong_guild', 'This bot can only be used in the configured Discord server.');
     }
   }
 

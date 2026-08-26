@@ -47,6 +47,7 @@ type InteractionRouterConfig = {
   applicationId: string;
   guildId: string;
   ownerUserId: string;
+  publicationMode: 'sandbox' | 'production';
 };
 
 type InteractionRouterDependencies = {
@@ -125,7 +126,9 @@ export class DiscordInteractionRouter {
         const local = this.#service.getOwnProfileLocal(this.#config.guildId, userId);
 
         if (local.snapshot) {
-          return { response: profilePanelResponse(local.snapshot) };
+          return {
+            response: profilePanelResponse(local.snapshot, this.#config.publicationMode),
+          };
         }
 
         if (local.hasBinding) {
@@ -136,7 +139,9 @@ export class DiscordInteractionRouter {
           };
         }
 
-        return { response: registerModalResponse(order) };
+        return {
+          response: registerModalResponse(order, this.#config.publicationMode),
+        };
       }
       case 'profile':
         return {
@@ -150,7 +155,7 @@ export class DiscordInteractionRouter {
               await this.#webhook.editOriginal(
                 interaction.token,
                 snapshot
-                  ? profilePanelEdit(snapshot)
+                  ? profilePanelEdit(snapshot, undefined, this.#config.publicationMode)
                   : photoFlowFinishedEdit(
                       'You do not have a GRASP profile yet. Run `/register` to create one.',
                     ),
@@ -178,7 +183,9 @@ export class DiscordInteractionRouter {
         return this.#deferredMutation(
           interaction,
           () => this.#service.ownerHide(actor, target),
-          'The profile was hidden from the website.',
+          this.#config.publicationMode === 'sandbox'
+            ? 'The profile was marked hidden in the sandbox. The website was not changed.'
+            : 'The profile was hidden from the website.',
         );
       }
       case 'revoke': {
@@ -273,9 +280,11 @@ export class DiscordInteractionRouter {
       return this.#deferredMutation(
         interaction,
         () => this.#service.setOwnListed(actor, listed, expectedRevision),
-        listed
-          ? 'Your profile is now shown on the Members page.'
-          : 'Your profile is now hidden from the Members page.',
+        this.#config.publicationMode === 'sandbox'
+          ? `Sandbox listing flag set to ${listed ? 'listed' : 'hidden'}. The website was not changed.`
+          : listed
+            ? 'Your profile is now shown on the Members page.'
+            : 'Your profile is now hidden from the Members page.',
         true,
       );
     }
@@ -286,7 +295,9 @@ export class DiscordInteractionRouter {
       return this.#deferredMutation(
         interaction,
         () => this.#service.confirmOwnPhoto(actor, confirmToken),
-        'Your profile photo was published.',
+        this.#config.publicationMode === 'sandbox'
+          ? 'Your profile photo was saved in the sandbox. The website was not changed.'
+          : 'Your profile photo was published.',
         true,
       );
     }
@@ -306,7 +317,11 @@ export class DiscordInteractionRouter {
             await this.#webhook.editOriginal(
               interaction.token,
               snapshot
-                ? profilePanelEdit(snapshot, 'Profile photo change cancelled.')
+                ? profilePanelEdit(
+                    snapshot,
+                    'Profile photo change cancelled.',
+                    this.#config.publicationMode,
+                  )
                 : photoFlowFinishedEdit('Profile photo change cancelled.'),
             );
           } catch (error) {
@@ -322,7 +337,9 @@ export class DiscordInteractionRouter {
   #routeModalSubmit(interaction: DiscordInteraction, userId: string): InteractionRouteResult {
     const customId = interaction.data?.custom_id;
     const actor = this.#actor(interaction, userId);
-    const registrationMatch = customId?.match(/^register:v1:([0-5])$/);
+    const registrationMatch = customId?.match(
+      /^register:v1:(sandbox|production):([0-5])$/,
+    );
     const basicProfileMatch = customId?.match(
       /^profile-basic:v1:([0-9a-f]{20})$/,
     );
@@ -334,7 +351,15 @@ export class DiscordInteractionRouter {
     );
 
     if (registrationMatch) {
-      const order = Number(registrationMatch[1]);
+      const registrationMode = registrationMatch[1];
+
+      if (registrationMode !== this.#config.publicationMode) {
+        throw new DiscordInputError(
+          'The bot publication mode changed after this form was opened. Run `/register` again.',
+        );
+      }
+
+      const order = Number(registrationMatch[2]);
 
       if (!isMemberOrder(order)) {
         throw new DiscordInputError('Member category is invalid.');
@@ -347,7 +372,9 @@ export class DiscordInteractionRouter {
       return this.#deferredMutation(
         interaction,
         () => this.#service.register(actor, { name, position, order }),
-        'Your hidden GRASP profile was created. Run `/profile` to continue editing it.',
+        this.#config.publicationMode === 'sandbox'
+          ? 'Your sandbox profile was created. Run `/profile` to continue editing it; the website was not changed.'
+          : 'Your hidden GRASP profile was created. Run `/profile` to continue editing it.',
       );
     }
 
@@ -448,7 +475,7 @@ export class DiscordInteractionRouter {
           const result = await operation();
           await this.#webhook.editOriginal(
             interaction.token,
-            operationCompleteEdit(successMessage, result),
+            operationCompleteEdit(successMessage, result, this.#config.publicationMode),
           );
         } catch (error) {
           await this.#editDeferredFailure(interaction.token, error);

@@ -1,106 +1,13 @@
 import assert from 'node:assert/strict';
-import { generateKeyPairSync, sign } from 'node:crypto';
 import test from 'node:test';
 
 import { getUploadedAttachment } from '../src/discord/inputs.js';
-import { DiscordInteractionHttpHandler } from '../src/discord/http.js';
-import {
-  verifyAndParseDiscordInteraction,
-  verifyDiscordSignature,
-} from '../src/discord/signature.js';
 import type { DiscordInteraction } from '../src/discord/types.js';
 import {
   DiscordAttachmentDownloadError,
   DiscordCdnAttachmentDownloader,
   DiscordInteractionWebhookClient,
 } from '../src/discord/webhook.js';
-
-test('Discord Ed25519 signatures are checked against the exact raw body', async () => {
-  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-  const publicDer = publicKey.export({ type: 'spki', format: 'der' });
-  const discordPublicKey = publicDer.subarray(-32).toString('hex');
-  const timestamp = '1777000000';
-  const body = JSON.stringify({
-    id: '111111111111111111',
-    application_id: '222222222222222222',
-    type: 1,
-    token: 'interaction-token',
-  });
-  const signature = sign(
-    null,
-    Buffer.concat([Buffer.from(timestamp), Buffer.from(body)]),
-    privateKey,
-  ).toString('hex');
-
-  assert.equal(
-    await verifyDiscordSignature({
-      rawBody: body,
-      signature,
-      timestamp,
-      publicKey: discordPublicKey,
-    }),
-    true,
-  );
-  assert.equal(
-    await verifyDiscordSignature({
-      rawBody: `${body} `,
-      signature,
-      timestamp,
-      publicKey: discordPublicKey,
-    }),
-    false,
-  );
-
-  const parsed = await verifyAndParseDiscordInteraction({
-    rawBody: body,
-    signature,
-    timestamp,
-    publicKey: discordPublicKey,
-  });
-  assert.equal(parsed?.type, 1);
-});
-
-test('HTTP boundary rejects unsigned payloads before routing and accepts a signed ping', async () => {
-  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-  const discordPublicKey = publicKey
-    .export({ type: 'spki', format: 'der' })
-    .subarray(-32)
-    .toString('hex');
-  let routeCalls = 0;
-  const handler = new DiscordInteractionHttpHandler(discordPublicKey, {
-    route: async () => {
-      routeCalls += 1;
-      return { response: { type: 1 } };
-    },
-  });
-  const rawBody = Buffer.from(
-    JSON.stringify({
-      id: '111111111111111111',
-      application_id: '222222222222222222',
-      type: 1,
-      token: 'token',
-    }),
-  );
-  const timestamp = '1777000000';
-
-  const denied = await handler.handle({
-    rawBody,
-    signature: '00',
-    timestamp,
-  });
-  assert.equal(denied.status, 401);
-  assert.equal(routeCalls, 0);
-
-  const signature = sign(
-    null,
-    Buffer.concat([Buffer.from(timestamp), rawBody]),
-    privateKey,
-  ).toString('hex');
-  const accepted = await handler.handle({ rawBody, signature, timestamp });
-  assert.equal(accepted.status, 200);
-  assert.deepEqual(accepted.body, { type: 1 });
-  assert.equal(routeCalls, 1);
-});
 
 test('file upload parser resolves the submitted attachment ID rather than object order', () => {
   const interaction = {

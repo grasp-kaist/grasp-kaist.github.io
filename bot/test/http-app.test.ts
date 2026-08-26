@@ -1,84 +1,50 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { createHttpApp, MAX_INTERACTION_BODY_BYTES } from '../src/http-app.js';
-import type { DiscordHttpInteractionResult } from '../src/discord/http.js';
+import { createHealthApp, type BotHealthSnapshot } from '../src/http-app.js';
 
-test('health endpoint is small and credential-free', async () => {
-  const app = createFixture().app;
-  const response = await app.request('/healthz');
-
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { status: 'ok' });
-});
-
-test('interaction adapter preserves raw bytes and signature headers', async () => {
-  let handled: Parameters<FixtureHandler['handle']>[0] | undefined;
-  let scheduled: DiscordHttpInteractionResult | undefined;
-  const fixture = createFixture({
-    handle: async (input) => {
-      handled = input;
-      return { status: 200, body: { type: 1 }, afterResponse: async () => undefined };
-    },
-    schedule: (result) => {
-      scheduled = result;
-    },
-  });
-  const body = '{"type":1,"unicode":"한글"}';
-  const response = await fixture.app.request('/interactions', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-signature-ed25519': 'signature',
-      'x-signature-timestamp': 'timestamp',
-    },
-    body,
-  });
-
-  assert.equal(response.status, 200);
-  assert.equal(new TextDecoder().decode(handled?.rawBody), body);
-  assert.equal(handled?.signature, 'signature');
-  assert.equal(handled?.timestamp, 'timestamp');
-  assert.equal(scheduled?.afterResponse instanceof Function, true);
-});
-
-test('oversized Discord bodies are rejected before signature processing', async () => {
-  let calls = 0;
-  const fixture = createFixture({
-    handle: async () => {
-      calls += 1;
-      return { status: 200, body: { type: 1 } };
-    },
-  });
-  const response = await fixture.app.request('/interactions', {
-    method: 'POST',
-    headers: { 'content-length': String(MAX_INTERACTION_BODY_BYTES + 1) },
-    body: '{}',
-  });
-
-  assert.equal(response.status, 413);
-  assert.equal(calls, 0);
-});
-
-type FixtureHandler = {
-  handle(input: {
-    rawBody: Uint8Array;
-    signature: string | undefined;
-    timestamp: string | undefined;
-  }): Promise<DiscordHttpInteractionResult>;
-};
-
-function createFixture(overrides: {
-  handle?: FixtureHandler['handle'];
-  schedule?: (result: DiscordHttpInteractionResult) => void;
-} = {}) {
-  const interactionHandler: FixtureHandler = {
-    handle: overrides.handle ?? (async () => ({ status: 401, body: { error: 'invalid' } })),
+test('health endpoint stays unavailable until the Gateway is ready', async () => {
+  let snapshot: BotHealthSnapshot = {
+    ready: false,
+    gateway: 'starting',
+    profileRecovery: 'running',
+    publicationMode: 'sandbox',
   };
-  return {
-    app: createHttpApp({
-      interactionHandler,
-      scheduleAfterResponse: overrides.schedule ?? (() => undefined),
-    }),
+  const app = createHealthApp(() => snapshot);
+
+  const starting = await app.request('/healthz');
+  assert.equal(starting.status, 503);
+  assert.deepEqual(await starting.json(), {
+    status: 'starting',
+    gateway: 'starting',
+    profileRecovery: 'running',
+    publicationMode: 'sandbox',
+  });
+
+  snapshot = {
+    ...snapshot,
+    ready: true,
+    gateway: 'ready',
+    profileRecovery: 'ready',
   };
-}
+  const ready = await app.request('/healthz');
+  assert.equal(ready.status, 200);
+  assert.deepEqual(await ready.json(), {
+    status: 'ok',
+    gateway: 'ready',
+    profileRecovery: 'ready',
+    publicationMode: 'sandbox',
+  });
+});
+
+test('health service exposes no Discord interaction route', async () => {
+  const app = createHealthApp(() => ({
+    ready: true,
+    gateway: 'ready',
+    profileRecovery: 'ready',
+    publicationMode: 'production',
+  }));
+
+  const response = await app.request('/interactions', { method: 'POST' });
+  assert.equal(response.status, 404);
+});

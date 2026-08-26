@@ -40,7 +40,7 @@ test('register uses only a local probe before opening a current Label modal', as
     ]),
   );
   assert.equal(valid.response.type, 9);
-  assert.equal(valid.response.data?.custom_id, 'register:v1:4');
+  assert.equal(valid.response.data?.custom_id, 'register:v1:production:4');
   assert.equal(localProbes, 1);
   assert.equal(profileReads, 0);
 
@@ -156,7 +156,7 @@ test('register modal defers before invoking the mutation and edits the webhook a
       return { commitSha: 'abc123', deploymentStatus: 'success' };
     },
   });
-  const interaction = modalInteraction('register:v1:4', [
+  const interaction = modalInteraction('register:v1:production:4', [
     labelText('name', 'Taein Oh'),
     labelText('position', 'Undergraduate Student, KAIST'),
     {
@@ -183,6 +183,32 @@ test('register modal defers before invoking the mutation and edits the webhook a
   assert.equal(harness.edits.length, 1);
   assert.equal(harness.edits[0]?.token, interaction.token);
   assert.equal(harness.edits[0]?.payload.flags, 32768);
+});
+
+test('register rejects a sandbox modal submitted after switching to production', async () => {
+  let registerCalls = 0;
+  const harness = createHarness({
+    register: async () => {
+      registerCalls += 1;
+      return {};
+    },
+  });
+  const staleInteraction = modalInteraction('register:v1:sandbox:4', [
+    labelText('name', 'Taein Oh'),
+    labelText('position', 'Undergraduate Student, KAIST'),
+    {
+      type: 18,
+      component: { type: 22, custom_id: 'consent', values: ['accepted'] },
+    },
+  ]);
+
+  const routed = await harness.router.route(staleInteraction);
+
+  assert.equal(routed.response.type, 4);
+  assert.equal(routed.afterResponse, undefined);
+  assert.equal(registerCalls, 0);
+  const components = routed.response.data?.components as Array<Record<string, unknown>>;
+  assert.match(String(components[0]?.content), /publication mode changed/i);
 });
 
 test('profile edit modal defers an update and replaces the stale panel with its result', async () => {
@@ -416,12 +442,16 @@ test('photo cancellation discards only the staged photo named by the button', as
 
 test('owner command is checked independently of Discord command visibility', async () => {
   let hiddenTarget: string | undefined;
-  const harness = createHarness({
-    ownerHide: async (_actor, targetUserId) => {
-      hiddenTarget = targetUserId;
-      return {};
+  const harness = createHarness(
+    {
+      ownerHide: async (_actor, targetUserId) => {
+        hiddenTarget = targetUserId;
+        return {};
+      },
     },
-  });
+    undefined,
+    'sandbox',
+  );
   const options = [
     {
       type: 1,
@@ -442,11 +472,14 @@ test('owner command is checked independently of Discord command visibility', asy
   assert.equal(allowed.response.type, 5);
   await allowed.afterResponse?.();
   assert.equal(hiddenTarget, TARGET_ID);
+  const completion = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
+  assert.match(String(completion[0]?.content), /website was not changed/i);
 });
 
 function createHarness(
   serviceOverrides: Partial<ProfileService> = {},
   downloaderOverride?: AttachmentDownloader,
+  publicationMode: 'sandbox' | 'production' = 'production',
 ) {
   const edits: Array<{
     token: string;
@@ -464,6 +497,7 @@ function createHarness(
       applicationId: APPLICATION_ID,
       guildId: GUILD_ID,
       ownerUserId: OWNER_ID,
+      publicationMode,
     },
     service,
     webhook,

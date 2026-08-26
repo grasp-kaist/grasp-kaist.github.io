@@ -44,7 +44,7 @@ export function getGuildUserId(interaction: DiscordInteraction) {
 
 export function assertExpectedGuild(interaction: DiscordInteraction, guildId: string) {
   if (interaction.guild_id !== guildId) {
-    throw new DiscordInputError('This command is only available in the configured GRASP server.');
+    throw new DiscordInputError('This command is only available in the configured Discord server.');
   }
 }
 

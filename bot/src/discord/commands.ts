@@ -82,32 +82,3 @@ export const guildCommands = [
     ],
   },
 ] as const;
-
-export async function registerGuildCommands(
-  input: {
-    applicationId: string;
-    guildId: string;
-    botToken: string;
-  },
-  fetchImplementation: typeof fetch = fetch,
-) {
-  const endpoint = new URL(
-    `https://discord.com/api/v10/applications/${encodeURIComponent(input.applicationId)}` +
-      `/guilds/${encodeURIComponent(input.guildId)}/commands`,
-  );
-  const response = await fetchImplementation(endpoint, {
-    method: 'PUT',
-    headers: {
-      Authorization: `Bot ${input.botToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(guildCommands),
-  });
-
-  if (!response.ok) {
-    const detail = (await response.text()).slice(0, 1_000);
-    throw new Error(`Discord command registration failed (${response.status}): ${detail}`);
-  }
-
-  return response.json() as Promise<unknown>;
-}

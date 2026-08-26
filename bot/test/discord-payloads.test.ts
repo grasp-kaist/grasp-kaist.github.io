@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createEmptyProfile } from '../src/domain/member-profile.js';
-import { guildCommands, registerGuildCommands } from '../src/discord/commands.js';
+import { guildCommands } from '../src/discord/commands.js';
 import {
   categoryModalResponse,
   editBasicModalResponse,
@@ -32,33 +32,11 @@ test('guild commands expose fixed category choices and no destructive delete com
   );
 });
 
-test('command registration uses the guild bulk-overwrite endpoint', async () => {
-  let requestUrl = '';
-  let requestInit: RequestInit | undefined;
-  const fakeFetch = (async (input: URL | RequestInfo, init?: RequestInit) => {
-    requestUrl = String(input);
-    requestInit = init;
-    return new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } });
-  }) as typeof fetch;
-
-  await registerGuildCommands(
-    { applicationId: '123', guildId: '456', botToken: 'secret' },
-    fakeFetch,
-  );
-
-  assert.equal(
-    requestUrl,
-    'https://discord.com/api/v10/applications/123/guilds/456/commands',
-  );
-  assert.equal(requestInit?.method, 'PUT');
-  assert.equal((requestInit?.headers as Record<string, string>).Authorization, 'Bot secret');
-  assert.deepEqual(JSON.parse(String(requestInit?.body)), guildCommands);
-});
-
 test('registration and file upload modals use Label-based current components', () => {
   const registration = registerModalResponse(4);
   const registerComponents = registration.data?.components as Array<Record<string, unknown>>;
   assert.equal(registration.type, 9);
+  assert.equal(registration.data?.custom_id, 'register:v1:production:4');
   assert.equal(registerComponents[0]?.type, 10);
   assert.equal(registerComponents.some((component) => component.type === 1), false);
   assert.deepEqual(
@@ -80,6 +58,29 @@ test('registration and file upload modals use Label-based current components', (
   assert.equal(fileComponent.type, 19);
   assert.deepEqual(fileComponent.file_types, ['.jpg', '.jpeg', '.png', '.webp']);
   assert.equal(upload.data?.flags, undefined);
+});
+
+test('sandbox UI states clearly that the live website is not being changed', () => {
+  const registration = registerModalResponse(4, 'sandbox');
+  const registerComponents = registration.data?.components as Array<Record<string, unknown>>;
+  assert.match(String(registerComponents[0]?.content), /sandbox/i);
+  assert.match(String(registerComponents[0]?.content), /website will not change/i);
+  assert.equal(registration.data?.custom_id, 'register:v1:sandbox:4');
+
+  const response = profilePanelResponse(
+    { ...snapshot(), lastDeploymentStatus: 'sandbox' },
+    'sandbox',
+  );
+  const container = (response.data?.components as Array<Record<string, unknown>>)[0]!;
+  const components = container.components as Array<Record<string, unknown>>;
+  const summary = String(components.find((component) => component.type === 10)?.content);
+  assert.match(summary, /Sandbox listing flag/);
+  assert.match(summary, /Last sandbox save/);
+  const labels = components
+    .filter((component) => component.type === 1)
+    .flatMap((row) => row.components as Array<Record<string, unknown>>)
+    .map((button) => button.label);
+  assert.ok(labels.includes('Mark listed (sandbox)'));
 });
 
 test('profile panel is ephemeral Components V2 with bounded action rows', () => {
