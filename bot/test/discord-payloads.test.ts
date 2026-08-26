@@ -28,7 +28,7 @@ test('guild commands expose fixed category choices and no destructive delete com
   assert.equal(admin && 'default_member_permissions' in admin, false);
   assert.deepEqual(
     admin?.options?.map((option) => option.name),
-    ['hide', 'revoke', 'restore', 'transfer', 'set-category'],
+    ['hide', 'unhide', 'revoke', 'restore', 'transfer', 'set-category'],
   );
 });
 
@@ -117,6 +117,45 @@ test('profile panel is ephemeral Components V2 with bounded action rows', () => 
   assert.ok(actionCustomIds.includes(`profile:set-listed:1:${STATE_REVISION}`));
 });
 
+test('force-hidden profiles explain the owner lock and disable self-listing', () => {
+  const response = profilePanelResponse({
+    ...snapshot(),
+    listingPolicy: 'force_hidden',
+  });
+  const container = (response.data?.components as Array<Record<string, unknown>>)[0]!;
+  const components = container.components as Array<Record<string, unknown>>;
+  const summary = String(components.find((component) => component.type === 10)?.content);
+  assert.match(summary, /locked by the site owner/i);
+
+  const buttons = components
+    .filter((component) => component.type === 1)
+    .flatMap((row) => row.components as Array<Record<string, unknown>>);
+  const listing = buttons.find((button) => button.label === 'Hidden by site owner');
+  assert.equal(listing?.disabled, true);
+  assert.equal(
+    buttons.find((button) => button.label === 'Name & position')?.disabled,
+    undefined,
+  );
+});
+
+test('pending owner moderation is visible and temporarily disables profile editing', () => {
+  const response = profilePanelResponse({
+    ...snapshot(),
+    pendingAdminAction: 'hide',
+  });
+  const container = (response.data?.components as Array<Record<string, unknown>>)[0]!;
+  const components = container.components as Array<Record<string, unknown>>;
+  const summary = String(components.find((component) => component.type === 10)?.content);
+  assert.match(summary, /hide pending recovery/i);
+
+  const buttons = components
+    .filter((component) => component.type === 1)
+    .flatMap((row) => row.components as Array<Record<string, unknown>>);
+  assert.ok(buttons.length > 0);
+  assert.ok(buttons.every((button) => button.disabled === true));
+  assert.ok(buttons.some((button) => button.label === 'Owner action pending'));
+});
+
 test('profile edit modals bind submissions to the rendered state revision', () => {
   const current = snapshot();
 
@@ -171,6 +210,7 @@ function snapshot(): ProfileSnapshot {
     profileSlug: 'example',
     stateRevision: STATE_REVISION,
     bindingStatus: 'active',
+    listingPolicy: 'user_controlled',
     profile: createEmptyProfile({
       name: 'Example Member',
       position: 'Undergraduate Student, KAIST',

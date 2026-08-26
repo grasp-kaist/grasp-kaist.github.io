@@ -10,6 +10,7 @@ import {
   type ProfilePublishResult,
   type ProfilePublisher,
   type ProfileRepositoryReader,
+  type RepositoryProfileSnapshot,
 } from '../src/service/profile-service.js';
 import { SqliteStore } from '../src/storage/sqlite-store.js';
 
@@ -96,7 +97,24 @@ function currentRevision(service: ProfileService, userId = 'member') {
   return revision;
 }
 
-test('local profile probes never invoke repository reconciliation', async () => {
+function profileSnapshot(
+  overrides: Partial<RepositoryProfileSnapshot['profile']> = {},
+): RepositoryProfileSnapshot['profile'] {
+  return {
+    listed: false,
+    order: 4,
+    name: 'Example Member',
+    position: 'Undergraduate Student, KAIST',
+    details: [],
+    researchInterests: [],
+    contact: [],
+    website: '',
+    photo: '',
+    ...overrides,
+  };
+}
+
+test('local profile probes do not add repository reads after registration preflight', async () => {
   let repositoryReads = 0;
   const { store, service } = createFixture({
     repositoryReader: {
@@ -113,12 +131,13 @@ test('local profile probes never invoke repository reconciliation', async () => 
       snapshot: null,
     });
     await registerMember(service);
+    const readsAfterRegistration = repositoryReads;
 
     const local = service.getOwnProfileLocal(guildId, 'member');
     assert.equal(local.hasBinding, true);
     assert.equal(local.snapshot?.bindingStatus, 'active');
     assert.equal(local.snapshot?.profile.name, 'Example Member');
-    assert.equal(repositoryReads, 0);
+    assert.equal(repositoryReads, readsAfterRegistration);
   } finally {
     store.close();
   }
@@ -143,6 +162,36 @@ test('registration immediately binds an unlisted canonical profile and is idempo
   }
 });
 
+test('registration skips a remotely existing slug and allocates the numeric -2 suffix', async () => {
+  const repositoryReads: string[] = [];
+  const { store, publisher, service } = createFixture({
+    repositoryReader: {
+      readProfile: async (slug) => {
+        repositoryReads.push(slug);
+        return slug === 'example-member'
+          ? {
+              profile: profileSnapshot(),
+              profileBlobSha: 'remote-profile',
+              commitSha: 'remote-commit',
+              operationId: 'pre-existing-operation',
+            }
+          : null;
+      },
+    },
+  });
+
+  try {
+    const registered = await registerMember(service);
+
+    assert.equal(registered.snapshot?.profileSlug, 'example-member-2');
+    assert.equal(store.getBinding(guildId, 'member')?.profileSlug, 'example-member-2');
+    assert.equal(publisher.calls[0]?.slug, 'example-member-2');
+    assert.deepEqual(repositoryReads, ['example-member', 'example-member-2']);
+  } finally {
+    store.close();
+  }
+});
+
 test('a definitely unpublished validation failure releases the provisional registration', async () => {
   const { store, publisher, service } = createFixture();
   publisher.failNext = Object.assign(new Error('validation failed'), {
@@ -156,6 +205,20 @@ test('a definitely unpublished validation failure releases the provisional regis
     store.close();
   }
 });
+
+for (const errorCode of ['content_conflict', 'main_conflict'] as const) {
+  test(`${errorCode} releases the provisional registration`, async () => {
+    const { store, publisher, service } = createFixture();
+    publisher.failNext = Object.assign(new Error(errorCode), { code: errorCode });
+
+    try {
+      await assert.rejects(() => registerMember(service), new RegExp(errorCode));
+      assert.equal(store.getBinding(guildId, 'member'), undefined);
+    } finally {
+      store.close();
+    }
+  });
+}
 
 test('an ambiguous initial publish failure keeps its reservation for remote reconciliation', async () => {
   const { store, publisher, service } = createFixture();
@@ -177,6 +240,7 @@ test('an ambiguous initial publish failure keeps its reservation for remote reco
 test('registration and concurrent profile recovery finalize one active binding', async () => {
   const releasePublish = Promise.withResolvers<void>();
   let repositoryReads = 0;
+  let remotePublished = false;
   const remoteProfile = {
     listed: false,
     order: 4 as const,
@@ -192,12 +256,12 @@ test('registration and concurrent profile recovery finalize one active binding',
     repositoryReader: {
       readProfile: async () => {
         repositoryReads += 1;
-        return {
+        return remotePublished ? {
           profile: remoteProfile,
           profileBlobSha: 'profile-1',
           commitSha: 'commit-1',
           operationId: 'operation-1',
-        };
+        } : null;
       },
     },
   });
@@ -210,14 +274,58 @@ test('registration and concurrent profile recovery finalize one active binding',
       await new Promise((resolve) => setImmediate(resolve));
     }
 
+    remotePublished = true;
     const recovery = service.getOwnProfile(guildId, 'member');
     releasePublish.resolve();
     const [registered, recovered] = await Promise.all([registration, recovery]);
 
     assert.equal(registered.snapshot?.bindingStatus, 'active');
     assert.equal(recovered?.bindingStatus, 'active');
-    assert.equal(repositoryReads, 1);
+    assert.equal(repositoryReads, 2);
     assert.equal(store.getInteractionReceipt('register-member')?.status, 'completed');
+  } finally {
+    releasePublish.resolve();
+    store.close();
+  }
+});
+
+test('a second service cannot steal a fresh provisioning binding while publication is running', async () => {
+  const { store, publisher, service } = createFixture();
+  const releasePublish = Promise.withResolvers<void>();
+  const secondService = new ProfileService({
+    store,
+    publisher,
+    guildId,
+    ownerUserId,
+    now: () => new Date('2026-08-21T00:00:00.000Z'),
+    newOperationId: () => 'second-operation',
+  });
+
+  try {
+    publisher.pauseNext = releasePublish.promise;
+    const firstRegistration = registerMember(service);
+
+    while (publisher.calls.length < 1) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    await assert.rejects(
+      secondService.register(actor('register-from-second-service'), {
+        name: 'Example Member',
+        position: 'Undergraduate Student, KAIST',
+        order: 4,
+      }),
+      (error: unknown) =>
+        error instanceof ProfileServiceError && error.code === 'registration_recovering',
+    );
+    assert.equal(
+      store.getBinding(guildId, 'member')?.provisioningOperationId,
+      'operation-1',
+    );
+
+    releasePublish.resolve();
+    const completed = await firstRegistration;
+    assert.equal(completed.snapshot?.bindingStatus, 'active');
   } finally {
     releasePublish.resolve();
     store.close();
@@ -338,6 +446,7 @@ test('a no-change publication preserves the last deployed commit for the profile
 
 test('a publication timeout marks active state for remote verification on the next profile open', async () => {
   let repositoryReads = 0;
+  let remotePublished = false;
   const remoteProfile = {
     listed: false,
     order: 4 as const,
@@ -353,18 +462,19 @@ test('a publication timeout marks active state for remote verification on the ne
     repositoryReader: {
       readProfile: async () => {
         repositoryReads += 1;
-        return {
+        return remotePublished ? {
           profile: remoteProfile,
           profileBlobSha: 'remote-profile-2',
           commitSha: 'remote-commit-2',
           operationId: 'operation-2',
-        };
+        } : null;
       },
     },
   });
 
   try {
     await registerMember(service);
+    remotePublished = true;
     publisher.failNext = Object.assign(new Error('publication deadline exceeded'), {
       code: 'publication_timeout',
     });
@@ -380,7 +490,7 @@ test('a publication timeout marks active state for remote verification on the ne
 
     const recovered = await service.getOwnProfile(guildId, 'member');
 
-    assert.equal(repositoryReads, 1);
+    assert.equal(repositoryReads, 2);
     assert.equal(recovered?.profile.website, remoteProfile.website);
     assert.equal(recovered?.lastCommitSha, 'remote-commit-2');
   } finally {
@@ -520,6 +630,186 @@ test('owner recovery is runtime-guarded and revoked users cannot edit', async ()
   }
 });
 
+test('owner hide prevents relisting until an explicit owner unhide', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    await service.setOwnListed(actor('list-before-hide'), true, currentRevision(service));
+
+    const hidden = await service.ownerHide(actor('owner-hide', ownerUserId), 'member');
+    assert.equal(hidden.snapshot?.profile.listed, false);
+    assert.equal(hidden.snapshot?.listingPolicy, 'force_hidden');
+    assert.equal(store.getBinding(guildId, 'member')?.listingPolicy, 'force_hidden');
+
+    const callsBeforeBlockedRelist = publisher.calls.length;
+    await assert.rejects(
+      () => service.setOwnListed(actor('blocked-relist'), true, currentRevision(service)),
+      (error: unknown) =>
+        error instanceof ProfileServiceError && error.code === 'visibility_locked',
+    );
+    assert.equal(publisher.calls.length, callsBeforeBlockedRelist);
+
+    const unhidden = await service.ownerUnhide(actor('owner-unhide', ownerUserId), 'member');
+    assert.equal(unhidden.snapshot?.listingPolicy, 'user_controlled');
+    assert.equal(unhidden.snapshot?.profile.listed, false);
+
+    const relisted = await service.setOwnListed(
+      actor('relist-after-unhide'),
+      true,
+      currentRevision(service),
+    );
+    assert.equal(relisted.snapshot?.profile.listed, true);
+  } finally {
+    store.close();
+  }
+});
+
+test('owner revoke remains pending and active until the hidden profile publish succeeds', async () => {
+  const { store, publisher, service } = createFixture();
+  const releasePublish = Promise.withResolvers<void>();
+
+  try {
+    await registerMember(service);
+    await service.setOwnListed(actor('list-before-revoke'), true, currentRevision(service));
+    publisher.pauseNext = releasePublish.promise;
+
+    const revoke = service.ownerRevoke(actor('owner-revoke', ownerUserId), 'member');
+    while (publisher.calls.length < 3) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+
+    const pending = store.getBinding(guildId, 'member');
+    assert.equal(pending?.status, 'active');
+    assert.equal(pending?.listingPolicy, 'user_controlled');
+    assert.equal(pending?.pendingAdminAction, 'revoke');
+    assert.equal(
+      JSON.parse(store.getProfileState(guildId, 'example-member')!.profileJson).listed,
+      true,
+    );
+
+    releasePublish.resolve();
+    const revoked = await revoke;
+    assert.equal(revoked.snapshot?.profile.listed, false);
+    assert.equal(revoked.snapshot?.bindingStatus, 'revoked');
+    assert.equal(revoked.snapshot?.listingPolicy, 'force_hidden');
+    assert.equal(store.getBinding(guildId, 'member')?.pendingAdminAction, undefined);
+    assert.equal(JSON.parse(publisher.calls[2]!.profile.json).listed, false);
+  } finally {
+    releasePublish.resolve();
+    store.close();
+  }
+});
+
+test('a definitely unpublished revoke failure leaves the binding active and visible', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    await service.setOwnListed(actor('list-before-failed-revoke'), true, currentRevision(service));
+    publisher.failNext = Object.assign(new Error('validation failed'), {
+      code: 'validation_failed',
+    });
+
+    await assert.rejects(
+      () => service.ownerRevoke(actor('failed-revoke', ownerUserId), 'member'),
+      /validation failed/,
+    );
+
+    const binding = store.getBinding(guildId, 'member');
+    assert.equal(binding?.status, 'active');
+    assert.equal(binding?.listingPolicy, 'user_controlled');
+    assert.equal(binding?.pendingAdminAction, undefined);
+    assert.equal(
+      JSON.parse(store.getProfileState(guildId, 'example-member')!.profileJson).listed,
+      true,
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test('owner restore recovers editing but preserves the force-hidden listing policy', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    await service.setOwnListed(actor('list-before-restore-test'), true, currentRevision(service));
+    await service.ownerRevoke(actor('revoke-before-restore', ownerUserId), 'member');
+
+    const restored = await service.ownerRestore(actor('owner-restore', ownerUserId), 'member');
+    assert.equal(restored.snapshot?.bindingStatus, 'active');
+    assert.equal(restored.snapshot?.listingPolicy, 'force_hidden');
+    assert.equal(restored.snapshot?.profile.listed, false);
+
+    const callsBeforeBlockedRelist = publisher.calls.length;
+    await assert.rejects(
+      () => service.setOwnListed(actor('blocked-restored-relist'), true, currentRevision(service)),
+      (error: unknown) =>
+        error instanceof ProfileServiceError && error.code === 'visibility_locked',
+    );
+    assert.equal(publisher.calls.length, callsBeforeBlockedRelist);
+    assert.equal(store.getBinding(guildId, 'member')?.status, 'active');
+  } finally {
+    store.close();
+  }
+});
+
+for (const pendingAction of ['hide', 'revoke'] as const) {
+  test(`startup recovery completes a pending owner ${pendingAction} from remote proof`, async () => {
+    const { store, publisher, service } = createFixture();
+
+    try {
+      await registerMember(service);
+      await service.setOwnListed(
+        actor(`list-before-pending-${pendingAction}`),
+        true,
+        currentRevision(service),
+      );
+      const operationId = `pending-${pendingAction}-operation`;
+      const interactionId = `pending-${pendingAction}-interaction`;
+      store.beginInteraction(
+        interactionId,
+        operationId,
+        pendingAction === 'revoke' ? 'PROFILE_OWNER_REVOKE' : 'PROFILE_OWNER_HIDE',
+      );
+      store.beginAdminAction(guildId, 'member', pendingAction, operationId);
+      const hiddenProfile = profileSnapshot({ listed: false });
+      const restarted = new ProfileService({
+        store,
+        publisher,
+        repositoryReader: {
+          readProfile: async () => ({
+            profile: hiddenProfile,
+            profileBlobSha: `recovered-${pendingAction}-profile`,
+            commitSha: `recovered-${pendingAction}-commit`,
+            operationId,
+          }),
+        },
+        guildId,
+        ownerUserId,
+        now: () => new Date('2026-08-21T00:01:00.000Z'),
+      });
+
+      const summary = await restarted.reconcileKnownProfiles();
+      assert.deepEqual(summary.issues, []);
+
+      const recovered = store.getBinding(guildId, 'member');
+      assert.equal(recovered?.pendingAdminAction, undefined);
+      assert.equal(recovered?.pendingAdminOperationId, undefined);
+      assert.equal(recovered?.listingPolicy, 'force_hidden');
+      assert.equal(recovered?.status, pendingAction === 'revoke' ? 'revoked' : 'active');
+      assert.equal(
+        JSON.parse(store.getProfileState(guildId, 'example-member')!.profileJson).listed,
+        false,
+      );
+      assert.equal(store.getInteractionReceipt(interactionId)?.status, 'completed');
+    } finally {
+      store.close();
+    }
+  });
+}
+
 test('owner transfer cannot change ownership during an active profile publication', async () => {
   const { store, publisher, service } = createFixture();
   const releasePublish = Promise.withResolvers<void>();
@@ -624,12 +914,48 @@ test('an interrupted registration is claimed only when its remote operation proo
   const { store, service } = createFixture({ repositoryReader });
 
   try {
+    store.beginInteraction(
+      'interrupted-registration-interaction',
+      'registration-op',
+      'PROFILE_CREATE',
+    );
     store.reserveBinding(guildId, 'recovered-user', 'recovered-member', 'registration-op');
     const recovered = await service.getOwnProfile(guildId, 'recovered-user');
 
     assert.equal(recovered?.bindingStatus, 'active');
     assert.equal(recovered?.lastDeploymentStatus, 'published_status_unknown');
     assert.equal(store.getProfileState(guildId, 'recovered-member')?.profileBlobSha, 'remote-profile');
+    assert.equal(
+      store.getInteractionReceipt('interrupted-registration-interaction')?.status,
+      'completed',
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test('an aged provisioning binding with publication evidence survives a transient missing remote', async () => {
+  const store = new SqliteStore(':memory:', {
+    now: () => new Date('2026-08-21T00:00:00.000Z'),
+  });
+  store.reserveBinding(guildId, 'member', 'example-member', 'published-operation');
+  const service = new ProfileService({
+    store,
+    publisher: new RecordingPublisher(),
+    repositoryReader: { readProfile: async () => null },
+    checkpointLookup: { load: async () => ({ stage: 'main_updated' }) },
+    guildId,
+    ownerUserId,
+    now: () => new Date('2026-08-21T00:31:00.000Z'),
+  });
+
+  try {
+    await assert.rejects(
+      () => service.getOwnProfile(guildId, 'member'),
+      (error: unknown) =>
+        error instanceof ProfileServiceError && error.code === 'registration_remote_pending',
+    );
+    assert.equal(store.getBinding(guildId, 'member')?.provisioningOperationId, 'published-operation');
   } finally {
     store.close();
   }
@@ -688,6 +1014,7 @@ test('startup reconciliation bounds concurrent repository reads', async () => {
 
 test('startup reconciliation repairs an active profile left stale after publication', async () => {
   let repositoryReads = 0;
+  let remotePublished = false;
   const remoteProfile = {
     listed: true,
     order: 4 as const,
@@ -703,22 +1030,23 @@ test('startup reconciliation repairs an active profile left stale after publicat
     repositoryReader: {
       readProfile: async () => {
         repositoryReads += 1;
-        return {
+        return remotePublished ? {
           profile: remoteProfile,
           profileBlobSha: 'remote-profile',
           commitSha: 'remote-commit',
           operationId: 'remote-operation',
-        };
+        } : null;
       },
     },
   });
 
   try {
     await registerMember(service);
+    remotePublished = true;
 
     const summary = await service.reconcileKnownProfiles();
 
-    assert.equal(repositoryReads, 1);
+    assert.equal(repositoryReads, 2);
     assert.equal(summary.reconciled, 1);
     assert.equal(summary.issues.length, 0);
     const recovered = service.getOwnProfileLocal(guildId, 'member').snapshot;
@@ -778,6 +1106,7 @@ test('concurrent startup and command recovery share one repository read', async 
 test('startup recovery rejects a mutation quickly and the retry uses recovered state', async () => {
   const readStarted = Promise.withResolvers<void>();
   const releaseRead = Promise.withResolvers<void>();
+  let recoveryEnabled = false;
   const remoteProfile = {
     listed: false,
     order: 4 as const,
@@ -792,6 +1121,9 @@ test('startup recovery rejects a mutation quickly and the retry uses recovered s
   const { store, publisher, service } = createFixture({
     repositoryReader: {
       readProfile: async () => {
+        if (!recoveryEnabled) {
+          return null;
+        }
         readStarted.resolve();
         await releaseRead.promise;
         return {
@@ -806,6 +1138,7 @@ test('startup recovery rejects a mutation quickly and the retry uses recovered s
 
   try {
     await registerMember(service);
+    recoveryEnabled = true;
     const recovery = service.reconcileKnownProfiles();
     await readStarted.promise;
     await assert.rejects(

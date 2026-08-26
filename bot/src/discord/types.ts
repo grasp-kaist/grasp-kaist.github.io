@@ -7,12 +7,16 @@ export type DiscordActor = {
 };
 
 export type ProfileBindingStatus = 'provisioning' | 'active' | 'revoked';
+export type ProfileListingPolicy = 'user_controlled' | 'force_hidden';
+export type PendingProfileAdminAction = 'hide' | 'revoke';
 
 export type ProfileSnapshot = {
   profileSlug: string;
   stateRevision: string;
   profile: MemberProfile;
   bindingStatus: ProfileBindingStatus;
+  listingPolicy: ProfileListingPolicy;
+  pendingAdminAction?: PendingProfileAdminAction;
   lastCommitSha?: string;
   lastDeploymentStatus?: string;
   membersPageUrl?: string;
@@ -77,6 +81,7 @@ export type ProfileService = {
     expectedRevision: string,
   ): Promise<ProfileOperationResult>;
   ownerHide(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult>;
+  ownerUnhide(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult>;
   ownerRevoke(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult>;
   ownerRestore(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult>;
   ownerTransfer(

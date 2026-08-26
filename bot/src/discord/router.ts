@@ -188,6 +188,16 @@ export class DiscordInteractionRouter {
             : 'The profile was hidden from the website.',
         );
       }
+      case 'unhide': {
+        const target = getRequiredStringOption(subcommand.options, 'member');
+        return this.#deferredMutation(
+          interaction,
+          () => this.#service.ownerUnhide(actor, target),
+          this.#config.publicationMode === 'sandbox'
+            ? 'The owner visibility lock was removed in the sandbox. The profile remains hidden until its owner marks it listed.'
+            : 'The owner visibility lock was removed. The profile remains hidden until its owner shows it on the website.',
+        );
+      }
       case 'revoke': {
         const target = getRequiredStringOption(subcommand.options, 'member');
         return this.#deferredMutation(

@@ -45,6 +45,12 @@ export const guildCommands = [
       },
       {
         type: 1,
+        name: 'unhide',
+        description: 'Return visibility control to a profile owner',
+        options: [userOption('member', 'Profile owner')],
+      },
+      {
+        type: 1,
         name: 'revoke',
         description: 'Suspend a profile binding',
         options: [userOption('member', 'Profile owner')],

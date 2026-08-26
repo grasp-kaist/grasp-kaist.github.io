@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import { BindingConflictError, SqliteStore } from '../src/storage/sqlite-store.js';
@@ -36,6 +40,139 @@ test('failed provisioning reservations can be released', () => {
     store.reserveBinding('guild', 'user-1', 'member-a');
     store.removeProvisioningBinding('guild', 'user-1');
     assert.equal(store.getBinding('guild', 'user-1'), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test('new bindings start user-controlled with no pending moderation action', () => {
+  const store = new SqliteStore(':memory:');
+
+  try {
+    const binding = store.reserveBinding('guild', 'user-1', 'member-a');
+    assert.equal(binding.listingPolicy, 'user_controlled');
+    assert.equal(binding.pendingAdminAction, undefined);
+    assert.equal(binding.pendingAdminOperationId, undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test('legacy bindings migrate to user-controlled moderation fields without data loss', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'grasp-profile-store-migration-'));
+  const databasePath = join(directory, 'legacy.sqlite');
+  const legacy = new DatabaseSync(databasePath);
+
+  try {
+    legacy.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE profile_bindings (
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('provisioning', 'active', 'revoked')),
+        provisioning_operation_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (guild_id, discord_user_id),
+        UNIQUE (guild_id, profile_slug)
+      );
+      INSERT INTO profile_bindings (
+        guild_id, discord_user_id, profile_slug, status,
+        provisioning_operation_id, created_at, updated_at
+      ) VALUES (
+        'legacy-guild', 'legacy-user', 'legacy-member', 'active',
+        NULL, '2026-08-20T00:00:00.000Z', '2026-08-20T00:00:00.000Z'
+      );
+    `);
+  } finally {
+    legacy.close();
+  }
+
+  const migrated = new SqliteStore(databasePath);
+  try {
+    const binding = migrated.getBinding('legacy-guild', 'legacy-user');
+    assert.equal(binding?.profileSlug, 'legacy-member');
+    assert.equal(binding?.status, 'active');
+    assert.equal(binding?.createdAt, '2026-08-20T00:00:00.000Z');
+    assert.equal(binding?.listingPolicy, 'user_controlled');
+    assert.equal(binding?.pendingAdminAction, undefined);
+
+    const pending = migrated.beginAdminAction(
+      'legacy-guild',
+      'legacy-user',
+      'hide',
+      'legacy-hide-operation',
+    );
+    assert.equal(pending.pendingAdminAction, 'hide');
+    assert.equal(pending.pendingAdminOperationId, 'legacy-hide-operation');
+  } finally {
+    migrated.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('admin moderation completion atomically updates profile state and binding policy', () => {
+  const store = new SqliteStore(':memory:', { now: () => fixedDate });
+
+  try {
+    store.reserveBinding('guild', 'user-1', 'member-a');
+    store.activateBinding('guild', 'user-1');
+    store.saveProfileState({
+      guildId: 'guild',
+      profileSlug: 'member-a',
+      profileJson: '{"listed":true}',
+      profileBlobSha: 'profile-before',
+      lastCommitSha: 'commit-before',
+      lastDeploymentStatus: 'deployed',
+    });
+    const pending = store.beginAdminAction(
+      'guild',
+      'user-1',
+      'revoke',
+      'revoke-operation',
+    );
+    assert.equal(pending.status, 'active');
+    assert.equal(pending.listingPolicy, 'user_controlled');
+    assert.equal(pending.pendingAdminAction, 'revoke');
+
+    assert.throws(() => store.completeAdminActionWithProfileState({
+      guildId: 'guild',
+      discordUserId: 'user-1',
+      operationId: 'wrong-operation',
+      action: 'revoke',
+      state: {
+        profileSlug: 'member-a',
+        profileJson: '{"listed":false}',
+        profileBlobSha: 'profile-should-roll-back',
+        lastCommitSha: 'commit-should-roll-back',
+        lastDeploymentStatus: 'deployed',
+      },
+    }));
+
+    assert.equal(store.getProfileState('guild', 'member-a')?.profileBlobSha, 'profile-before');
+    assert.equal(store.getBinding('guild', 'user-1')?.pendingAdminAction, 'revoke');
+
+    const completed = store.completeAdminActionWithProfileState({
+      guildId: 'guild',
+      discordUserId: 'user-1',
+      operationId: 'revoke-operation',
+      action: 'revoke',
+      state: {
+        profileSlug: 'member-a',
+        profileJson: '{"listed":false}',
+        profileBlobSha: 'profile-after',
+        lastCommitSha: 'commit-after',
+        lastDeploymentStatus: 'deployed',
+      },
+    });
+
+    assert.equal(completed.binding.status, 'revoked');
+    assert.equal(completed.binding.listingPolicy, 'force_hidden');
+    assert.equal(completed.binding.pendingAdminAction, undefined);
+    assert.equal(completed.binding.pendingAdminOperationId, undefined);
+    assert.equal(completed.state.profileBlobSha, 'profile-after');
+    assert.equal(completed.state.profileJson, '{"listed":false}');
   } finally {
     store.close();
   }

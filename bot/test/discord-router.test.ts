@@ -476,6 +476,33 @@ test('owner command is checked independently of Discord command visibility', asy
   assert.match(String(completion[0]?.content), /website was not changed/i);
 });
 
+test('owner can remove a force-hide without claiming that the profile is already visible', async () => {
+  let unhiddenTarget: string | undefined;
+  const harness = createHarness({
+    ownerUnhide: async (_actor, targetUserId) => {
+      unhiddenTarget = targetUserId;
+      return {};
+    },
+  });
+  const options = [
+    {
+      type: 1,
+      name: 'unhide',
+      options: [{ type: 6, name: 'member', value: TARGET_ID }],
+    },
+  ];
+
+  const routed = await harness.router.route(
+    commandInteraction('profile-admin', options, OWNER_ID),
+  );
+  assert.equal(routed.response.type, 5);
+  await routed.afterResponse?.();
+  assert.equal(unhiddenTarget, TARGET_ID);
+  const completion = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
+  assert.match(String(completion[0]?.content), /visibility lock was removed/i);
+  assert.match(String(completion[0]?.content), /remains hidden/i);
+});
+
 function createHarness(
   serviceOverrides: Partial<ProfileService> = {},
   downloaderOverride?: AttachmentDownloader,
@@ -526,6 +553,7 @@ function defaultService(): ProfileService {
     removeOwnPhoto: async () => ({}),
     setOwnListed: async () => ({}),
     ownerHide: async () => ({}),
+    ownerUnhide: async () => ({}),
     ownerRevoke: async () => ({}),
     ownerRestore: async () => ({}),
     ownerTransfer: async () => ({}),
@@ -538,6 +566,7 @@ function snapshot(): ProfileSnapshot {
     profileSlug: 'taein-oh',
     stateRevision: STATE_REVISION,
     bindingStatus: 'active',
+    listingPolicy: 'user_controlled',
     profile: createEmptyProfile({
       name: 'Taein Oh',
       position: 'Undergraduate Student, KAIST',

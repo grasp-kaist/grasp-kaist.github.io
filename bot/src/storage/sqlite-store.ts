@@ -3,12 +3,17 @@ import { dirname } from 'node:path';
 import { DatabaseSync, type StatementResultingChanges } from 'node:sqlite';
 
 export type BindingStatus = 'provisioning' | 'active' | 'revoked';
+export type ListingPolicy = 'user_controlled' | 'force_hidden';
+export type PendingAdminAction = 'hide' | 'revoke';
 
 export type ProfileBinding = {
   guildId: string;
   discordUserId: string;
   profileSlug: string;
   status: BindingStatus;
+  listingPolicy: ListingPolicy;
+  pendingAdminAction?: PendingAdminAction;
+  pendingAdminOperationId?: string;
   provisioningOperationId?: string;
   createdAt: string;
   updatedAt: string;
@@ -99,7 +104,8 @@ export class SqliteStore {
   getBinding(guildId: string, discordUserId: string) {
     const row = this.#database
       .prepare(
-        `SELECT guild_id, discord_user_id, profile_slug, status,
+        `SELECT guild_id, discord_user_id, profile_slug, status, listing_policy,
+                pending_admin_action, pending_admin_operation_id,
                 provisioning_operation_id, created_at, updated_at
          FROM profile_bindings
          WHERE guild_id = ? AND discord_user_id = ?`,
@@ -112,7 +118,8 @@ export class SqliteStore {
   getBindingBySlug(guildId: string, profileSlug: string) {
     const row = this.#database
       .prepare(
-        `SELECT guild_id, discord_user_id, profile_slug, status,
+        `SELECT guild_id, discord_user_id, profile_slug, status, listing_policy,
+                pending_admin_action, pending_admin_operation_id,
                 provisioning_operation_id, created_at, updated_at
          FROM profile_bindings
          WHERE guild_id = ? AND profile_slug = ?`,
@@ -176,7 +183,8 @@ export class SqliteStore {
   listBindings(guildId: string) {
     const rows = this.#database
       .prepare(
-        `SELECT guild_id, discord_user_id, profile_slug, status,
+        `SELECT guild_id, discord_user_id, profile_slug, status, listing_policy,
+                pending_admin_action, pending_admin_operation_id,
                 provisioning_operation_id, created_at, updated_at
          FROM profile_bindings
          WHERE guild_id = ?
@@ -261,11 +269,92 @@ export class SqliteStore {
       .prepare(
         `UPDATE profile_bindings
          SET status = ?, provisioning_operation_id = NULL, updated_at = ?
-         WHERE guild_id = ? AND discord_user_id = ?`,
+         WHERE guild_id = ? AND discord_user_id = ? AND pending_admin_action IS NULL`,
       )
       .run(status, this.#timestamp(), guildId, discordUserId);
 
     assertChanged(result, 'Binding was not found.');
+    return this.getBinding(guildId, discordUserId)!;
+  }
+
+  beginAdminAction(
+    guildId: string,
+    discordUserId: string,
+    action: PendingAdminAction,
+    operationId: string,
+  ) {
+    const result = this.#database
+      .prepare(
+        `UPDATE profile_bindings
+         SET pending_admin_action = ?, pending_admin_operation_id = ?, updated_at = ?
+         WHERE guild_id = ? AND discord_user_id = ?
+           AND status = 'active' AND pending_admin_action IS NULL`,
+      )
+      .run(action, operationId, this.#timestamp(), guildId, discordUserId);
+
+    assertChanged(result, 'Active binding is missing or already has a pending admin action.');
+    return this.getBinding(guildId, discordUserId)!;
+  }
+
+  clearPendingAdminAction(guildId: string, discordUserId: string, operationId: string) {
+    const result = this.#database
+      .prepare(
+        `UPDATE profile_bindings
+         SET pending_admin_action = NULL, pending_admin_operation_id = NULL, updated_at = ?
+         WHERE guild_id = ? AND discord_user_id = ? AND pending_admin_operation_id = ?`,
+      )
+      .run(this.#timestamp(), guildId, discordUserId, operationId);
+
+    assertChanged(result, 'Pending admin action was not found.');
+    return this.getBinding(guildId, discordUserId)!;
+  }
+
+  completeAdminActionWithProfileState(input: {
+    guildId: string;
+    discordUserId: string;
+    operationId: string;
+    action: PendingAdminAction;
+    state: Omit<ProfileStateInput, 'guildId'>;
+  }) {
+    this.#transaction(() => {
+      this.#upsertProfileState({ guildId: input.guildId, ...input.state });
+      const result = this.#database
+        .prepare(
+          `UPDATE profile_bindings
+           SET status = ?, listing_policy = 'force_hidden',
+               pending_admin_action = NULL, pending_admin_operation_id = NULL, updated_at = ?
+           WHERE guild_id = ? AND discord_user_id = ?
+             AND pending_admin_action = ? AND pending_admin_operation_id = ?`,
+        )
+        .run(
+          input.action === 'revoke' ? 'revoked' : 'active',
+          this.#timestamp(),
+          input.guildId,
+          input.discordUserId,
+          input.action,
+          input.operationId,
+        );
+
+      assertChanged(result, 'Pending admin action changed before it could be completed.');
+    });
+
+    return {
+      binding: this.getBinding(input.guildId, input.discordUserId)!,
+      state: this.getProfileState(input.guildId, input.state.profileSlug)!,
+    };
+  }
+
+  clearForceHidden(guildId: string, discordUserId: string) {
+    const result = this.#database
+      .prepare(
+        `UPDATE profile_bindings
+         SET listing_policy = 'user_controlled', updated_at = ?
+         WHERE guild_id = ? AND discord_user_id = ?
+           AND pending_admin_action IS NULL`,
+      )
+      .run(this.#timestamp(), guildId, discordUserId);
+
+    assertChanged(result, 'Binding is missing or still has a pending admin action.');
     return this.getBinding(guildId, discordUserId)!;
   }
 
@@ -282,7 +371,7 @@ export class SqliteStore {
           `UPDATE profile_bindings
            SET discord_user_id = ?, status = 'active', provisioning_operation_id = NULL,
                updated_at = ?
-           WHERE guild_id = ? AND profile_slug = ?`,
+           WHERE guild_id = ? AND profile_slug = ? AND pending_admin_action IS NULL`,
         )
         .run(newDiscordUserId, this.#timestamp(), guildId, profileSlug);
 
@@ -321,6 +410,47 @@ export class SqliteStore {
     assertChanged(result, 'Interaction receipt was not found.');
   }
 
+  completeProcessingInteractionByOperation(
+    operationId: string,
+    kind: string,
+    response: unknown,
+  ) {
+    const row = this.#database
+      .prepare(
+        `SELECT interaction_id, operation_id, kind, status, response_json, created_at, updated_at
+         FROM interaction_receipts
+         WHERE operation_id = ? AND kind = ? AND status = 'processing'
+         ORDER BY created_at, interaction_id
+         LIMIT 1`,
+      )
+      .get(operationId, kind) as InteractionRow | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    const responseJson = JSON.stringify(response);
+    const updatedAt = this.#timestamp();
+    const result = this.#database
+      .prepare(
+        `UPDATE interaction_receipts
+         SET status = 'completed', response_json = ?, updated_at = ?
+         WHERE interaction_id = ? AND operation_id = ? AND kind = ? AND status = 'processing'`,
+      )
+      .run(responseJson, updatedAt, row.interaction_id, operationId, kind);
+
+    if (Number(result.changes) !== 1) {
+      return undefined;
+    }
+
+    return mapInteractionReceipt({
+      ...row,
+      status: 'completed',
+      response_json: responseJson,
+      updated_at: updatedAt,
+    });
+  }
+
   getInteractionReceipt(interactionId: string) {
     const row = this.#database
       .prepare(
@@ -334,20 +464,7 @@ export class SqliteStore {
       return undefined;
     }
 
-    const receipt: InteractionReceipt = {
-      interactionId: row.interaction_id,
-      operationId: row.operation_id,
-      kind: row.kind,
-      status: row.status,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    };
-
-    if (row.response_json !== null) {
-      receipt.responseJson = row.response_json;
-    }
-
-    return receipt;
+    return mapInteractionReceipt(row);
   }
 
   stagePhoto(input: {
@@ -532,6 +649,11 @@ export class SqliteStore {
         discord_user_id TEXT NOT NULL,
         profile_slug TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('provisioning', 'active', 'revoked')),
+        listing_policy TEXT NOT NULL DEFAULT 'user_controlled'
+          CHECK (listing_policy IN ('user_controlled', 'force_hidden')),
+        pending_admin_action TEXT
+          CHECK (pending_admin_action IS NULL OR pending_admin_action IN ('hide', 'revoke')),
+        pending_admin_operation_id TEXT,
         provisioning_operation_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -592,6 +714,9 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS idx_audit_profile_created
         ON audit_events (profile_slug, created_at);
+
+      CREATE INDEX IF NOT EXISTS idx_interaction_operation
+        ON interaction_receipts (operation_id, kind, status);
     `);
 
     const bindingColumns = this.#database
@@ -601,6 +726,24 @@ export class SqliteStore {
     if (!bindingColumns.some((column) => column.name === 'provisioning_operation_id')) {
       this.#database.exec(
         'ALTER TABLE profile_bindings ADD COLUMN provisioning_operation_id TEXT',
+      );
+    }
+
+    if (!bindingColumns.some((column) => column.name === 'listing_policy')) {
+      this.#database.exec(
+        "ALTER TABLE profile_bindings ADD COLUMN listing_policy TEXT NOT NULL DEFAULT 'user_controlled'",
+      );
+    }
+
+    if (!bindingColumns.some((column) => column.name === 'pending_admin_action')) {
+      this.#database.exec(
+        'ALTER TABLE profile_bindings ADD COLUMN pending_admin_action TEXT',
+      );
+    }
+
+    if (!bindingColumns.some((column) => column.name === 'pending_admin_operation_id')) {
+      this.#database.exec(
+        'ALTER TABLE profile_bindings ADD COLUMN pending_admin_operation_id TEXT',
       );
     }
   }
@@ -638,6 +781,9 @@ type BindingRow = {
   discord_user_id: string;
   profile_slug: string;
   status: BindingStatus;
+  listing_policy: ListingPolicy;
+  pending_admin_action: PendingAdminAction | null;
+  pending_admin_operation_id: string | null;
   provisioning_operation_id: string | null;
   created_at: string;
   updated_at: string;
@@ -683,12 +829,21 @@ function mapBinding(row: BindingRow): ProfileBinding {
     discordUserId: row.discord_user_id,
     profileSlug: row.profile_slug,
     status: row.status,
+    listingPolicy: row.listing_policy,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 
   if (row.provisioning_operation_id !== null) {
     binding.provisioningOperationId = row.provisioning_operation_id;
+  }
+
+  if (row.pending_admin_action !== null) {
+    binding.pendingAdminAction = row.pending_admin_action;
+  }
+
+  if (row.pending_admin_operation_id !== null) {
+    binding.pendingAdminOperationId = row.pending_admin_operation_id;
   }
 
   return binding;
@@ -713,6 +868,23 @@ function mapProfileState(row: ProfileStateRow): ProfileState {
   }
 
   return state;
+}
+
+function mapInteractionReceipt(row: InteractionRow): InteractionReceipt {
+  const receipt: InteractionReceipt = {
+    interactionId: row.interaction_id,
+    operationId: row.operation_id,
+    kind: row.kind,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+
+  if (row.response_json !== null) {
+    receipt.responseJson = row.response_json;
+  }
+
+  return receipt;
 }
 
 function mapStagedPhoto(row: StagedPhotoRow): StagedPhoto {
