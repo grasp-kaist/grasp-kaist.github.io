@@ -5,7 +5,9 @@
   "position": "M.S. student, KAIST",
   "details": [],
   "researchInterests": [],
-  "contact": [],
-  "website": "",
+  "contact": [
+    "octanec8h18@kaist"
+  ],
+  "website": "https://octane-kr.github.io/",
   "photo": ""
 }
