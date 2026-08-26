@@ -1,4 +1,8 @@
 import { memberCategories, type MemberOrder } from '../domain/member-profile.js';
+import {
+  PROFILE_EDIT_CONFIRMATION_CUSTOM_ID,
+  PROFILE_EDIT_CONFIRMATION_VALUE,
+} from './inputs.js';
 import type {
   DiscordInteractionResponse,
   DiscordMessageFile,
@@ -140,6 +144,7 @@ export function editBasicModalResponse(snapshot: ProfileSnapshot): DiscordIntera
             value: snapshot.profile.position,
           },
         },
+        profileEditConfirmation(),
       ],
     },
   };
@@ -160,7 +165,13 @@ export function editTextModalResponse(snapshot: ProfileSnapshot): DiscordInterac
           snapshot.profile.researchInterests,
           2_000,
         ),
-        paragraphInput('Contact', 'contact', snapshot.profile.contact, 1_000),
+        paragraphInput(
+          'Contact',
+          'contact',
+          snapshot.profile.contact,
+          1_000,
+          '연락처, 이메일 등이 크롤링당하는 것을 막고 싶으면 적절히 변형해서 작성하세요. @kaist.ac.kr 메일의 경우 @kaist만 작성하길 권장합니다.',
+        ),
         {
           type: 18,
           label: 'Website',
@@ -173,6 +184,7 @@ export function editTextModalResponse(snapshot: ProfileSnapshot): DiscordInterac
             value: snapshot.profile.website,
           },
         },
+        profileEditConfirmation(),
       ],
     },
   };
@@ -202,6 +214,7 @@ export function categoryModalResponse(snapshot: ProfileSnapshot): DiscordInterac
             })),
           },
         },
+        profileEditConfirmation(),
       ],
     },
   };
@@ -381,6 +394,20 @@ export function operationFailedEdit(message: string): DiscordMessagePayload {
   );
 }
 
+export function operationPendingEdit(): DiscordMessagePayload {
+  return v2Edit(
+    [
+      {
+        type: 10,
+        content:
+          '프로필 등록 또는 이전 변경을 사이트에 반영 중이며 수 분이 걸릴 수 있습니다. '
+          + '잠시 후 `/profile`을 다시 실행해주세요.',
+      },
+    ],
+    [],
+  );
+}
+
 export function preparedPhotoPreviewEdit(prepared: PreparedProfilePhoto): {
   payload: DiscordMessagePayload;
   files: readonly DiscordMessageFile[];
@@ -456,11 +483,12 @@ function paragraphInput(
   customId: string,
   values: readonly string[],
   maxLength: number,
+  description = 'One item per line',
 ) {
   return {
     type: 18,
     label,
-    description: 'One item per line',
+    description,
     component: {
       type: 4,
       custom_id: customId,
@@ -468,6 +496,27 @@ function paragraphInput(
       required: false,
       max_length: maxLength,
       value: values.join('\n'),
+    },
+  };
+}
+
+function profileEditConfirmation() {
+  return {
+    type: 18,
+    label: 'Confirm save and publish',
+    description: 'Required. Submitting saves now and publishes immediately in production.',
+    component: {
+      type: 22,
+      custom_id: PROFILE_EDIT_CONFIRMATION_CUSTOM_ID,
+      min_values: 1,
+      max_values: 1,
+      required: true,
+      options: [
+        {
+          label: 'Save and publish this edit now',
+          value: PROFILE_EDIT_CONFIRMATION_VALUE,
+        },
+      ],
     },
   };
 }

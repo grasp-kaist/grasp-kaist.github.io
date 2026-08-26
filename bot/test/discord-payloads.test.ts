@@ -129,6 +129,46 @@ test('profile edit modals bind submissions to the rendered state revision', () =
     `profile-category:v1:${STATE_REVISION}`,
   );
   assert.equal(photoUploadModalResponse().data?.custom_id, 'profile-photo:v1');
+
+  const textComponents = editTextModalResponse(current).data?.components as Array<
+    Record<string, unknown>
+  >;
+  const contact = textComponents.find((component) => component.label === 'Contact');
+  assert.equal(
+    contact?.description,
+    '연락처, 이메일 등이 크롤링당하는 것을 막고 싶으면 적절히 변형해서 작성하세요. @kaist.ac.kr 메일의 경우 @kaist만 작성하길 권장합니다.',
+  );
+});
+
+test('every profile edit modal requires an explicit immediate publish confirmation', () => {
+  const current = snapshot();
+  const modals = [
+    editBasicModalResponse(current),
+    editTextModalResponse(current),
+    categoryModalResponse(current),
+  ];
+
+  for (const modal of modals) {
+    const components = modal.data?.components as Array<Record<string, unknown>>;
+    const confirmation = components.find(
+      (component) => component.label === 'Confirm save and publish',
+    );
+    const child = confirmation?.component as Record<string, unknown>;
+    const options = child.options as Array<Record<string, unknown>>;
+
+    assert.equal(confirmation?.description, 'Required. Submitting saves now and publishes immediately in production.');
+    assert.equal(child.type, 22);
+    assert.equal(child.custom_id, 'profile_edit_confirmation');
+    assert.equal(child.required, true);
+    assert.deepEqual(options, [
+      { label: 'Save and publish this edit now', value: 'save_and_publish' },
+    ]);
+  }
+
+  assert.equal(
+    (editTextModalResponse(current).data?.components as Array<Record<string, unknown>>).length,
+    5,
+  );
 });
 
 test('prepared photo preview attaches WebP and binds confirm/cancel to its token', () => {

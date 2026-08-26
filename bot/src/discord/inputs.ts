@@ -8,6 +8,9 @@ import type {
 
 const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
 
+export const PROFILE_EDIT_CONFIRMATION_CUSTOM_ID = 'profile_edit_confirmation';
+export const PROFILE_EDIT_CONFIRMATION_VALUE = 'save_and_publish';
+
 export class DiscordInputError extends Error {
   constructor(message: string) {
     super(message);
@@ -115,6 +118,21 @@ export function getSingleModalValue(interaction: DiscordInteraction, customId: s
 export function assertRegistrationConsent(interaction: DiscordInteraction) {
   if (getSingleModalValue(interaction, 'consent') !== 'accepted') {
     throw new DiscordInputError('Public information confirmation is required.');
+  }
+}
+
+export function assertProfileEditConfirmation(interaction: DiscordInteraction) {
+  const child = findModalChild(interaction, PROFILE_EDIT_CONFIRMATION_CUSTOM_ID);
+
+  if (
+    !child
+    || !hasValues(child)
+    || child.values.length !== 1
+    || child.values[0] !== PROFILE_EDIT_CONFIRMATION_VALUE
+  ) {
+    throw new DiscordInputError(
+      'Select the confirmation that saves and publishes this profile edit immediately.',
+    );
   }
 }
 

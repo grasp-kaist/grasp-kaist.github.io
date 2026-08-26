@@ -122,6 +122,24 @@ test('profile defers ephemerally before any potentially networked reconciliation
   assert.equal(components[0]?.type, 17);
 });
 
+test('profile explains registration delay when no usable profile is available', async () => {
+  const harness = createHarness({
+    getOwnProfile: async () => null,
+  });
+  const interaction = commandInteraction('profile');
+
+  const routed = await harness.router.route(interaction);
+  await routed.afterResponse?.();
+
+  const components = harness.edits[0]?.payload.components as Array<
+    Record<string, unknown>
+  >;
+  assert.equal(
+    components[0]?.content,
+    'register로부터 수 분이 걸릴 수 있습니다. 오랜 시간이 지나도 안 되면 Taein Oh에게 DM주세요.',
+  );
+});
+
 test('profile edit button opens its modal from local state without a repository read', async () => {
   let localProbes = 0;
   let profileReads = 0;
@@ -222,6 +240,7 @@ test('profile edit modal defers an update and replaces the stale panel with its 
   const interaction = modalInteraction(`profile-basic:v1:${STATE_REVISION}`, [
     labelText('name', 'Updated Member'),
     labelText('position', 'Graduate Student, KAIST'),
+    profileEditConfirmation(),
   ]);
 
   const routed = await harness.router.route(interaction);
@@ -258,6 +277,7 @@ test('text and category forms pass their rendered state revision to the service'
       labelText('research_interests', 'Verification'),
       labelText('contact', ''),
       labelText('website', 'example.org'),
+      profileEditConfirmation(),
     ]),
   );
   const category = await harness.router.route(
@@ -266,6 +286,7 @@ test('text and category forms pass their rendered state revision to the service'
         type: 18,
         component: { type: 3, custom_id: 'category', values: ['2'] },
       },
+      profileEditConfirmation(),
     ]),
   );
 
@@ -283,6 +304,70 @@ test('text and category forms pass their rendered state revision to the service'
     },
     { patch: { order: 2 }, expectedRevision: STATE_REVISION },
   ]);
+});
+
+test('profile edit modals reject submission without explicit publish confirmation', async () => {
+  let updateCalls = 0;
+  const harness = createHarness({
+    updateOwnProfile: async () => {
+      updateCalls += 1;
+      return {};
+    },
+  });
+  const submissions = [
+    modalInteraction(`profile-basic:v1:${STATE_REVISION}`, [
+      labelText('name', 'Updated Member'),
+      labelText('position', 'Graduate Student, KAIST'),
+    ]),
+    modalInteraction(`profile-text:v1:${STATE_REVISION}`, [
+      labelText('details', 'Details'),
+      labelText('research_interests', 'Verification'),
+      labelText('contact', ''),
+      labelText('website', 'example.org'),
+    ]),
+    modalInteraction(`profile-category:v1:${STATE_REVISION}`, [
+      {
+        type: 18,
+        component: { type: 3, custom_id: 'category', values: ['2'] },
+      },
+    ]),
+  ];
+
+  for (const submission of submissions) {
+    const routed = await harness.router.route(submission);
+    assert.equal(routed.response.type, 4);
+    assert.equal(routed.afterResponse, undefined);
+    const components = routed.response.data?.components as Array<Record<string, unknown>>;
+    assert.match(String(components[0]?.content), /saves and publishes.*immediately/i);
+  }
+
+  assert.equal(updateCalls, 0);
+});
+
+test('a profile publication already in progress is shown as waiting, not failed', async () => {
+  const pendingError = Object.assign(new Error('publication pending'), {
+    code: 'publication_pending',
+  });
+  const harness = createHarness({
+    updateOwnProfile: async () => {
+      throw pendingError;
+    },
+  });
+  const interaction = modalInteraction(`profile-basic:v1:${STATE_REVISION}`, [
+    labelText('name', 'Updated Member'),
+    labelText('position', 'Graduate Student, KAIST'),
+    profileEditConfirmation(),
+  ]);
+
+  const routed = await harness.router.route(interaction);
+  await routed.afterResponse?.();
+
+  const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
+  assert.equal(
+    components[0]?.content,
+    '프로필 등록 또는 이전 변경을 사이트에 반영 중이며 수 분이 걸릴 수 있습니다. 잠시 후 `/profile`을 다시 실행해주세요.',
+  );
+  assert.deepEqual(harness.errors, []);
 });
 
 test('photo modal resolves and downloads the selected attachment only after deferring', async () => {
@@ -448,6 +533,7 @@ function createHarness(
     payload: DiscordMessagePayload;
     files?: readonly DiscordMessageFile[];
   }> = [];
+  const errors: unknown[] = [];
   const webhook: InteractionWebhookClient = {
     editOriginal: async (token, payload, files) => {
       edits.push({ token, payload, ...(files ? { files } : {}) });
@@ -465,9 +551,10 @@ function createHarness(
     attachmentDownloader: downloaderOverride ?? {
       download: async () => new Uint8Array([1]),
     },
+    reportError: (error) => errors.push(error),
   });
 
-  return { router, edits, service };
+  return { router, edits, errors, service };
 }
 
 function defaultService(): ProfileService {
@@ -546,6 +633,17 @@ function labelText(customId: string, value: string) {
   return {
     type: 18 as const,
     component: { type: 4 as const, custom_id: customId, value },
+  };
+}
+
+function profileEditConfirmation() {
+  return {
+    type: 18 as const,
+    component: {
+      type: 22 as const,
+      custom_id: 'profile_edit_confirmation',
+      values: ['save_and_publish'],
+    },
   };
 }
 

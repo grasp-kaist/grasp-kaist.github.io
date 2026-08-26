@@ -1,6 +1,7 @@
 import { isMemberOrder, type MemberOrder } from '../domain/member-profile.js';
 import {
   assertExpectedGuild,
+  assertProfileEditConfirmation,
   assertRegistrationConsent,
   DiscordInputError,
   getGuildUserId,
@@ -22,6 +23,7 @@ import {
   ephemeralTextResponse,
   operationCompleteEdit,
   operationFailedEdit,
+  operationPendingEdit,
   photoFlowFinishedEdit,
   photoUploadModalResponse,
   pongResponse,
@@ -154,7 +156,7 @@ export class DiscordInteractionRouter {
                 snapshot
                   ? profilePanelEdit(snapshot, undefined, this.#config.publicationMode)
                   : photoFlowFinishedEdit(
-                      'You do not have a GRASP profile yet. Run `/register` to create one.',
+                      'register로부터 수 분이 걸릴 수 있습니다. 오랜 시간이 지나도 안 되면 Taein Oh에게 DM주세요.',
                     ),
               );
             } catch (error) {
@@ -317,6 +319,7 @@ export class DiscordInteractionRouter {
       const expectedRevision = basicProfileMatch[1]!;
       const name = limitedRequiredText(interaction, 'name', 80);
       const position = limitedRequiredText(interaction, 'position', 160);
+      assertProfileEditConfirmation(interaction);
       return this.#deferredMutation(
         interaction,
         () =>
@@ -340,6 +343,7 @@ export class DiscordInteractionRouter {
       );
       const contact = limitedOptionalText(interaction, 'contact', 1_000);
       const website = limitedOptionalText(interaction, 'website', 500);
+      assertProfileEditConfirmation(interaction);
       return this.#deferredMutation(
         interaction,
         () =>
@@ -361,6 +365,7 @@ export class DiscordInteractionRouter {
     if (categoryProfileMatch) {
       const expectedRevision = categoryProfileMatch[1]!;
       const order = getModalMemberOrder(interaction);
+      assertProfileEditConfirmation(interaction);
       return this.#deferredMutation(
         interaction,
         () => this.#service.updateOwnProfile(actor, { order }, expectedRevision),
@@ -420,6 +425,11 @@ export class DiscordInteractionRouter {
   }
 
   async #editDeferredFailure(interactionToken: string, error: unknown) {
+    if (isExpectedPendingError(error)) {
+      await this.#webhook.editOriginal(interactionToken, operationPendingEdit());
+      return;
+    }
+
     this.#reportError(error);
     await this.#webhook.editOriginal(
       interactionToken,
@@ -453,6 +463,23 @@ export class DiscordInteractionRouter {
       userId,
     };
   }
+}
+
+const EXPECTED_PENDING_ERROR_CODES = new Set([
+  'operation_in_progress',
+  'profile_busy',
+  'profile_not_active',
+  'publication_pending',
+]);
+
+function isExpectedPendingError(error: unknown) {
+  return (
+    typeof error === 'object'
+    && error !== null
+    && 'code' in error
+    && typeof error.code === 'string'
+    && EXPECTED_PENDING_ERROR_CODES.has(error.code)
+  );
 }
 
 function limitedRequiredText(
