@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -133,6 +134,7 @@ function runData(input: {
   id: number;
   sha: string;
   branch: string;
+  event?: 'push' | 'workflow_dispatch';
   status?: string;
   conclusion?: string | null;
   url?: string;
@@ -141,7 +143,7 @@ function runData(input: {
     id: input.id,
     head_sha: input.sha,
     head_branch: input.branch,
-    event: 'push',
+    event: input.event ?? 'push',
     status: input.status ?? 'completed',
     conclusion: input.conclusion === undefined ? 'success' : input.conclusion,
     html_url: input.url ?? `https://github.test/actions/runs/${input.id}`,
@@ -174,27 +176,49 @@ function createPublisher(
   });
 }
 
-function validationSteps(branch: string, headSha: string, conclusion = 'success'): ScriptStep[] {
+function validationSteps(
+  branch: string,
+  headSha: string,
+  conclusion = 'success',
+  includeQueuedPoll = true,
+): ScriptStep[] {
   const queued = runData({
     id: 10,
     sha: headSha,
     branch,
+    event: 'workflow_dispatch',
     status: 'queued',
     conclusion: null,
   });
   return [
     {
-      route: 'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs',
-      data: { workflow_runs: [queued] },
+      route: 'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+      data: {
+        workflow_run_id: 10,
+        run_url: 'https://api.github.test/actions/runs/10',
+        html_url: 'https://github.test/actions/runs/10',
+      },
       inspect: (parameters) => {
         assert.equal(parameters.workflow_id, 'validate-profile-bot.yml');
-        assert.equal(parameters.head_sha, headSha);
-        assert.equal(parameters.branch, branch);
+        assert.equal(parameters.ref, branch);
+        assert.equal('return_run_details' in parameters, false);
       },
     },
+    ...(includeQueuedPoll ? [{
+      route: 'GET /repos/{owner}/{repo}/actions/runs/{run_id}',
+      data: queued,
+      inspect: (parameters) => assert.equal(parameters.run_id, 10),
+    } satisfies ScriptStep] : []),
     {
       route: 'GET /repos/{owner}/{repo}/actions/runs/{run_id}',
-      data: runData({ id: 10, sha: headSha, branch, conclusion }),
+      data: runData({
+        id: 10,
+        sha: headSha,
+        branch,
+        event: 'workflow_dispatch',
+        conclusion,
+      }),
+      inspect: (parameters) => assert.equal(parameters.run_id, 10),
     },
   ];
 }
@@ -445,24 +469,25 @@ test('publishes two profiles in input order with one commit, validation, main up
       },
     },
     {
-      route: 'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs',
-      data: () => ({
-        workflow_runs: [runData({
-          id: 10,
-          sha: C,
-          branch: batchBranch,
-          status: 'queued',
-          conclusion: null,
-        })],
-      }),
+      route: 'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+      data: {
+        workflow_run_id: 10,
+        run_url: 'https://api.github.test/actions/runs/10',
+        html_url: 'https://github.test/actions/runs/10',
+      },
       inspect: (parameters) => {
-        assert.equal(parameters.branch, batchBranch);
-        assert.equal(parameters.head_sha, C);
+        assert.equal(parameters.workflow_id, 'validate-profile-bot.yml');
+        assert.equal(parameters.ref, batchBranch);
       },
     },
     {
       route: 'GET /repos/{owner}/{repo}/actions/runs/{run_id}',
-      data: () => runData({ id: 10, sha: C, branch: batchBranch }),
+      data: () => runData({
+        id: 10,
+        sha: C,
+        branch: batchBranch,
+        event: 'workflow_dispatch',
+      }),
     },
     { route: 'GET /repos/{owner}/{repo}/git/ref/{ref}', data: refData(A) },
     { route: 'PATCH /repos/{owner}/{repo}/git/refs/{ref}', data: refData(C) },
@@ -773,6 +798,59 @@ test('does not update main when remote validation fails and still deletes the te
   github.assertDone();
 });
 
+test('treats an unavailable validation dispatch as unpublished and cleans the temp branch', async () => {
+  const branch = 'bot/profile/example-member/operation-001/a1';
+  const github = new ScriptedGitHub([
+    { route: 'GET /repos/{owner}/{repo}/git/ref/{ref}', data: refData(A) },
+    { route: 'GET /repos/{owner}/{repo}/git/commits/{commit_sha}', data: commitData(T0) },
+    { route: 'GET /repos/{owner}/{repo}/contents/{path}', data: { type: 'file', sha: J } },
+    { route: 'POST /repos/{owner}/{repo}/git/blobs', data: { sha: P } },
+    { route: 'POST /repos/{owner}/{repo}/git/trees', data: { sha: T1 } },
+    { route: 'POST /repos/{owner}/{repo}/git/commits', data: { sha: C } },
+    {
+      route: 'GET /repos/{owner}/{repo}/compare/{basehead}',
+      data: {
+        status: 'ahead',
+        ahead_by: 1,
+        total_commits: 1,
+        files: [{ filename: 'src/data/members/example-member.json', status: 'modified' }],
+      },
+    },
+    { route: 'POST /repos/{owner}/{repo}/git/refs', data: { ref: `refs/heads/${branch}` } },
+    {
+      route: 'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+      error: httpError(503),
+    },
+    {
+      route: 'DELETE /repos/{owner}/{repo}/git/refs/{ref}',
+      inspect: (parameters) => assert.equal(parameters.ref, `heads/${branch}`),
+    },
+  ]);
+
+  await assert.rejects(
+    createPublisher(github).publish(publishInput()),
+    (error: unknown) =>
+      error instanceof ProfilePublisherError
+      && error.code === 'validation_unavailable'
+      && /No change was published/.test(error.message),
+  );
+  assert.equal(
+    github.calls.some((call) => call.route === 'PATCH /repos/{owner}/{repo}/git/refs/{ref}'),
+    false,
+  );
+  github.assertDone();
+});
+
+test('profile validation workflow is dispatch-only to avoid duplicate validation runs', () => {
+  const workflow = readFileSync(
+    new URL('../../.github/workflows/validate-profile-bot.yml', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(workflow, /^on:\r?\n {2}workflow_dispatch:\r?$/m);
+  assert.doesNotMatch(workflow, /^ {2}push:\r?$/m);
+});
+
 test('publication timeout aborts polling, cleans up separately, and never continues to main', async () => {
   const calls: Array<{ route: string; signal?: AbortSignal }> = [];
   let operationSignal: AbortSignal | undefined;
@@ -813,8 +891,25 @@ test('publication timeout aborts polling, cleans up separately, and never contin
         };
       case 'POST /repos/{owner}/{repo}/git/refs':
         return { data: {} };
-      case 'GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs':
-        return { data: { workflow_runs: [] } };
+      case 'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches':
+        return {
+          data: {
+            workflow_run_id: 10,
+            run_url: 'https://api.github.test/actions/runs/10',
+            html_url: 'https://github.test/actions/runs/10',
+          },
+        };
+      case 'GET /repos/{owner}/{repo}/actions/runs/{run_id}':
+        return {
+          data: runData({
+            id: 10,
+            sha: C,
+            branch: 'bot/profile/example-member/operation-001/a1',
+            event: 'workflow_dispatch',
+            status: 'queued',
+            conclusion: null,
+          }),
+        };
       default:
         throw new Error(`Unexpected GitHub request: ${route}`);
     }
@@ -881,7 +976,7 @@ test('timeout after main update records a completed deploy failure with the publ
       },
     },
     { route: 'POST /repos/{owner}/{repo}/git/refs', data: {} },
-    ...validationSteps(branch, C),
+    ...validationSteps(branch, C, 'success', false),
     { route: 'GET /repos/{owner}/{repo}/git/ref/{ref}', data: refData(A) },
     { route: 'PATCH /repos/{owner}/{repo}/git/refs/{ref}', data: refData(C) },
     { route: 'DELETE /repos/{owner}/{repo}/git/refs/{ref}', data: {} },

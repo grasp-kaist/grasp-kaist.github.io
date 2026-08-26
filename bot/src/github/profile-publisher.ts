@@ -116,6 +116,7 @@ export type PublisherErrorCode =
   | 'content_conflict'
   | 'unexpected_diff'
   | 'validation_workflow_not_found'
+  | 'validation_unavailable'
   | 'validation_failed'
   | 'validation_timeout'
   | 'main_conflict'
@@ -312,14 +313,9 @@ export class GitHubProfilePublisher {
         const changedItems = candidate.items.filter((item) => item.changed);
         temporaryRef = temporaryBranchName(changedItems.map((item) => item.input), candidate.expectedDiff, attempt);
         await this.createTemporaryRef(temporaryRef, candidate.headSha, signal);
-        await this.awaitWorkflow({
-          workflow: this.options.validateWorkflow,
+        await this.dispatchAndAwaitValidation({
           branch: temporaryRef,
           headSha: candidate.headSha,
-          discoveryErrorCode: 'validation_workflow_not_found',
-          failureErrorCode: 'validation_failed',
-          timeoutErrorCode: 'validation_timeout',
-          completionTimeoutMs: this.options.validationTimeoutMs,
         }, signal);
 
         await this.saveValidatedBatch(changedItems, candidate.baseSha, candidate.headSha, attempt);
@@ -765,7 +761,7 @@ export class GitHubProfilePublisher {
     signal: AbortSignal,
   ): Promise<DeploymentObservation> {
     try {
-      const deployRun = await this.awaitWorkflow({
+      const deployRun = await this.awaitPushWorkflow({
         workflow: this.options.deployWorkflow,
         branch: this.options.defaultBranch,
         headSha: commitSha,
@@ -792,7 +788,52 @@ export class GitHubProfilePublisher {
     }
   }
 
-  private async awaitWorkflow(input: {
+  private async dispatchAndAwaitValidation(input: {
+    branch: string;
+    headSha: string;
+  }, signal: AbortSignal): Promise<WorkflowRun> {
+    try {
+      const response = await this.request(
+        'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+        {
+          workflow_id: this.options.validateWorkflow,
+          ref: input.branch,
+        },
+        signal,
+      );
+      const dispatch = parseWorkflowDispatch(response.data);
+
+      return await this.awaitWorkflowRun({
+        runId: dispatch.workflowRunId,
+        workflow: this.options.validateWorkflow,
+        branch: input.branch,
+        headSha: input.headSha,
+        event: 'workflow_dispatch',
+        failureErrorCode: 'validation_failed',
+        timeoutErrorCode: 'validation_timeout',
+        completionTimeoutMs: this.options.validationTimeoutMs,
+      }, signal);
+    } catch (error) {
+      if (
+        error instanceof ProfilePublisherError
+        && (error.code === 'validation_failed' || error.code === 'validation_timeout')
+      ) {
+        throw error;
+      }
+
+      if (signal.aborted) {
+        throw error;
+      }
+
+      throw new ProfilePublisherError(
+        'validation_unavailable',
+        'GitHub could not start or track repository validation. No change was published.',
+        { cause: error },
+      );
+    }
+  }
+
+  private async awaitPushWorkflow(input: {
     workflow: string;
     branch: string;
     headSha: string;
@@ -845,17 +886,44 @@ export class GitHubProfilePublisher {
       );
     }
 
+    return this.awaitWorkflowRun({
+      runId: found.id,
+      workflow: input.workflow,
+      branch: input.branch,
+      headSha: input.headSha,
+      event: 'push',
+      failureErrorCode: input.failureErrorCode,
+      timeoutErrorCode: input.timeoutErrorCode,
+      completionTimeoutMs: input.completionTimeoutMs,
+    }, signal);
+  }
+
+  private async awaitWorkflowRun(input: {
+    runId: number;
+    workflow: string;
+    branch: string;
+    headSha: string;
+    event: 'push' | 'workflow_dispatch';
+    failureErrorCode: 'validation_failed' | 'deploy_failed';
+    timeoutErrorCode: 'validation_timeout' | 'deploy_timeout';
+    completionTimeoutMs: number;
+  }, signal: AbortSignal): Promise<WorkflowRun> {
     const completionDeadline = this.options.now() + input.completionTimeoutMs;
 
     while (this.options.now() <= completionDeadline) {
       const runData = await this.requestData(
         'GET /repos/{owner}/{repo}/actions/runs/{run_id}',
-        { run_id: found.id },
+        { run_id: input.runId },
         signal,
       );
       const run = parseWorkflowRun(runData);
 
-      if (run.head_sha !== input.headSha || run.head_branch !== input.branch || run.event !== 'push') {
+      if (
+        run.id !== input.runId
+        || run.head_sha !== input.headSha
+        || run.head_branch !== input.branch
+        || run.event !== input.event
+      ) {
         throw invalidGitHubResponse('Workflow run identity changed while polling.');
       }
 
@@ -1402,6 +1470,21 @@ function parseWorkflowRun(value: unknown): WorkflowRun {
     conclusion: conclusionValue,
     ...(htmlUrl ? { html_url: htmlUrl } : {}),
   };
+}
+
+function parseWorkflowDispatch(value: unknown) {
+  if (!isRecord(value)) {
+    throw invalidGitHubResponse('Workflow dispatch response is invalid.');
+  }
+
+  const workflowRunId = optionalNumberField(value, 'workflow_run_id');
+  if (!Number.isSafeInteger(workflowRunId) || workflowRunId === undefined || workflowRunId <= 0) {
+    throw invalidGitHubResponse('Workflow dispatch response is missing workflow_run_id.');
+  }
+
+  requireStringField(value, 'run_url', 'workflow dispatch API URL');
+  requireStringField(value, 'html_url', 'workflow dispatch HTML URL');
+  return { workflowRunId };
 }
 
 function positiveInteger(value: number | undefined, fallback: number, name: string) {

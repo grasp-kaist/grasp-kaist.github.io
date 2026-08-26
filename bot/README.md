@@ -21,9 +21,9 @@ GRASP 구성원이 Discord의 `/register`와 `/profile`만으로 자신의 웹�
 PROFILE_PUBLISH_MODE=production
 ```
 
-production 모드는 Discord에서 요청한 프로필 변경을 실제 GitHub 저장소에 반영한다. 요청을 먼저 SQLite 영구 큐에 저장한 뒤 기존 blob SHA 확인, 격리된 `bot/profile-batch/...` 브랜치, 저장소 검증 workflow, `main` 비강제 fast-forward, GitHub Pages 배포 확인 순서로 제한된 프로필 파일만 반영한다. 2초 안에 모인 서로 다른 프로필 최대 20개(파일 최대 40개)는 한 번의 검증·커밋·Pages 배포로 합친다. 서버 ID를 코드나 환경변수에 고정하지 않는다.
+production 모드는 Discord에서 요청한 프로필 변경을 실제 GitHub 저장소에 반영한다. 요청을 먼저 SQLite 영구 큐에 저장한 뒤 기존 blob SHA 확인, 격리된 `bot/profile-batch/...` 브랜치, `workflow_dispatch`로 시작한 저장소 검증, `main` 비강제 fast-forward, GitHub Pages 배포 확인 순서로 제한된 프로필 파일만 반영한다. 봇은 dispatch 응답의 정확한 workflow run ID만 추적한다. 2초 안에 모인 서로 다른 프로필 최대 20개(파일 최대 40개)는 한 번의 검증·커밋·Pages 배포로 합친다. 서버 ID를 코드나 환경변수에 고정하지 않는다.
 
-요청은 최대 6초 동안 완료를 기다린다. 그 안에 끝나지 않으면 실패로 표시하지 않고 “안전하게 대기열에 들어갔다”고 안내한다. 게시 결과가 불명확하게 끊긴 경우에는 로컬 상태를 되돌리지 않고 같은 operation ID로 복구·재시도한다. 확실히 게시 전 실패한 검증 오류만 사용자에게 실패로 확정한다.
+요청은 최대 6초 동안 완료를 기다린다. 그 안에 끝나지 않으면 대기열에 들어갔다고 안내한다. GitHub 검증을 시작하지 못하거나 제한 시간 안에 끝내지 못하면 사이트는 변경하지 않고, 사용자에게 GitHub 일시 장애 가능성과 재시도를 안내한다. 검증이 완료된 뒤 `main` 반영 결과가 불명확하게 끊긴 경우에는 로컬 상태를 되돌리지 않고 같은 operation ID로 복구·재시도한다.
 
 `listed`는 Members 페이지 표시 설정이지 비공개 저장 기능은 아니다. production에서 게시한 JSON, 사진, 커밋 기록은 공개 저장소에 남는다.
 
@@ -80,7 +80,7 @@ DISCORD_APPLICATION_ID=<Application ID>
 DISCORD_BOT_TOKEN=<Bot Token>
 ```
 
-production으로 바꿀 때에만 GitHub App 변수와 `MEMBERS_PAGE_URL`을 사용한다. GitHub App 권한은 대상 저장소 하나에 대한 Contents read/write, Actions read-only, Pages read-only, Metadata만 필요하다.
+production으로 바꿀 때에만 GitHub App 변수와 `MEMBERS_PAGE_URL`을 사용한다. GitHub App 권한은 대상 저장소 하나에 대한 Contents read/write, Actions read/write, Pages read-only, Metadata만 필요하다. Actions 권한을 변경한 뒤에는 해당 저장소에 설치된 GitHub App의 새 권한 요청을 한 번 승인해야 한다.
 
 ## HTTP endpoint
 

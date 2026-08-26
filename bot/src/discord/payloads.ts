@@ -405,8 +405,8 @@ export function operationCompleteEdit(
         {
           type: 10,
           content:
-            'The profile update was accepted and is safely queued. '
-            + 'Run `/profile` again shortly to see the published result.',
+            'The profile update was accepted and queued. Run `/profile` again in a few minutes to see the published result. '
+            + 'If it is still unchanged, GitHub may be temporarily unavailable; please submit the update again later.',
         },
       ],
       [],

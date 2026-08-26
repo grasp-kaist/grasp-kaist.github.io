@@ -270,7 +270,7 @@ test('prepared photo preview attaches WebP and binds confirm/cancel to its token
   );
 });
 
-test('queued publications tell the user to reopen the profile instead of claiming completion', () => {
+test('queued publications explain normal delay and temporary GitHub failure without claiming completion', () => {
   const payload = operationCompleteEdit(
     'Your profile was updated.',
     { queued: true, operationId: 'operation-1', deploymentStatus: 'queued' },
@@ -279,8 +279,10 @@ test('queued publications tell the user to reopen the profile instead of claimin
     (payload.components as Array<Record<string, unknown>>)[0]?.content,
   );
 
-  assert.match(content, /safely queued/i);
   assert.match(content, /\/profile/);
+  assert.match(content, /in a few minutes/i);
+  assert.match(content, /GitHub may be temporarily unavailable/i);
+  assert.match(content, /submit the update again later/i);
   assert.doesNotMatch(content, /Your profile was updated/);
 });
 

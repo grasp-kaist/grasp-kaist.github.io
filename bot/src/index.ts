@@ -528,7 +528,8 @@ function formatUserError(error: unknown) {
       return 'Repository validation rejected the profile update. No change was published.';
     case 'validation_timeout':
     case 'validation_workflow_not_found':
-      return 'Repository validation did not finish. No change was published.';
+    case 'validation_unavailable':
+      return 'GitHub validation may be temporarily unavailable or delayed. No change was published. Please try again in a few minutes.';
     case 'main_conflict':
       return 'The website changed repeatedly during publication. Please try again.';
     case 'main_update_rejected':

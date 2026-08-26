@@ -38,6 +38,7 @@ const DEFINITELY_UNPUBLISHED_ERROR_CODES = new Set([
   'main_conflict',
   'unexpected_diff',
   'validation_workflow_not_found',
+  'validation_unavailable',
   'validation_failed',
   'validation_timeout',
   'main_update_rejected',

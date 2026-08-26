@@ -335,7 +335,7 @@ test('Save changes is the only profile-edit action that invokes publication', as
     expectedDraftRevision: DRAFT_REVISION,
   });
   const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
-  assert.match(String(components[0]?.content), /safely queued/i);
+  assert.match(String(components[0]?.content), /GitHub may be temporarily unavailable/i);
 });
 
 test('a profile publication already in progress is shown as waiting, not failed', async () => {
