@@ -208,7 +208,7 @@ test('Gateway ACK maps immediate messages and Discord mention fields', async () 
   });
 });
 
-test('Gateway ACK maps response types 5, 6, 8, and 9', async () => {
+test('Gateway ACK maps response types 5, 6, 7, 8, and 9', async () => {
   const calls: Array<[string, unknown?]> = [];
 
   await acknowledgeGatewayInteraction(
@@ -223,6 +223,23 @@ test('Gateway ACK maps response types 5, 6, 8, and 9', async () => {
       deferUpdate: async () => calls.push(['deferUpdate']),
     } as unknown as Interaction,
     { type: 6 },
+  );
+  const updatedComponents = [{ type: 17, components: [] }];
+  await acknowledgeGatewayInteraction(
+    {
+      update: async (options: unknown) => calls.push(['update', options]),
+    } as unknown as Interaction,
+    {
+      type: 7,
+      data: {
+        content: null,
+        embeds: [],
+        attachments: [],
+        components: updatedComponents,
+        flags: 32_768,
+        allowed_mentions: { parse: [] },
+      },
+    },
   );
   await acknowledgeGatewayInteraction(
     {
@@ -249,6 +266,17 @@ test('Gateway ACK maps response types 5, 6, 8, and 9', async () => {
   assert.deepEqual(calls, [
     ['deferReply', { flags: 64 }],
     ['deferUpdate'],
+    [
+      'update',
+      {
+        content: null,
+        embeds: [],
+        attachments: [],
+        components: updatedComponents,
+        flags: 32_768,
+        allowedMentions: { parse: [] },
+      },
+    ],
     ['respond', [{ name: 'Member', value: 'member' }]],
     ['showModal', modal],
   ]);

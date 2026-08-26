@@ -18,6 +18,7 @@ const APPLICATION_ID = '111111111111111111';
 const GUILD_ID = '222222222222222222';
 const USER_ID = '333333333333333333';
 const STATE_REVISION = '0123456789abcdefabcd';
+const DRAFT_REVISION = 'fedcba9876543210fedc';
 
 test('register uses only a local probe before opening a current Label modal', async () => {
   let localProbes = 0;
@@ -227,47 +228,55 @@ test('register rejects a sandbox modal submitted after switching to production',
   assert.match(String(components[0]?.content), /publication mode changed/i);
 });
 
-test('profile edit modal defers an update and replaces the stale panel with its result', async () => {
-  let updateInput: unknown;
-  const updated = snapshot();
-  updated.profile.name = 'Updated Member';
+test('profile edit modal defers before updating only a draft and renders the review panel', async () => {
+  let draftInput: unknown;
+  let publishCalls = 0;
+  const drafted = snapshotWithDraft({ name: 'Updated Member', position: 'Graduate Student' });
   const harness = createHarness({
-    updateOwnProfile: async (actor, patch, expectedRevision) => {
-      updateInput = { actor, patch, expectedRevision };
-      return { snapshot: updated, commitSha: 'updated-commit' };
+    stageOwnProfileDraft: (actor, patch, expectedRevision) => {
+      draftInput = { actor, patch, expectedRevision };
+      return drafted;
+    },
+    updateOwnProfile: async () => {
+      publishCalls += 1;
+      return {};
     },
   });
   const interaction = modalInteraction(`profile-basic:v1:${STATE_REVISION}`, [
     labelText('name', 'Updated Member'),
-    labelText('position', 'Graduate Student, KAIST'),
-    profileEditConfirmation(),
+    labelText('position', 'Graduate Student'),
   ]);
 
   const routed = await harness.router.route(interaction);
   assert.equal(routed.response.type, 6);
-  assert.equal(updateInput, undefined);
-
+  assert.equal(draftInput, undefined);
+  assert.equal(publishCalls, 0);
   await routed.afterResponse?.();
-  assert.deepEqual(updateInput, {
+  assert.deepEqual(draftInput, {
     actor: { interactionId: interaction.id, guildId: GUILD_ID, userId: USER_ID },
-    patch: { name: 'Updated Member', position: 'Graduate Student, KAIST' },
+    patch: { name: 'Updated Member', position: 'Graduate Student' },
     expectedRevision: STATE_REVISION,
   });
   const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
   assert.equal(components[0]?.type, 10);
-  assert.match(String(components[0]?.content), /updated/i);
+  assert.match(String(components[0]?.content), /Nothing has been published yet/i);
   const panel = components.find((component) => component.type === 17)!;
   const summary = (panel.components as Array<Record<string, unknown>>).find(
-    (component) => component.type === 10,
+    (component) => component.type === 10 && /Updated Member/.test(String(component.content)),
   );
   assert.match(String(summary?.content), /Updated Member/);
 });
 
-test('text and category forms pass their rendered state revision to the service', async () => {
+test('text and category forms merge into drafts without publishing', async () => {
   const calls: unknown[] = [];
+  let publishCalls = 0;
   const harness = createHarness({
-    updateOwnProfile: async (_actor, patch, expectedRevision) => {
+    stageOwnProfileDraft: (_actor, patch, expectedRevision) => {
       calls.push({ patch, expectedRevision });
+      return snapshotWithDraft(patch);
+    },
+    updateOwnProfile: async () => {
+      publishCalls += 1;
       return {};
     },
   });
@@ -277,7 +286,6 @@ test('text and category forms pass their rendered state revision to the service'
       labelText('research_interests', 'Verification'),
       labelText('contact', ''),
       labelText('website', 'example.org'),
-      profileEditConfirmation(),
     ]),
   );
   const category = await harness.router.route(
@@ -286,12 +294,15 @@ test('text and category forms pass their rendered state revision to the service'
         type: 18,
         component: { type: 3, custom_id: 'category', values: ['2'] },
       },
-      profileEditConfirmation(),
     ]),
   );
 
+  assert.equal(text.response.type, 6);
+  assert.equal(category.response.type, 6);
+  assert.deepEqual(calls, []);
   await text.afterResponse?.();
   await category.afterResponse?.();
+  assert.equal(publishCalls, 0);
   assert.deepEqual(calls, [
     {
       patch: {
@@ -306,42 +317,25 @@ test('text and category forms pass their rendered state revision to the service'
   ]);
 });
 
-test('profile edit modals reject submission without explicit publish confirmation', async () => {
-  let updateCalls = 0;
+test('Save changes is the only profile-edit action that invokes publication', async () => {
+  let saved: unknown;
   const harness = createHarness({
-    updateOwnProfile: async () => {
-      updateCalls += 1;
-      return {};
+    saveOwnProfileDraft: async (actor, expectedDraftRevision) => {
+      saved = { actor, expectedDraftRevision };
+      return { queued: true, operationId: 'draft-operation', deploymentStatus: 'queued' };
     },
   });
-  const submissions = [
-    modalInteraction(`profile-basic:v1:${STATE_REVISION}`, [
-      labelText('name', 'Updated Member'),
-      labelText('position', 'Graduate Student, KAIST'),
-    ]),
-    modalInteraction(`profile-text:v1:${STATE_REVISION}`, [
-      labelText('details', 'Details'),
-      labelText('research_interests', 'Verification'),
-      labelText('contact', ''),
-      labelText('website', 'example.org'),
-    ]),
-    modalInteraction(`profile-category:v1:${STATE_REVISION}`, [
-      {
-        type: 18,
-        component: { type: 3, custom_id: 'category', values: ['2'] },
-      },
-    ]),
-  ];
-
-  for (const submission of submissions) {
-    const routed = await harness.router.route(submission);
-    assert.equal(routed.response.type, 4);
-    assert.equal(routed.afterResponse, undefined);
-    const components = routed.response.data?.components as Array<Record<string, unknown>>;
-    assert.match(String(components[0]?.content), /saves and publishes.*immediately/i);
-  }
-
-  assert.equal(updateCalls, 0);
+  const interaction = componentInteraction(`profile:save-draft:${DRAFT_REVISION}`);
+  const routed = await harness.router.route(interaction);
+  assert.equal(routed.response.type, 6);
+  assert.equal(saved, undefined);
+  await routed.afterResponse?.();
+  assert.deepEqual(saved, {
+    actor: { interactionId: interaction.id, guildId: GUILD_ID, userId: USER_ID },
+    expectedDraftRevision: DRAFT_REVISION,
+  });
+  const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
+  assert.match(String(components[0]?.content), /safely queued/i);
 });
 
 test('a profile publication already in progress is shown as waiting, not failed', async () => {
@@ -349,15 +343,11 @@ test('a profile publication already in progress is shown as waiting, not failed'
     code: 'publication_pending',
   });
   const harness = createHarness({
-    updateOwnProfile: async () => {
+    saveOwnProfileDraft: async () => {
       throw pendingError;
     },
   });
-  const interaction = modalInteraction(`profile-basic:v1:${STATE_REVISION}`, [
-    labelText('name', 'Updated Member'),
-    labelText('position', 'Graduate Student, KAIST'),
-    profileEditConfirmation(),
-  ]);
+  const interaction = componentInteraction(`profile:save-draft:${DRAFT_REVISION}`);
 
   const routed = await harness.router.route(interaction);
   await routed.afterResponse?.();
@@ -368,6 +358,48 @@ test('a profile publication already in progress is shown as waiting, not failed'
     'Your profile registration or previous update is being published and may take a few minutes. Run `/profile` again shortly.',
   );
   assert.deepEqual(harness.errors, []);
+});
+
+test('Discard draft clears only the selected revision without publishing', async () => {
+  let discarded: unknown;
+  const harness = createHarness({
+    discardOwnProfileDraft: (actor, expectedDraftRevision) => {
+      discarded = { actor, expectedDraftRevision };
+      return snapshot();
+    },
+  });
+  const interaction = componentInteraction(`profile:discard-draft:${DRAFT_REVISION}`);
+
+  const routed = await harness.router.route(interaction);
+
+  assert.equal(routed.response.type, 6);
+  assert.equal(discarded, undefined);
+  await routed.afterResponse?.();
+  assert.deepEqual(discarded, {
+    actor: { interactionId: interaction.id, guildId: GUILD_ID, userId: USER_ID },
+    expectedDraftRevision: DRAFT_REVISION,
+  });
+  const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
+  assert.match(String(components[0]?.content), /Draft discarded/i);
+});
+
+test('an unchanged profile form says there is no draft to save', async () => {
+  const harness = createHarness({
+    stageOwnProfileDraft: () => snapshot(),
+  });
+  const routed = await harness.router.route(
+    modalInteraction(`profile-basic:v1:${STATE_REVISION}`, [
+      labelText('name', 'Taein Oh'),
+      labelText('position', 'Undergraduate Student, KAIST'),
+    ]),
+  );
+
+  assert.equal(routed.response.type, 6);
+  await routed.afterResponse?.();
+
+  const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
+  assert.match(String(components[0]?.content), /No draft changes to save/i);
+  assert.equal(JSON.stringify(components).includes('profile:save-draft:'), false);
 });
 
 test('photo modal resolves and downloads the selected attachment only after deferring', async () => {
@@ -563,6 +595,9 @@ function defaultService(): ProfileService {
     getOwnProfile: async () => snapshot(),
     register: async () => ({}),
     updateOwnProfile: async () => ({}),
+    stageOwnProfileDraft: () => snapshotWithDraft({}),
+    discardOwnProfileDraft: () => snapshot(),
+    saveOwnProfileDraft: async () => ({}),
     prepareOwnPhoto: async () => ({
       stagedPhotoId: 'stage_default',
       previewBytes: new Uint8Array([1]),
@@ -587,6 +622,20 @@ function snapshot(): ProfileSnapshot {
       order: 4,
     }),
   };
+}
+
+function snapshotWithDraft(
+  patch: Partial<ProfileSnapshot['profile']>,
+): ProfileSnapshot {
+  const current = snapshot();
+  current.draft = {
+    profile: { ...current.profile, ...patch },
+    revision: DRAFT_REVISION,
+    baseStateRevision: STATE_REVISION,
+    isPublishing: false,
+    stale: false,
+  };
+  return current;
 }
 
 function commandInteraction(
@@ -633,17 +682,6 @@ function labelText(customId: string, value: string) {
   return {
     type: 18 as const,
     component: { type: 4 as const, custom_id: customId, value },
-  };
-}
-
-function profileEditConfirmation() {
-  return {
-    type: 18 as const,
-    component: {
-      type: 22 as const,
-      custom_id: 'profile_edit_confirmation',
-      values: ['save_and_publish'],
-    },
   };
 }
 

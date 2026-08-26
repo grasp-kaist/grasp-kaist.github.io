@@ -7,6 +7,7 @@ import {
   type CommandInteractionOption,
   type Interaction,
   type InteractionReplyOptions,
+  type InteractionUpdateOptions,
   type MessageMentionOptions,
   type ModalData,
   type ModalSubmitInteraction,
@@ -150,6 +151,14 @@ export async function acknowledgeGatewayInteraction(
       }
 
       await interaction.deferUpdate();
+      return;
+    }
+    case 7: {
+      if (!('update' in interaction) || typeof interaction.update !== 'function') {
+        throw new DiscordGatewayAckError('This interaction cannot update its message.');
+      }
+
+      await interaction.update(toInteractionUpdateOptions(response.data));
       return;
     }
     case 8: {
@@ -348,6 +357,44 @@ function toInteractionReplyOptions(
     throw new DiscordGatewayAckError(
       'Initial Gateway responses with attachment metadata require file data.',
     );
+  }
+
+  return options;
+}
+
+function toInteractionUpdateOptions(
+  data: Record<string, unknown> | undefined,
+): InteractionUpdateOptions {
+  const options: InteractionUpdateOptions = {};
+
+  if (!data) {
+    return options;
+  }
+
+  if (typeof data.content === 'string' || data.content === null) {
+    options.content = data.content;
+  }
+
+  if (Array.isArray(data.embeds)) {
+    options.embeds = data.embeds as NonNullable<InteractionUpdateOptions['embeds']>;
+  }
+
+  if (Array.isArray(data.components)) {
+    options.components = data.components as APIMessageTopLevelComponent[];
+  }
+
+  if (Array.isArray(data.attachments)) {
+    options.attachments = data.attachments as NonNullable<InteractionUpdateOptions['attachments']>;
+  }
+
+  if (typeof data.flags === 'number') {
+    options.flags = data.flags as InteractionUpdateOptions['flags'];
+  }
+
+  const allowedMentions = toAllowedMentions(data.allowed_mentions);
+
+  if (allowedMentions) {
+    options.allowedMentions = allowedMentions;
   }
 
   return options;

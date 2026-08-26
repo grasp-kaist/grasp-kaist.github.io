@@ -6,6 +6,7 @@ GRASP 구성원이 Discord의 `/register`와 `/profile`만으로 자신의 웹�
 
 - `/register`: Discord 계정에 새 프로필 하나를 연결한다. 관리자 승인은 없고, 처음에는 `listed: false`라 Members 페이지에 표시되지 않는다.
 - `/profile`: 이름, 소속/직위, 설명, 연구 관심사, 연락처, 웹사이트, 구성원 분류, 사진, 공개 여부를 수정한다.
+- `/profile`의 텍스트·분류 편집은 먼저 SQLite 초안에만 모인다. 실제 사이트 반영은 프로필 패널의 `Save changes`를 눌렀을 때 한 번만 시작하며, `Discard draft`로 게시 전 변경을 버릴 수 있다.
 - 사진: JPEG, PNG, WebP를 받아 EXIF 방향을 적용한 뒤 중앙 기준 4:5로 자른다. 확대하지 않고 최대 800×1000으로 줄여 WebP로 변환하며, 사용자는 미리보기를 확인한 다음 게시한다.
 
 저장소 경로, 임의 JSON, 임의 커밋, 범용 GitHub 작업은 Discord 입력으로 받지 않는다.

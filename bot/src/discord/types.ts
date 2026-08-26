@@ -12,6 +12,13 @@ export type ProfileSnapshot = {
   profileSlug: string;
   stateRevision: string;
   profile: MemberProfile;
+  draft?: {
+    profile: MemberProfile;
+    revision: string;
+    baseStateRevision: string;
+    isPublishing: boolean;
+    stale: boolean;
+  };
   bindingStatus: ProfileBindingStatus;
   lastCommitSha?: string;
   lastDeploymentStatus?: string;
@@ -62,6 +69,19 @@ export type ProfileService = {
     actor: DiscordActor,
     patch: EditableProfilePatch,
     expectedRevision: string,
+  ): Promise<ProfileOperationResult>;
+  stageOwnProfileDraft(
+    actor: DiscordActor,
+    patch: EditableProfilePatch,
+    expectedRevision: string,
+  ): ProfileSnapshot;
+  discardOwnProfileDraft(
+    actor: DiscordActor,
+    expectedDraftRevision: string,
+  ): ProfileSnapshot;
+  saveOwnProfileDraft(
+    actor: DiscordActor,
+    expectedDraftRevision: string,
   ): Promise<ProfileOperationResult>;
   prepareOwnPhoto(
     actor: DiscordActor,

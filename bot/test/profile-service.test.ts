@@ -124,6 +124,34 @@ function profileSnapshot(
   };
 }
 
+function enqueueRecordedPublisherCall(
+  store: SqliteStore,
+  publisher: RecordingPublisher,
+  callIndex: number,
+) {
+  const call = publisher.calls[callIndex];
+  const context = publisher.contexts[callIndex];
+  assert.ok(call);
+  assert.ok(context);
+
+  return store.enqueuePublicationJob({
+    operationId: call.operationId,
+    context: {
+      guildId: context.guildId,
+      actorUserId: context.actorUserId,
+      targetUserId: context.targetUserId,
+      interactionId: context.interactionId,
+      receiptKind: context.receiptKind,
+      ...(context.stagedPhotoId ? { stagedPhotoId: context.stagedPhotoId } : {}),
+    },
+    profileSlug: call.slug,
+    action: call.action,
+    profileJson: call.profile.json,
+    profileExpectedSha: call.profile.expectedSha,
+    ...(call.photo ? { photo: call.photo } : {}),
+  });
+}
+
 test('local profile probes do not add repository reads after registration preflight', async () => {
   let repositoryReads = 0;
   const { store, service } = createFixture({
@@ -387,6 +415,200 @@ test('profile edits carry the stored blob revision and listed is independently m
     assert.deepEqual(updated.snapshot?.profile.details, ['B.S. student']);
     assert.equal(updated.snapshot?.profile.website, 'example.com');
     assert.equal(listed.snapshot?.profile.listed, true);
+  } finally {
+    store.close();
+  }
+});
+
+test('profile draft fields merge with revision CAS and can be discarded without publishing', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    const first = service.stageOwnProfileDraft(
+      actor('draft-details'),
+      { details: ['  First detail  '] },
+      currentRevision(service),
+    );
+    assert.deepEqual(first.draft?.profile.details, ['First detail']);
+    assert.match(first.draft?.revision ?? '', /^[0-9a-f]{20}$/);
+    assert.equal(publisher.calls.length, 1);
+
+    const second = service.stageOwnProfileDraft(
+      actor('draft-contact'),
+      { contact: [' member@kaist '] },
+      first.draft!.revision,
+    );
+    assert.deepEqual(second.draft?.profile.details, ['First detail']);
+    assert.deepEqual(second.draft?.profile.contact, ['member@kaist']);
+
+    assert.throws(
+      () => service.stageOwnProfileDraft(
+        actor('stale-draft-edit'),
+        { website: 'stale.example' },
+        first.draft!.revision,
+      ),
+      (error: unknown) =>
+        error instanceof ProfileServiceError && error.code === 'draft_changed',
+    );
+
+    const discarded = service.discardOwnProfileDraft(
+      actor('discard-draft'),
+      second.draft!.revision,
+    );
+    assert.equal(discarded.draft, undefined);
+    assert.deepEqual(discarded.profile.details, []);
+    assert.equal(publisher.calls.length, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test('saving a profile draft publishes the full editable draft exactly once', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    const draft = service.stageOwnProfileDraft(
+      actor('stage-full-draft'),
+      {
+        name: 'Drafted Member',
+        details: ['Draft detail'],
+        researchInterests: ['Reliable systems'],
+        contact: ['member@kaist'],
+        website: 'draft.example',
+      },
+      currentRevision(service),
+    );
+
+    const saved = await service.saveOwnProfileDraft(
+      actor('save-full-draft'),
+      draft.draft!.revision,
+    );
+
+    assert.equal(publisher.calls.length, 2);
+    assert.equal(publisher.calls[1]?.action, 'PROFILE_UPDATE');
+    assert.deepEqual(JSON.parse(publisher.calls[1]!.profile.json), draft.draft?.profile);
+    assert.equal(saved.snapshot?.profile.name, 'Drafted Member');
+    assert.equal(saved.snapshot?.profile.website, 'draft.example');
+    assert.equal(saved.snapshot?.draft, undefined);
+    assert.equal(store.getProfileDraft(guildId, 'member'), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test('queued draft publication survives failure and clears after an applied success', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    const draft = service.stageOwnProfileDraft(
+      actor('stage-queued-draft'),
+      { website: 'queued-draft.example' },
+      currentRevision(service),
+    );
+    publisher.queueNext = true;
+    const firstQueued = await service.saveOwnProfileDraft(
+      actor('save-queued-draft-1'),
+      draft.draft!.revision,
+    );
+    const firstJob = enqueueRecordedPublisherCall(store, publisher, 1);
+
+    assert.equal(firstQueued.queued, true);
+    assert.equal(
+      service.getOwnProfileLocal(guildId, 'member').snapshot?.draft?.isPublishing,
+      true,
+    );
+
+    const firstLease = store.claimPublicationJobs({
+      workerId: 'worker-1',
+      leaseToken: 'lease-1',
+      leaseExpiresAt: new Date('2026-08-21T00:05:00.000Z'),
+    })[0]!;
+    store.applyPublicationBatchFailure({
+      workerId: 'worker-1',
+      leaseToken: 'lease-1',
+      jobs: [{
+        operationId: firstLease.operationId,
+        leaseGeneration: firstLease.leaseGeneration,
+      }],
+      errorJson: JSON.stringify({ code: 'validation_failed' }),
+    });
+    assert.equal(firstJob.operationId, firstLease.operationId);
+    assert.equal(store.getProfileDraft(guildId, 'member')?.draftRevision, draft.draft!.revision);
+
+    publisher.queueNext = true;
+    const secondQueued = await service.saveOwnProfileDraft(
+      actor('save-queued-draft-2'),
+      draft.draft!.revision,
+    );
+    const secondJob = enqueueRecordedPublisherCall(store, publisher, 2);
+    const secondLease = store.claimPublicationJobs({
+      workerId: 'worker-2',
+      leaseToken: 'lease-2',
+      leaseExpiresAt: new Date('2026-08-21T00:05:00.000Z'),
+    })[0]!;
+    const resultJson = JSON.stringify({
+      status: 'deployed',
+      commitSha: 'draft-commit',
+      profileBlobSha: 'draft-profile-sha',
+      attempts: 1,
+    });
+    store.recordPublicationBatchSuccess({
+      workerId: 'worker-2',
+      leaseToken: 'lease-2',
+      results: [{
+        operationId: secondLease.operationId,
+        leaseGeneration: secondLease.leaseGeneration,
+        resultJson,
+      }],
+    });
+    store.applyRecordedPublicationBatchSuccess({
+      results: [{
+        operationId: secondJob.operationId,
+        resultJson,
+        state: {
+          profileSlug: secondJob.profileSlug,
+          profileJson: secondJob.profileJson,
+          profileBlobSha: 'draft-profile-sha',
+          lastCommitSha: 'draft-commit',
+          lastDeploymentStatus: 'deployed',
+        },
+      }],
+    });
+
+    assert.equal(secondQueued.queued, true);
+    const applied = service.getOwnProfileLocal(guildId, 'member').snapshot;
+    assert.equal(applied?.profile.website, 'queued-draft.example');
+    assert.equal(applied?.draft, undefined);
+    assert.equal(store.getProfileDraft(guildId, 'member'), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test('listing and photo mutations are blocked while a profile draft exists', async () => {
+  const { store, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    service.stageOwnProfileDraft(
+      actor('stage-blocking-draft'),
+      { website: 'draft.example' },
+      currentRevision(service),
+    );
+
+    await assert.rejects(
+      service.setOwnListed(actor('listed-with-draft'), true, currentRevision(service)),
+      (error: unknown) =>
+        error instanceof ProfileServiceError && error.code === 'profile_draft_exists',
+    );
+    await assert.rejects(
+      service.removeOwnPhoto(actor('photo-with-draft'), currentRevision(service)),
+      (error: unknown) =>
+        error instanceof ProfileServiceError && error.code === 'profile_draft_exists',
+    );
   } finally {
     store.close();
   }

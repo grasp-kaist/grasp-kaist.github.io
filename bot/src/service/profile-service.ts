@@ -11,6 +11,7 @@ import {
 import { processProfilePhoto } from '../image/process-profile-photo.js';
 import {
   BindingConflictError,
+  ProfileDraftConflictError,
   PublicationJobConflictError,
   SqliteStore,
   type ProfileBinding,
@@ -34,6 +35,13 @@ export type ProfileSnapshot = {
   lastCommitSha?: string;
   lastDeploymentStatus?: string;
   membersPageUrl?: string;
+  draft?: {
+    profile: MemberProfile;
+    revision: string;
+    baseStateRevision: string;
+    isPublishing: boolean;
+    stale: boolean;
+  };
 };
 
 export type ProfileOperationResult = {
@@ -391,6 +399,150 @@ export class ProfileService {
     );
   }
 
+  stageOwnProfileDraft(
+    actor: DiscordActor,
+    patch: EditableProfilePatch,
+    expectedRevision: string,
+  ): ProfileSnapshot {
+    this.#assertActor(actor);
+    const binding = this.#requireBinding(actor.guildId, actor.userId);
+    this.#assertProfileAvailableForDraftEdit(binding);
+
+    if (binding.status !== 'active') {
+      throw new ProfileServiceError(
+        'profile_not_active',
+        'This profile is not active yet. Try again shortly.',
+      );
+    }
+
+    const state = this.#requireState(actor.guildId, binding.profileSlug);
+    const existing = this.#store.getProfileDraft(actor.guildId, actor.userId);
+    let source: MemberProfile;
+    let baseStateRevision: string;
+
+    if (existing) {
+      if (existing.profileSlug !== binding.profileSlug) {
+        throw new ProfileServiceError(
+          'draft_binding_changed',
+          'The saved profile draft no longer matches this account.',
+        );
+      }
+      if (existing.draftRevision !== expectedRevision) {
+        throw profileDraftChangedError();
+      }
+      source = parseProfile(existing.profileJson);
+      baseStateRevision = existing.baseStateRevision;
+    } else {
+      this.#assertExpectedRevision(state, expectedRevision);
+      source = parseProfile(state.profileJson);
+      baseStateRevision = profileStateRevision(state);
+    }
+
+    const profile = normalizeMemberProfile({ ...source, ...patch });
+    const profileJson = serializeProfile(profile);
+
+    if (profileJson === state.profileJson) {
+      if (
+        existing
+        && !this.#store.deleteProfileDraft(
+          actor.guildId,
+          actor.userId,
+          existing.draftRevision,
+        )
+      ) {
+        throw profileDraftChangedError();
+      }
+      return this.#snapshot(binding, state);
+    }
+
+    if (existing?.profileJson === profileJson) {
+      return this.#snapshot(binding, state);
+    }
+
+    const draftRevision = profileDraftRevision(
+      baseStateRevision,
+      profileJson,
+      existing?.draftRevision,
+    );
+
+    try {
+      this.#store.saveProfileDraft(
+        {
+          guildId: actor.guildId,
+          discordUserId: actor.userId,
+          profileSlug: binding.profileSlug,
+          baseStateRevision,
+          draftRevision,
+          profileJson,
+        },
+        existing?.draftRevision ?? null,
+      );
+    } catch (error) {
+      if (error instanceof ProfileDraftConflictError) {
+        throw profileDraftChangedError();
+      }
+      throw error;
+    }
+
+    return this.#snapshot(binding, state);
+  }
+
+  discardOwnProfileDraft(
+    actor: DiscordActor,
+    expectedDraftRevision: string,
+  ): ProfileSnapshot {
+    this.#assertActor(actor);
+    const binding = this.#requireBinding(actor.guildId, actor.userId);
+    this.#assertProfileAvailableForDraftEdit(binding);
+    const state = this.#requireState(actor.guildId, binding.profileSlug);
+    const draft = this.#store.getProfileDraft(actor.guildId, actor.userId);
+
+    if (!draft) {
+      throw new ProfileServiceError('draft_missing', 'There is no saved profile draft to discard.');
+    }
+    if (
+      draft.profileSlug !== binding.profileSlug
+      || draft.draftRevision !== expectedDraftRevision
+      || !this.#store.deleteProfileDraft(
+        actor.guildId,
+        actor.userId,
+        expectedDraftRevision,
+      )
+    ) {
+      throw profileDraftChangedError();
+    }
+
+    return this.#snapshot(binding, state);
+  }
+
+  async saveOwnProfileDraft(
+    actor: DiscordActor,
+    expectedDraftRevision: string,
+  ): Promise<ProfileOperationResult> {
+    this.#assertActor(actor);
+    const binding = this.#requireBinding(actor.guildId, actor.userId);
+    this.#assertProfileAvailableForDraftEdit(binding);
+    const state = this.#requireState(actor.guildId, binding.profileSlug);
+    const draft = this.#store.getProfileDraft(actor.guildId, actor.userId);
+
+    if (!draft) {
+      throw new ProfileServiceError('draft_missing', 'There is no saved profile draft to publish.');
+    }
+    if (draft.profileSlug !== binding.profileSlug || draft.draftRevision !== expectedDraftRevision) {
+      throw profileDraftChangedError();
+    }
+    if (draft.baseStateRevision !== profileStateRevision(state)) {
+      throw profileChangedError();
+    }
+
+    const profile = parseProfile(draft.profileJson);
+    return this.updateOwnProfile(
+      actor,
+      editableProfilePatch(profile),
+      draft.baseStateRevision,
+    );
+  }
+
   async prepareOwnPhoto(
     actor: DiscordActor,
     input: { bytes: Uint8Array; filename: string; contentType?: string },
@@ -712,6 +864,9 @@ export class ProfileService {
             const binding = this.#requireBinding(actor.guildId, targetUserId);
             this.#assertSameProfileBinding(initialBinding, binding);
             this.#assertNoPendingPublication(binding);
+            if (action === 'PROFILE_SET_LISTED') {
+              this.#assertNoProfileDraft(binding, targetUserId);
+            }
             recoveryBinding = binding;
 
             if (binding.status !== 'active') {
@@ -776,6 +931,7 @@ export class ProfileService {
     this.#assertActor(actor);
     const binding = this.#requireBinding(actor.guildId, actor.userId);
     this.#assertNoPendingPublication(binding);
+    this.#assertNoProfileDraft(binding, actor.userId);
 
     if (binding.status !== 'active') {
       throw new ProfileServiceError(
@@ -795,6 +951,43 @@ export class ProfileService {
         'A website update for this profile is already queued or publishing. Try again after it finishes.',
       );
     }
+  }
+
+  #assertProfileAvailableForDraftEdit(binding: ProfileBinding) {
+    this.#assertNoPendingPublication(binding);
+    if (this.#profileOperationTails.has(profileKey(binding.guildId, binding.profileSlug))) {
+      throw new ProfileServiceError(
+        'profile_busy',
+        'This profile is being recovered or updated. Reopen `/profile` and try again shortly.',
+      );
+    }
+  }
+
+  #assertNoProfileDraft(binding: ProfileBinding, userId: string) {
+    const draft = this.#store.getProfileDraft(binding.guildId, userId);
+    if (!draft) {
+      return;
+    }
+
+    const state = this.#store.getProfileState(binding.guildId, binding.profileSlug);
+    if (
+      state
+      && draft.profileSlug === binding.profileSlug
+      && draft.profileJson === state.profileJson
+    ) {
+      this.#store.clearProfileDraftIfProfileMatches(
+        binding.guildId,
+        userId,
+        binding.profileSlug,
+        state.profileJson,
+      );
+      return;
+    }
+
+    throw new ProfileServiceError(
+      'profile_draft_exists',
+      'Save or discard the profile draft before changing listing or photo settings.',
+    );
   }
 
   async #reconcileBinding(binding: ProfileBinding): Promise<ProfileState | undefined> {
@@ -1326,13 +1519,38 @@ export class ProfileService {
   }
 
   #snapshot(binding: ProfileBinding, state: ProfileState): ProfileSnapshot {
+    const profile = parseProfile(state.profileJson);
+    const stateRevision = profileStateRevision(state);
     const snapshot: ProfileSnapshot = {
       profileSlug: binding.profileSlug,
-      profile: parseProfile(state.profileJson),
+      profile,
       bindingStatus: binding.status,
-      stateRevision: profileStateRevision(state),
+      stateRevision,
       lastDeploymentStatus: state.lastDeploymentStatus,
     };
+
+    const storedDraft = this.#store.getProfileDraft(binding.guildId, binding.discordUserId);
+    if (storedDraft?.profileSlug === binding.profileSlug) {
+      if (storedDraft.profileJson === state.profileJson) {
+        this.#store.clearProfileDraftIfProfileMatches(
+          binding.guildId,
+          binding.discordUserId,
+          binding.profileSlug,
+          state.profileJson,
+        );
+      } else {
+        snapshot.draft = {
+          profile: parseProfile(storedDraft.profileJson),
+          revision: storedDraft.draftRevision,
+          baseStateRevision: storedDraft.baseStateRevision,
+          isPublishing: this.#store.hasNonterminalPublicationJob(
+            binding.guildId,
+            binding.profileSlug,
+          ),
+          stale: storedDraft.baseStateRevision !== stateRevision,
+        };
+      }
+    }
 
     if (state.lastCommitSha) {
       snapshot.lastCommitSha = state.lastCommitSha;
@@ -1440,6 +1658,34 @@ function profileStateRevision(state: ProfileState) {
     .slice(0, 20);
 }
 
+function profileDraftRevision(
+  baseStateRevision: string,
+  profileJson: string,
+  previousDraftRevision = '',
+) {
+  return createHash('sha256')
+    .update('profile-draft\0')
+    .update(baseStateRevision)
+    .update('\0')
+    .update(previousDraftRevision)
+    .update('\0')
+    .update(profileJson)
+    .digest('hex')
+    .slice(0, 20);
+}
+
+function editableProfilePatch(profile: MemberProfile): EditableProfilePatch {
+  return {
+    name: profile.name,
+    position: profile.position,
+    order: profile.order,
+    details: profile.details,
+    researchInterests: profile.researchInterests,
+    contact: profile.contact,
+    website: profile.website,
+  };
+}
+
 function createStagedPhotoId(baseId: string, revision: string) {
   const maxBaseLength = 64 - 1 - revision.length;
   return `${baseId.slice(0, maxBaseLength)}-${revision}`;
@@ -1453,6 +1699,13 @@ function profileChangedError() {
   return new ProfileServiceError(
     'profile_changed',
     'The profile changed after this panel was opened. Reopen `/profile` and try again.',
+  );
+}
+
+function profileDraftChangedError() {
+  return new ProfileServiceError(
+    'draft_changed',
+    'The profile draft changed after this form was opened. Reopen `/profile` and try again.',
   );
 }
 

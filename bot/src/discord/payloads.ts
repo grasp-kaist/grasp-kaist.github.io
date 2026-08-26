@@ -1,8 +1,4 @@
 import { memberCategories, type MemberOrder } from '../domain/member-profile.js';
-import {
-  PROFILE_EDIT_CONFIRMATION_CUSTOM_ID,
-  PROFILE_EDIT_CONFIRMATION_VALUE,
-} from './inputs.js';
 import type {
   DiscordInteractionResponse,
   DiscordMessageFile,
@@ -111,13 +107,15 @@ export function registerModalResponse(
 }
 
 export function editBasicModalResponse(snapshot: ProfileSnapshot): DiscordInteractionResponse {
-  const revision = assertProfileRevision(snapshot.stateRevision);
+  const revision = editableRevision(snapshot);
+  const profile = editableProfile(snapshot);
   return {
     type: 9,
     data: {
       custom_id: `profile-basic:v1:${revision}`,
       title: 'Edit name and position',
       components: [
+        draftOnlyNotice(),
         {
           type: 18,
           label: 'Public name',
@@ -128,7 +126,7 @@ export function editBasicModalResponse(snapshot: ProfileSnapshot): DiscordIntera
             min_length: 1,
             max_length: 80,
             required: true,
-            value: snapshot.profile.name,
+            value: profile.name,
           },
         },
         {
@@ -142,34 +140,35 @@ export function editBasicModalResponse(snapshot: ProfileSnapshot): DiscordIntera
             min_length: 1,
             max_length: 160,
             required: true,
-            value: snapshot.profile.position,
+            value: profile.position,
           },
         },
-        profileEditConfirmation(),
       ],
     },
   };
 }
 
 export function editTextModalResponse(snapshot: ProfileSnapshot): DiscordInteractionResponse {
-  const revision = assertProfileRevision(snapshot.stateRevision);
+  const revision = editableRevision(snapshot);
+  const profile = editableProfile(snapshot);
   return {
     type: 9,
     data: {
       custom_id: `profile-text:v1:${revision}`,
       title: 'Edit profile information',
       components: [
-        paragraphInput('Details', 'details', snapshot.profile.details, 2_000),
+        draftOnlyNotice(),
+        paragraphInput('Details', 'details', profile.details, 2_000),
         paragraphInput(
           'Research interests',
           'research_interests',
-          snapshot.profile.researchInterests,
+          profile.researchInterests,
           2_000,
         ),
         paragraphInput(
           'Contact',
           'contact',
-          snapshot.profile.contact,
+          profile.contact,
           1_000,
           'To deter scraping, obfuscate contact details if needed. '
           + 'For @kaist.ac.kr, use only @kaist.',
@@ -183,23 +182,24 @@ export function editTextModalResponse(snapshot: ProfileSnapshot): DiscordInterac
             style: 1,
             required: false,
             max_length: 500,
-            value: snapshot.profile.website,
+            value: profile.website,
           },
         },
-        profileEditConfirmation(),
       ],
     },
   };
 }
 
 export function categoryModalResponse(snapshot: ProfileSnapshot): DiscordInteractionResponse {
-  const revision = assertProfileRevision(snapshot.stateRevision);
+  const revision = editableRevision(snapshot);
+  const profile = editableProfile(snapshot);
   return {
     type: 9,
     data: {
       custom_id: `profile-category:v1:${revision}`,
       title: 'Member category',
       components: [
+        draftOnlyNotice(),
         {
           type: 18,
           label: 'Member category',
@@ -212,11 +212,10 @@ export function categoryModalResponse(snapshot: ProfileSnapshot): DiscordInterac
             options: memberCategories.map(({ order, label }) => ({
               label,
               value: String(order),
-              default: order === snapshot.profile.order,
+              default: order === profile.order,
             })),
           },
         },
-        profileEditConfirmation(),
       ],
     },
   };
@@ -269,14 +268,26 @@ export function profilePanelEdit(
   return v2Edit(profilePanelComponents(snapshot, notice, publicationMode), []);
 }
 
+export function profilePanelUpdateResponse(
+  snapshot: ProfileSnapshot,
+  notice?: string,
+  publicationMode: 'sandbox' | 'production' = 'production',
+): DiscordInteractionResponse {
+  return {
+    type: 7,
+    data: v2Edit(profilePanelComponents(snapshot, notice, publicationMode), []),
+  };
+}
+
 function profilePanelComponents(
   snapshot: ProfileSnapshot,
   notice: string | undefined,
   publicationMode: 'sandbox' | 'production',
 ) {
   const revision = assertProfileRevision(snapshot.stateRevision);
-  const category = memberCategories.find(({ order }) => order === snapshot.profile.order)?.label;
-  const profile = snapshot.profile;
+  const draft = snapshot.draft;
+  const profile = draft?.profile ?? snapshot.profile;
+  const category = memberCategories.find(({ order }) => order === profile.order)?.label;
   const statusText = snapshot.bindingStatus === 'active' ? '' : `\nStatus: **${snapshot.bindingStatus}**`;
   const summary = [
     `## ${escapeDiscordMarkdown(profile.name)}`,
@@ -295,33 +306,68 @@ function profilePanelComponents(
     .filter(Boolean)
     .join('\n');
 
-  const containerChildren: Record<string, unknown>[] = [{ type: 10, content: summary }];
+  const containerChildren: Record<string, unknown>[] = [];
+
+  if (draft) {
+    const draftStatus = draft.isPublishing
+      ? '## Draft is being published\nEditing is temporarily unavailable. Run `/profile` again shortly.'
+      : draft.stale
+        ? '## Draft needs review\nThe published profile changed. Discard this draft and edit again.'
+        : '## Draft changes — not published\nThe preview below contains your draft. The website still shows the last published version.';
+    containerChildren.push({ type: 10, content: draftStatus });
+  }
+
+  containerChildren.push({ type: 10, content: summary });
 
   if (snapshot.bindingStatus === 'active') {
+    const editLocked = Boolean(draft?.isPublishing || draft?.stale);
+    const directMutationLocked = Boolean(draft);
     containerChildren.push(
       {
         type: 1,
         components: [
-          button('Name & position', 'profile:edit-basic', 1),
-          button('Profile details', 'profile:edit-text', 2),
-          button('Category', 'profile:edit-category', 2),
-          button('Change photo', 'profile:replace-photo', 2),
+          button('Name & position', 'profile:edit-basic', 1, editLocked),
+          button('Profile details', 'profile:edit-text', 2, editLocked),
+          button('Category', 'profile:edit-category', 2, editLocked),
+          button('Change photo', 'profile:replace-photo', 2, directMutationLocked),
         ],
       },
       {
         type: 1,
         components: [
-          button('Remove photo', `profile:remove-photo:${revision}`, 4),
+          button('Remove photo', `profile:remove-photo:${revision}`, 4, directMutationLocked),
           button(
             publicationMode === 'sandbox'
               ? (profile.listed ? 'Mark hidden (sandbox)' : 'Mark listed (sandbox)')
               : (profile.listed ? 'Hide from website' : 'Show on website'),
             `profile:set-listed:${profile.listed ? '0' : '1'}:${revision}`,
             profile.listed ? 2 : 3,
+            directMutationLocked,
           ),
         ],
       },
     );
+
+    if (draft) {
+      const draftRevision = assertProfileRevision(draft.revision);
+      containerChildren.push({
+        type: 1,
+        components: [
+          button(
+            'Save changes',
+            `profile:save-draft:${draftRevision}`,
+            3,
+            draft.isPublishing || draft.stale,
+          ),
+          button(
+            'Discard draft',
+            `profile:discard-draft:${draftRevision}`,
+            4,
+            draft.isPublishing,
+          ),
+        ],
+      });
+    }
   }
 
   if (snapshot.membersPageUrl) {
@@ -502,25 +548,19 @@ function paragraphInput(
   };
 }
 
-function profileEditConfirmation() {
+function draftOnlyNotice() {
   return {
-    type: 18,
-    label: 'Confirm save and publish',
-    description: 'Required. Submitting saves now and publishes immediately in production.',
-    component: {
-      type: 22,
-      custom_id: PROFILE_EDIT_CONFIRMATION_CUSTOM_ID,
-      min_values: 1,
-      max_values: 1,
-      required: true,
-      options: [
-        {
-          label: 'Save and publish this edit now',
-          value: PROFILE_EDIT_CONFIRMATION_VALUE,
-        },
-      ],
-    },
+    type: 10,
+    content: 'Submitting this form updates your draft only. Use **Save changes** on the profile panel to publish it.',
   };
+}
+
+function editableProfile(snapshot: ProfileSnapshot) {
+  return snapshot.draft?.profile ?? snapshot.profile;
+}
+
+function editableRevision(snapshot: ProfileSnapshot) {
+  return assertProfileRevision(snapshot.draft?.revision ?? snapshot.stateRevision);
 }
 
 function button(label: string, customId: string, style: number, disabled = false) {

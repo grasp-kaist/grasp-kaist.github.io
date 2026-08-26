@@ -1,7 +1,6 @@
 import { isMemberOrder, type MemberOrder } from '../domain/member-profile.js';
 import {
   assertExpectedGuild,
-  assertProfileEditConfirmation,
   assertRegistrationConsent,
   DiscordInputError,
   getGuildUserId,
@@ -9,7 +8,6 @@ import {
   getOptionalModalText,
   getRequiredMemberOrderOption,
   getRequiredModalText,
-  getSingleModalValue,
   getUploadedAttachment,
   splitModalLines,
 } from './inputs.js';
@@ -196,6 +194,30 @@ export class DiscordInteractionRouter {
 
     const actor = this.#actor(interaction, userId);
 
+    const saveDraftMatch = customId.match(/^profile:save-draft:([0-9a-f]{20})$/);
+
+    if (saveDraftMatch) {
+      const expectedDraftRevision = saveDraftMatch[1]!;
+      return this.#deferredMutation(
+        interaction,
+        () => this.#service.saveOwnProfileDraft(actor, expectedDraftRevision),
+        this.#config.publicationMode === 'sandbox'
+          ? 'Your draft was saved in the sandbox. The website was not changed.'
+          : 'Your draft was published.',
+        true,
+      );
+    }
+
+    const discardDraftMatch = customId.match(/^profile:discard-draft:([0-9a-f]{20})$/);
+
+    if (discardDraftMatch) {
+      return this.#deferredProfilePanelMutation(
+        interaction,
+        () => this.#service.discardOwnProfileDraft(actor, discardDraftMatch[1]!),
+        () => 'Draft discarded. The published profile was not changed.',
+      );
+    }
+
     const removePhotoMatch = customId.match(/^profile:remove-photo:([0-9a-f]{20})$/);
 
     if (removePhotoMatch) {
@@ -320,17 +342,14 @@ export class DiscordInteractionRouter {
       const expectedRevision = basicProfileMatch[1]!;
       const name = limitedRequiredText(interaction, 'name', 80);
       const position = limitedRequiredText(interaction, 'position', 160);
-      assertProfileEditConfirmation(interaction);
-      return this.#deferredMutation(
+      return this.#deferredProfilePanelMutation(
         interaction,
-        () =>
-          this.#service.updateOwnProfile(
-            actor,
-            { name, position },
-            expectedRevision,
-          ),
-        'Your name and position were updated.',
-        true,
+        () => this.#service.stageOwnProfileDraft(
+          actor,
+          { name, position },
+          expectedRevision,
+        ),
+        draftStageNotice,
       );
     }
 
@@ -344,34 +363,33 @@ export class DiscordInteractionRouter {
       );
       const contact = limitedOptionalText(interaction, 'contact', 1_000);
       const website = limitedOptionalText(interaction, 'website', 500);
-      assertProfileEditConfirmation(interaction);
-      return this.#deferredMutation(
+      return this.#deferredProfilePanelMutation(
         interaction,
-        () =>
-          this.#service.updateOwnProfile(
-            actor,
-            {
-              details: splitModalLines(details),
-              researchInterests: splitModalLines(researchInterests),
-              contact: splitModalLines(contact),
-              website,
-            },
-            expectedRevision,
-          ),
-        'Your profile information was updated.',
-        true,
+        () => this.#service.stageOwnProfileDraft(
+          actor,
+          {
+            details: splitModalLines(details),
+            researchInterests: splitModalLines(researchInterests),
+            contact: splitModalLines(contact),
+            website,
+          },
+          expectedRevision,
+        ),
+        draftStageNotice,
       );
     }
 
     if (categoryProfileMatch) {
       const expectedRevision = categoryProfileMatch[1]!;
       const order = getModalMemberOrder(interaction);
-      assertProfileEditConfirmation(interaction);
-      return this.#deferredMutation(
+      return this.#deferredProfilePanelMutation(
         interaction,
-        () => this.#service.updateOwnProfile(actor, { order }, expectedRevision),
-        'Your member category was updated.',
-        true,
+        () => this.#service.stageOwnProfileDraft(
+          actor,
+          { order },
+          expectedRevision,
+        ),
+        draftStageNotice,
       );
     }
 
@@ -417,6 +435,31 @@ export class DiscordInteractionRouter {
           await this.#webhook.editOriginal(
             interaction.token,
             operationCompleteEdit(successMessage, result, this.#config.publicationMode),
+          );
+        } catch (error) {
+          await this.#editDeferredFailure(interaction.token, error);
+        }
+      },
+    };
+  }
+
+  #deferredProfilePanelMutation(
+    interaction: DiscordInteraction,
+    operation: () => ProfileSnapshot,
+    notice: (snapshot: ProfileSnapshot) => string,
+  ): InteractionRouteResult {
+    return {
+      response: deferUpdateResponse(),
+      afterResponse: async () => {
+        try {
+          const snapshot = operation();
+          await this.#webhook.editOriginal(
+            interaction.token,
+            profilePanelEdit(
+              snapshot,
+              notice(snapshot),
+              this.#config.publicationMode,
+            ),
           );
         } catch (error) {
           await this.#editDeferredFailure(interaction.token, error);
@@ -481,6 +524,12 @@ function isExpectedPendingError(error: unknown) {
     && typeof error.code === 'string'
     && EXPECTED_PENDING_ERROR_CODES.has(error.code)
   );
+}
+
+function draftStageNotice(snapshot: ProfileSnapshot) {
+  return snapshot.draft
+    ? 'Draft updated. Nothing has been published yet.'
+    : 'No draft changes to save. Your published profile was not changed.';
 }
 
 function limitedRequiredText(

@@ -129,7 +129,7 @@ test('profile panel is ephemeral Components V2 with bounded action rows', () => 
   assert.ok(actionCustomIds.includes(`profile:set-listed:1:${STATE_REVISION}`));
 });
 
-test('profile edit modals bind submissions to the rendered state revision', () => {
+test('profile edit modals bind submissions to the current published or draft revision', () => {
   const current = snapshot();
 
   assert.equal(
@@ -145,6 +145,22 @@ test('profile edit modals bind submissions to the rendered state revision', () =
     `profile-category:v1:${STATE_REVISION}`,
   );
   assert.equal(photoUploadModalResponse().data?.custom_id, 'profile-photo:v1');
+
+  current.draft = {
+    profile: { ...current.profile, name: 'Draft Member' },
+    revision: 'fedcba9876543210fedc',
+    baseStateRevision: STATE_REVISION,
+    isPublishing: false,
+    stale: false,
+  };
+  assert.equal(
+    editBasicModalResponse(current).data?.custom_id,
+    'profile-basic:v1:fedcba9876543210fedc',
+  );
+  const draftName = (
+    editBasicModalResponse(current).data?.components as Array<Record<string, unknown>>
+  ).find((component) => component.label === 'Public name');
+  assert.equal((draftName?.component as Record<string, unknown>).value, 'Draft Member');
 
   const basicComponents = editBasicModalResponse(current).data?.components as Array<
     Record<string, unknown>
@@ -165,7 +181,7 @@ test('profile edit modals bind submissions to the rendered state revision', () =
   );
 });
 
-test('every profile edit modal requires an explicit immediate publish confirmation', () => {
+test('profile edit modals save drafts and do not contain an immediate publish confirmation', () => {
   const current = snapshot();
   const modals = [
     editBasicModalResponse(current),
@@ -175,25 +191,52 @@ test('every profile edit modal requires an explicit immediate publish confirmati
 
   for (const modal of modals) {
     const components = modal.data?.components as Array<Record<string, unknown>>;
-    const confirmation = components.find(
-      (component) => component.label === 'Confirm save and publish',
+    assert.equal(
+      components.some((component) => component.label === 'Confirm save and publish'),
+      false,
     );
-    const child = confirmation?.component as Record<string, unknown>;
-    const options = child.options as Array<Record<string, unknown>>;
-
-    assert.equal(confirmation?.description, 'Required. Submitting saves now and publishes immediately in production.');
-    assert.equal(child.type, 22);
-    assert.equal(child.custom_id, 'profile_edit_confirmation');
-    assert.equal(child.required, true);
-    assert.deepEqual(options, [
-      { label: 'Save and publish this edit now', value: 'save_and_publish' },
-    ]);
+    assert.match(String(components[0]?.content), /updates your draft only/i);
+    assert.match(String(components[0]?.content), /Save changes/);
   }
 
   assert.equal(
     (editTextModalResponse(current).data?.components as Array<Record<string, unknown>>).length,
     5,
   );
+});
+
+test('a draft panel previews draft values and exposes one explicit final save', () => {
+  const current = snapshot();
+  const draftRevision = 'fedcba9876543210fedc';
+  current.draft = {
+    profile: { ...current.profile, name: 'Draft Member', order: 3 },
+    revision: draftRevision,
+    baseStateRevision: STATE_REVISION,
+    isPublishing: false,
+    stale: false,
+  };
+
+  const response = profilePanelResponse(current);
+  const container = (response.data?.components as Array<Record<string, unknown>>)[0]!;
+  const children = container.components as Array<Record<string, unknown>>;
+  const text = children
+    .filter((component) => component.type === 10)
+    .map((component) => String(component.content))
+    .join('\n');
+  assert.match(text, /Draft changes.*not published/i);
+  assert.match(text, /Draft Member/);
+  assert.match(text, /M\\\.S\\\. Student/);
+
+  const buttons = children
+    .filter((component) => component.type === 1)
+    .flatMap((row) => row.components as Array<Record<string, unknown>>);
+  const byLabel = (label: string) => buttons.find((button) => button.label === label);
+  assert.equal(byLabel('Save changes')?.custom_id, `profile:save-draft:${draftRevision}`);
+  assert.equal(byLabel('Save changes')?.disabled, undefined);
+  assert.equal(byLabel('Discard draft')?.custom_id, `profile:discard-draft:${draftRevision}`);
+  assert.equal(byLabel('Change photo')?.disabled, true);
+  assert.equal(byLabel('Remove photo')?.disabled, true);
+  assert.equal(byLabel('Show on website')?.disabled, true);
 });
 
 test('prepared photo preview attaches WebP and binds confirm/cancel to its token', () => {
@@ -248,7 +291,7 @@ function snapshot(): ProfileSnapshot {
     bindingStatus: 'active',
     profile: createEmptyProfile({
       name: 'Example Member',
-      position: 'Undergraduate Student, KAIST',
+      position: 'Undergraduate Student',
       order: 4,
     }),
   };

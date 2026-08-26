@@ -271,6 +271,52 @@ test('published profile state preserves optimistic-lock revisions', () => {
   }
 });
 
+test('profile drafts persist across reopen with revisions and timestamps intact', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'grasp-profile-draft-'));
+  const databasePath = join(directory, 'draft.sqlite');
+  let store = new SqliteStore(databasePath, { now: () => fixedDate });
+
+  try {
+    store.reserveBinding('guild', 'user-1', 'member-a');
+    store.activateBinding('guild', 'user-1');
+    const saved = store.saveProfileDraft(
+      {
+        guildId: 'guild',
+        discordUserId: 'user-1',
+        profileSlug: 'member-a',
+        baseStateRevision: '0123456789abcdefabcd',
+        draftRevision: 'abcdef0123456789abcd',
+        profileJson: '{"name":"Draft Member"}\n',
+      },
+      null,
+    );
+
+    assert.equal(saved.createdAt, fixedDate.toISOString());
+    assert.equal(saved.updatedAt, fixedDate.toISOString());
+    store.close();
+
+    store = new SqliteStore(databasePath, { now: () => fixedDate });
+    assert.deepEqual(store.getProfileDraft('guild', 'user-1'), saved);
+
+    const updated = store.saveProfileDraft(
+      {
+        guildId: 'guild',
+        discordUserId: 'user-1',
+        profileSlug: 'member-a',
+        baseStateRevision: saved.baseStateRevision,
+        draftRevision: '11111111111111111111',
+        profileJson: '{"name":"Updated Draft"}\n',
+      },
+      saved.draftRevision,
+    );
+    assert.equal(updated.draftRevision, '11111111111111111111');
+    assert.equal(updated.profileJson, '{"name":"Updated Draft"}\n');
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('photo staging enforces owner, expiry, and one publisher claim', () => {
   let now = new Date('2026-08-21T00:00:00.000Z');
   const store = new SqliteStore(':memory:', { now: () => now });

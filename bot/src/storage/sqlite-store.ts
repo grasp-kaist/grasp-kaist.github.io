@@ -102,6 +102,27 @@ export type ProfileStateInput = {
   lastDeploymentStatus: string;
 };
 
+export type ProfileDraft = {
+  guildId: string;
+  discordUserId: string;
+  profileSlug: string;
+  baseStateRevision: string;
+  draftRevision: string;
+  profileJson: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type ProfileDraftInput = Pick<
+  ProfileDraft,
+  | 'guildId'
+  | 'discordUserId'
+  | 'profileSlug'
+  | 'baseStateRevision'
+  | 'draftRevision'
+  | 'profileJson'
+>;
+
 export type StagedPhoto = {
   id: string;
   guildId: string;
@@ -137,6 +158,13 @@ export class PublicationJobConflictError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'PublicationJobConflictError';
+  }
+}
+
+export class ProfileDraftConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProfileDraftConflictError';
   }
 }
 
@@ -227,6 +255,129 @@ export class SqliteStore {
     this.#upsertProfileState(input);
 
     return this.getProfileState(input.guildId, input.profileSlug)!;
+  }
+
+  getProfileDraft(guildId: string, discordUserId: string) {
+    const row = this.#database
+      .prepare(
+        `SELECT guild_id, discord_user_id, profile_slug, base_state_revision,
+                draft_revision, profile_json, created_at, updated_at
+         FROM profile_drafts
+         WHERE guild_id = ? AND discord_user_id = ?`,
+      )
+      .get(guildId, discordUserId) as ProfileDraftRow | undefined;
+
+    return row ? mapProfileDraft(row) : undefined;
+  }
+
+  saveProfileDraft(
+    input: ProfileDraftInput,
+    expectedDraftRevision: string | null,
+  ) {
+    assertProfileRevision(input.baseStateRevision, 'base state revision');
+    assertProfileRevision(input.draftRevision, 'draft revision');
+    requireNonEmpty(input.profileJson, 'profileJson');
+
+    return this.#transaction(() => {
+      const binding = this.getBinding(input.guildId, input.discordUserId);
+      if (!binding || binding.profileSlug !== input.profileSlug || binding.status !== 'active') {
+        throw new ProfileDraftConflictError(
+          'The active profile binding changed before the draft could be saved.',
+        );
+      }
+
+      const timestamp = this.#timestamp();
+      let result: StatementResultingChanges;
+
+      if (expectedDraftRevision === null) {
+        try {
+          result = this.#database
+            .prepare(
+              `INSERT INTO profile_drafts (
+                 guild_id, discord_user_id, profile_slug, base_state_revision,
+                 draft_revision, profile_json, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              input.guildId,
+              input.discordUserId,
+              input.profileSlug,
+              input.baseStateRevision,
+              input.draftRevision,
+              input.profileJson,
+              timestamp,
+              timestamp,
+            );
+        } catch (error) {
+          if (isUniqueConstraintError(error)) {
+            throw new ProfileDraftConflictError(
+              'A profile draft was created by another interaction.',
+            );
+          }
+          throw error;
+        }
+      } else {
+        assertProfileRevision(expectedDraftRevision, 'expected draft revision');
+        result = this.#database
+          .prepare(
+            `UPDATE profile_drafts
+             SET draft_revision = ?, profile_json = ?, updated_at = ?
+             WHERE guild_id = ? AND discord_user_id = ? AND profile_slug = ?
+               AND base_state_revision = ? AND draft_revision = ?`,
+          )
+          .run(
+            input.draftRevision,
+            input.profileJson,
+            timestamp,
+            input.guildId,
+            input.discordUserId,
+            input.profileSlug,
+            input.baseStateRevision,
+            expectedDraftRevision,
+          );
+      }
+
+      if (Number(result.changes) !== 1) {
+        throw new ProfileDraftConflictError(
+          'The profile draft changed before this edit could be saved.',
+        );
+      }
+
+      return this.getProfileDraft(input.guildId, input.discordUserId)!;
+    });
+  }
+
+  deleteProfileDraft(
+    guildId: string,
+    discordUserId: string,
+    expectedDraftRevision: string,
+  ) {
+    assertProfileRevision(expectedDraftRevision, 'expected draft revision');
+    const result = this.#database
+      .prepare(
+        `DELETE FROM profile_drafts
+         WHERE guild_id = ? AND discord_user_id = ? AND draft_revision = ?`,
+      )
+      .run(guildId, discordUserId, expectedDraftRevision);
+
+    return Number(result.changes) === 1;
+  }
+
+  clearProfileDraftIfProfileMatches(
+    guildId: string,
+    discordUserId: string,
+    profileSlug: string,
+    profileJson: string,
+  ) {
+    const result = this.#database
+      .prepare(
+        `DELETE FROM profile_drafts
+         WHERE guild_id = ? AND discord_user_id = ? AND profile_slug = ?
+           AND profile_json = ?`,
+      )
+      .run(guildId, discordUserId, profileSlug, profileJson);
+
+    return Number(result.changes) === 1;
   }
 
   activateBindingWithProfileState(
@@ -992,6 +1143,12 @@ export class SqliteStore {
 
         this.#applySuccessfulPublicationBinding(job, timestamp);
         this.#upsertProfileState({ guildId: job.context.guildId, ...item.state });
+        this.clearProfileDraftIfProfileMatches(
+          job.context.guildId,
+          job.context.targetUserId,
+          job.profileSlug,
+          item.state.profileJson,
+        );
         this.#finishQueuedInteraction(
           job,
           'completed',
@@ -1399,6 +1556,23 @@ export class SqliteStore {
           ON UPDATE CASCADE ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS profile_drafts (
+        guild_id TEXT NOT NULL,
+        discord_user_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        base_state_revision TEXT NOT NULL
+          CHECK (length(base_state_revision) = 20 AND base_state_revision NOT GLOB '*[^0-9a-f]*'),
+        draft_revision TEXT NOT NULL
+          CHECK (length(draft_revision) = 20 AND draft_revision NOT GLOB '*[^0-9a-f]*'),
+        profile_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (guild_id, discord_user_id),
+        FOREIGN KEY (guild_id, discord_user_id)
+          REFERENCES profile_bindings (guild_id, discord_user_id)
+          ON UPDATE CASCADE ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS staged_photos (
         id TEXT PRIMARY KEY,
         guild_id TEXT NOT NULL,
@@ -1607,6 +1781,17 @@ type ProfileStateRow = {
   updated_at: string;
 };
 
+type ProfileDraftRow = {
+  guild_id: string;
+  discord_user_id: string;
+  profile_slug: string;
+  base_state_revision: string;
+  draft_revision: string;
+  profile_json: string;
+  created_at: string;
+  updated_at: string;
+};
+
 type StagedPhotoRow = {
   id: string;
   guild_id: string;
@@ -1693,6 +1878,19 @@ function mapProfileState(row: ProfileStateRow): ProfileState {
   }
 
   return state;
+}
+
+function mapProfileDraft(row: ProfileDraftRow): ProfileDraft {
+  return {
+    guildId: row.guild_id,
+    discordUserId: row.discord_user_id,
+    profileSlug: row.profile_slug,
+    baseStateRevision: row.base_state_revision,
+    draftRevision: row.draft_revision,
+    profileJson: row.profile_json,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 function mapInteractionReceipt(row: InteractionRow): InteractionReceipt {
@@ -1797,6 +1995,12 @@ function validatePublicationJobInput(input: EnqueuePublicationJobInput) {
 function requireNonEmpty(value: string, name: string) {
   if (!value.trim()) {
     throw new Error(`Publication job ${name} must not be empty.`);
+  }
+}
+
+function assertProfileRevision(value: string, name: string) {
+  if (!/^[0-9a-f]{20}$/.test(value)) {
+    throw new Error(`Profile draft ${name} must be 20 lowercase hexadecimal characters.`);
   }
 }
 
