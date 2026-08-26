@@ -49,91 +49,81 @@ test('failed provisioning reservations can be released', () => {
   }
 });
 
-test('new bindings start user-controlled with no pending moderation action', () => {
-  const store = new SqliteStore(':memory:');
-
-  try {
-    const binding = store.reserveBinding('guild', 'user-1', 'member-a');
-    assert.equal(binding.listingPolicy, 'user_controlled');
-    assert.equal(binding.pendingAdminAction, undefined);
-    assert.equal(binding.pendingAdminOperationId, undefined);
-  } finally {
-    store.close();
-  }
-});
-
-test('legacy bindings migrate to user-controlled moderation fields without data loss', () => {
+test('legacy profile-admin state is retired without leaving a blocked binding or job', () => {
   const directory = mkdtempSync(join(tmpdir(), 'grasp-profile-store-migration-'));
   const databasePath = join(directory, 'legacy.sqlite');
-  const legacy = new DatabaseSync(databasePath);
+  const seed = new SqliteStore(databasePath, { now: () => fixedDate });
 
   try {
-    legacy.exec(`
-      PRAGMA foreign_keys = ON;
-      CREATE TABLE profile_bindings (
-        guild_id TEXT NOT NULL,
-        discord_user_id TEXT NOT NULL,
-        profile_slug TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('provisioning', 'active', 'revoked')),
-        provisioning_operation_id TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (guild_id, discord_user_id),
-        UNIQUE (guild_id, profile_slug)
-      );
-      INSERT INTO profile_bindings (
-        guild_id, discord_user_id, profile_slug, status,
-        provisioning_operation_id, created_at, updated_at
-      ) VALUES (
-        'legacy-guild', 'legacy-user', 'legacy-member', 'active',
-        NULL, '2026-08-20T00:00:00.000Z', '2026-08-20T00:00:00.000Z'
-      );
-    `);
+    seed.reserveBinding('legacy-guild', 'legacy-user', 'legacy-member');
+    seed.activateBinding('legacy-guild', 'legacy-user');
+    seed.saveProfileState({
+      guildId: 'legacy-guild',
+      profileSlug: 'legacy-member',
+      profileJson: '{"name":"Legacy Member"}',
+      profileBlobSha: 'legacy-profile-sha',
+      lastDeploymentStatus: 'deployed',
+    });
+    seed.beginInteraction('legacy-interaction', 'legacy-operation', 'PROFILE_OWNER_HIDE');
+    seed.enqueuePublicationJob({
+      operationId: 'legacy-operation',
+      context: {
+        guildId: 'legacy-guild',
+        actorUserId: 'legacy-owner',
+        targetUserId: 'legacy-user',
+        interactionId: 'legacy-interaction',
+        receiptKind: 'PROFILE_OWNER_HIDE',
+      },
+      profileSlug: 'legacy-member',
+      action: 'PROFILE_SET_LISTED',
+      profileJson: '{"name":"Legacy Member","listed":false}',
+      profileExpectedSha: 'legacy-profile-sha',
+    });
   } finally {
-    legacy.close();
+    seed.close();
   }
+
+  const legacy = new DatabaseSync(databasePath);
+  legacy.exec(`
+    ALTER TABLE profile_bindings ADD COLUMN listing_policy TEXT NOT NULL DEFAULT 'user_controlled';
+    ALTER TABLE profile_bindings ADD COLUMN pending_admin_action TEXT;
+    ALTER TABLE profile_bindings ADD COLUMN pending_admin_operation_id TEXT;
+    ALTER TABLE profile_publish_jobs ADD COLUMN admin_action TEXT;
+    PRAGMA ignore_check_constraints = ON;
+    UPDATE profile_bindings
+      SET status = 'revoked', listing_policy = 'force_hidden',
+          pending_admin_action = 'hide', pending_admin_operation_id = 'legacy-operation';
+    UPDATE profile_publish_jobs SET admin_action = 'hide';
+    PRAGMA ignore_check_constraints = OFF;
+  `);
+  legacy.close();
 
   const migrated = new SqliteStore(databasePath);
   try {
     const binding = migrated.getBinding('legacy-guild', 'legacy-user');
     assert.equal(binding?.profileSlug, 'legacy-member');
     assert.equal(binding?.status, 'active');
-    assert.equal(binding?.createdAt, '2026-08-20T00:00:00.000Z');
-    assert.equal(binding?.listingPolicy, 'user_controlled');
-    assert.equal(binding?.pendingAdminAction, undefined);
-
-    const pending = migrated.beginAdminAction(
-      'legacy-guild',
-      'legacy-user',
-      'hide',
-      'legacy-hide-operation',
+    assert.equal(migrated.getPublicationJob('legacy-operation')?.status, 'failed');
+    assert.ok(migrated.getPublicationJob('legacy-operation')?.appliedAt);
+    assert.equal(migrated.getInteractionReceipt('legacy-interaction')?.status, 'failed');
+    assert.match(
+      migrated.getInteractionReceipt('legacy-interaction')?.responseJson ?? '',
+      /feature_removed/,
     );
-    assert.equal(pending.pendingAdminAction, 'hide');
-    assert.equal(pending.pendingAdminOperationId, 'legacy-hide-operation');
-    migrated.clearPendingAdminAction('legacy-guild', 'legacy-user', 'legacy-hide-operation');
-    migrated.beginInteraction(
-      'legacy-interaction',
-      'legacy-publish-operation',
-      'PROFILE_UPDATE',
-    );
-
-    const migratedJob = migrated.enqueuePublicationJob({
-      operationId: 'legacy-publish-operation',
-      context: {
-        guildId: 'legacy-guild',
-        actorUserId: 'legacy-user',
-        targetUserId: 'legacy-user',
-        interactionId: 'legacy-interaction',
-        receiptKind: 'PROFILE_UPDATE',
-      },
-      profileSlug: 'legacy-member',
-      action: 'PROFILE_UPDATE',
-      profileJson: '{"name":"Legacy Member"}',
-      profileExpectedSha: 'legacy-profile-sha',
-    });
-    assert.equal(migratedJob.status, 'queued');
   } finally {
     migrated.close();
+  }
+
+  const inspected = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const bindingColumns = inspected.prepare('PRAGMA table_info(profile_bindings)').all() as unknown as Array<{ name: string }>;
+    const jobColumns = inspected.prepare('PRAGMA table_info(profile_publish_jobs)').all() as unknown as Array<{ name: string }>;
+    assert.equal(bindingColumns.some(({ name }) => name === 'listing_policy'), false);
+    assert.equal(bindingColumns.some(({ name }) => name === 'pending_admin_action'), false);
+    assert.equal(bindingColumns.some(({ name }) => name === 'pending_admin_operation_id'), false);
+    assert.equal(jobColumns.some(({ name }) => name === 'admin_action'), false);
+  } finally {
+    inspected.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -212,72 +202,6 @@ test('online SQLite backups are verified read-only and preserve durable queue by
   }
 });
 
-test('admin moderation completion atomically updates profile state and binding policy', () => {
-  const store = new SqliteStore(':memory:', { now: () => fixedDate });
-
-  try {
-    store.reserveBinding('guild', 'user-1', 'member-a');
-    store.activateBinding('guild', 'user-1');
-    store.saveProfileState({
-      guildId: 'guild',
-      profileSlug: 'member-a',
-      profileJson: '{"listed":true}',
-      profileBlobSha: 'profile-before',
-      lastCommitSha: 'commit-before',
-      lastDeploymentStatus: 'deployed',
-    });
-    const pending = store.beginAdminAction(
-      'guild',
-      'user-1',
-      'revoke',
-      'revoke-operation',
-    );
-    assert.equal(pending.status, 'active');
-    assert.equal(pending.listingPolicy, 'user_controlled');
-    assert.equal(pending.pendingAdminAction, 'revoke');
-
-    assert.throws(() => store.completeAdminActionWithProfileState({
-      guildId: 'guild',
-      discordUserId: 'user-1',
-      operationId: 'wrong-operation',
-      action: 'revoke',
-      state: {
-        profileSlug: 'member-a',
-        profileJson: '{"listed":false}',
-        profileBlobSha: 'profile-should-roll-back',
-        lastCommitSha: 'commit-should-roll-back',
-        lastDeploymentStatus: 'deployed',
-      },
-    }));
-
-    assert.equal(store.getProfileState('guild', 'member-a')?.profileBlobSha, 'profile-before');
-    assert.equal(store.getBinding('guild', 'user-1')?.pendingAdminAction, 'revoke');
-
-    const completed = store.completeAdminActionWithProfileState({
-      guildId: 'guild',
-      discordUserId: 'user-1',
-      operationId: 'revoke-operation',
-      action: 'revoke',
-      state: {
-        profileSlug: 'member-a',
-        profileJson: '{"listed":false}',
-        profileBlobSha: 'profile-after',
-        lastCommitSha: 'commit-after',
-        lastDeploymentStatus: 'deployed',
-      },
-    });
-
-    assert.equal(completed.binding.status, 'revoked');
-    assert.equal(completed.binding.listingPolicy, 'force_hidden');
-    assert.equal(completed.binding.pendingAdminAction, undefined);
-    assert.equal(completed.binding.pendingAdminOperationId, undefined);
-    assert.equal(completed.state.profileBlobSha, 'profile-after');
-    assert.equal(completed.state.profileJson, '{"listed":false}');
-  } finally {
-    store.close();
-  }
-});
-
 test('known guild IDs are distinct and sorted for startup recovery', () => {
   const store = new SqliteStore(':memory:');
 
@@ -290,23 +214,6 @@ test('known guild IDs are distinct and sorted for startup recovery', () => {
       '222222222222222222',
       '333333333333333333',
     ]);
-  } finally {
-    store.close();
-  }
-});
-
-test('owner recovery can revoke and transfer a binding', () => {
-  const store = new SqliteStore(':memory:');
-
-  try {
-    store.reserveBinding('guild', 'old-user', 'member-a');
-    store.activateBinding('guild', 'old-user');
-    store.setBindingStatus('guild', 'old-user', 'revoked');
-
-    const transferred = store.transferBinding('guild', 'member-a', 'new-user');
-    assert.equal(transferred.discordUserId, 'new-user');
-    assert.equal(transferred.status, 'active');
-    assert.equal(store.getBinding('guild', 'old-user'), undefined);
   } finally {
     store.close();
   }
@@ -477,7 +384,7 @@ test('durable publication jobs preserve data and recover only expired leases', (
     assert.deepEqual(repeated.photo?.kind === 'upsert' ? repeated.photo.bytes : null, input.photo.bytes);
     assert.equal(store.listPublicationJobs('guild').length, 1);
     assert.deepEqual(store.getPublicationJobOutcome(input.operationId), { status: 'queued' });
-    assert.deepEqual(store.listPublicationRecoveryCandidates('guild'), [{ status: 'queued' }]);
+    assert.deepEqual(store.listPublicationRecoveryCandidates(), [{ status: 'queued' }]);
     assert.equal(store.getPublicationJobOutcome('missing-operation'), undefined);
 
     assert.throws(
@@ -494,7 +401,6 @@ test('durable publication jobs preserve data and recover only expired leases', (
     );
 
     const [claimed] = store.claimPublicationJobs({
-      guildId: 'guild',
       workerId: 'worker-a',
       leaseToken: 'lease-a',
       leaseExpiresAt: new Date('2026-08-21T00:05:00.000Z'),
@@ -503,18 +409,18 @@ test('durable publication jobs preserve data and recover only expired leases', (
     assert.equal(claimed?.attempts, 1);
     assert.equal(claimed?.leaseGeneration, 1);
     assert.deepEqual(claimed?.photo?.kind === 'upsert' ? claimed.photo.bytes : null, input.photo.bytes);
-    assert.deepEqual(store.listPublicationRecoveryCandidates('guild'), [{
+    assert.deepEqual(store.listPublicationRecoveryCandidates(), [{
       status: 'leased',
       leaseExpiresAt: '2026-08-21T00:05:00.000Z',
     }]);
 
-    assert.equal(store.recoverPublicationLeases('guild'), 0);
+    assert.equal(store.recoverPublicationLeases(), 0);
     const active = store.getPublicationJob(input.operationId);
     assert.equal(active?.status, 'leased');
     assert.equal(active?.leaseOwner, 'worker-a');
 
     now = new Date('2026-08-21T00:05:00.000Z');
-    assert.equal(store.recoverPublicationLeases('guild'), 1);
+    assert.equal(store.recoverPublicationLeases(), 1);
     const recovered = store.getPublicationJob(input.operationId);
     assert.equal(recovered?.status, 'queued');
     assert.equal(recovered?.leaseOwner, undefined);
@@ -524,102 +430,7 @@ test('durable publication jobs preserve data and recover only expired leases', (
   }
 });
 
-test('two stores atomically queue owner moderation with its pending binding state', () => {
-  const directory = mkdtempSync(join(tmpdir(), 'grasp-admin-enqueue-race-'));
-  const databasePath = join(directory, 'shared.sqlite');
-  const first = new SqliteStore(databasePath, { now: () => fixedDate });
-  const second = new SqliteStore(databasePath, { now: () => fixedDate });
-
-  try {
-    first.reserveBinding('guild', 'user-1', 'member-a');
-    first.activateBinding('guild', 'user-1');
-    first.saveProfileState({
-      guildId: 'guild',
-      profileSlug: 'member-a',
-      profileJson: '{"name":"Member A","listed":true}',
-      profileBlobSha: 'profile-before',
-      lastDeploymentStatus: 'deployed',
-    });
-    first.beginInteraction('hide-interaction', 'hide-operation', 'PROFILE_OWNER_HIDE');
-
-    assert.equal(second.hasNonterminalPublicationJob('guild', 'member-a'), false);
-    assert.equal(second.getBinding('guild', 'user-1')?.pendingAdminAction, undefined);
-
-    first.enqueuePublicationJob({
-      operationId: 'hide-operation',
-      context: {
-        guildId: 'guild',
-        actorUserId: 'owner',
-        targetUserId: 'user-1',
-        interactionId: 'hide-interaction',
-        receiptKind: 'PROFILE_OWNER_HIDE',
-        adminAction: 'hide',
-      },
-      profileSlug: 'member-a',
-      action: 'PROFILE_SET_LISTED',
-      profileJson: '{"name":"Member A","listed":false}',
-      profileExpectedSha: 'profile-before',
-    });
-
-    assert.equal(second.hasNonterminalPublicationJob('guild', 'member-a'), true);
-    assert.equal(second.getBinding('guild', 'user-1')?.pendingAdminAction, 'hide');
-    assert.equal(
-      second.getBinding('guild', 'user-1')?.pendingAdminOperationId,
-      'hide-operation',
-    );
-    assert.throws(
-      () => second.transferBinding('guild', 'member-a', 'user-2'),
-      PublicationJobConflictError,
-    );
-    assert.equal(second.getBinding('guild', 'user-1')?.profileSlug, 'member-a');
-    assert.equal(second.getBinding('guild', 'user-2'), undefined);
-  } finally {
-    second.close();
-    first.close();
-    rmSync(directory, { recursive: true, force: true });
-  }
-});
-
-test('atomic enqueue rejects a member write after the binding becomes revoked', () => {
-  const store = new SqliteStore(':memory:', { now: () => fixedDate });
-
-  try {
-    store.reserveBinding('guild', 'user-1', 'member-a');
-    store.activateBinding('guild', 'user-1');
-    store.saveProfileState({
-      guildId: 'guild',
-      profileSlug: 'member-a',
-      profileJson: '{"name":"Member A"}',
-      profileBlobSha: 'profile-before',
-      lastDeploymentStatus: 'deployed',
-    });
-    store.setBindingStatus('guild', 'user-1', 'revoked');
-    store.beginInteraction('late-edit', 'late-operation', 'PROFILE_UPDATE');
-
-    assert.throws(
-      () => store.enqueuePublicationJob({
-        operationId: 'late-operation',
-        context: {
-          guildId: 'guild',
-          actorUserId: 'user-1',
-          targetUserId: 'user-1',
-          interactionId: 'late-edit',
-          receiptKind: 'PROFILE_UPDATE',
-        },
-        profileSlug: 'member-a',
-        action: 'PROFILE_UPDATE',
-        profileJson: '{"name":"Too Late"}',
-        profileExpectedSha: 'profile-before',
-      }),
-      PublicationJobConflictError,
-    );
-    assert.equal(store.listPublicationJobs('guild').length, 0);
-  } finally {
-    store.close();
-  }
-});
-
-test('a second store cannot mutate binding or staged-photo state after a stale queue check', () => {
+test('a second store cannot mutate staged-photo state after a stale queue check', () => {
   const directory = mkdtempSync(join(tmpdir(), 'grasp-profile-mutation-race-'));
   const databasePath = join(directory, 'shared.sqlite');
   const first = new SqliteStore(databasePath, { now: () => fixedDate });
@@ -664,10 +475,6 @@ test('a second store cannot mutate binding or staged-photo state after a stale q
     });
 
     const blocked = [
-      () => second.setBindingStatus('guild', 'user-1', 'revoked'),
-      () => second.clearForceHidden('guild', 'user-1'),
-      () => second.beginAdminAction('guild', 'user-1', 'hide', 'late-hide'),
-      () => second.transferBinding('guild', 'member-a', 'user-2'),
       () => second.stagePhoto({
         id: 'replacement-photo',
         guildId: 'guild',
@@ -686,8 +493,6 @@ test('a second store cannot mutate binding or staged-photo state after a stale q
     }
 
     assert.equal(second.getBinding('guild', 'user-1')?.status, 'active');
-    assert.equal(second.getBinding('guild', 'user-1')?.pendingAdminAction, undefined);
-    assert.equal(second.getBinding('guild', 'user-2'), undefined);
     assert.equal(
       second.getStagedPhoto('guild', 'user-1', 'prepared-photo')?.status,
       'prepared',
@@ -761,7 +566,6 @@ test('photo expiry and startup recovery preserve bytes owned by unfinished publi
       'publishing',
     );
     const [claimed] = store.claimPublicationJobs({
-      guildId: 'guild',
       workerId: 'worker-photo',
       leaseToken: 'lease-photo',
       leaseExpiresAt: new Date('2026-08-21T00:10:00.000Z'),

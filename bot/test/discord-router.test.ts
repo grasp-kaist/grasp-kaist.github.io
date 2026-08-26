@@ -17,8 +17,6 @@ import type {
 const APPLICATION_ID = '111111111111111111';
 const GUILD_ID = '222222222222222222';
 const USER_ID = '333333333333333333';
-const OWNER_ID = '444444444444444444';
-const TARGET_ID = '555555555555555555';
 const STATE_REVISION = '0123456789abcdefabcd';
 
 test('register uses only a local probe before opening a current Label modal', async () => {
@@ -440,69 +438,6 @@ test('photo cancellation discards only the staged photo named by the button', as
   assert.equal(components.some((component) => component.type === 17), true);
 });
 
-test('owner command is checked independently of Discord command visibility', async () => {
-  let hiddenTarget: string | undefined;
-  const harness = createHarness(
-    {
-      ownerHide: async (_actor, targetUserId) => {
-        hiddenTarget = targetUserId;
-        return {};
-      },
-    },
-    undefined,
-    'sandbox',
-  );
-  const options = [
-    {
-      type: 1,
-      name: 'hide',
-      options: [{ type: 6, name: 'member', value: TARGET_ID }],
-    },
-  ];
-
-  const denied = await harness.router.route(
-    commandInteraction('profile-admin', options, USER_ID),
-  );
-  assert.equal(denied.response.type, 4);
-  assert.equal(hiddenTarget, undefined);
-
-  const allowed = await harness.router.route(
-    commandInteraction('profile-admin', options, OWNER_ID),
-  );
-  assert.equal(allowed.response.type, 5);
-  await allowed.afterResponse?.();
-  assert.equal(hiddenTarget, TARGET_ID);
-  const completion = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
-  assert.match(String(completion[0]?.content), /website was not changed/i);
-});
-
-test('owner can remove a force-hide without claiming that the profile is already visible', async () => {
-  let unhiddenTarget: string | undefined;
-  const harness = createHarness({
-    ownerUnhide: async (_actor, targetUserId) => {
-      unhiddenTarget = targetUserId;
-      return {};
-    },
-  });
-  const options = [
-    {
-      type: 1,
-      name: 'unhide',
-      options: [{ type: 6, name: 'member', value: TARGET_ID }],
-    },
-  ];
-
-  const routed = await harness.router.route(
-    commandInteraction('profile-admin', options, OWNER_ID),
-  );
-  assert.equal(routed.response.type, 5);
-  await routed.afterResponse?.();
-  assert.equal(unhiddenTarget, TARGET_ID);
-  const completion = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
-  assert.match(String(completion[0]?.content), /visibility lock was removed/i);
-  assert.match(String(completion[0]?.content), /remains hidden/i);
-});
-
 function createHarness(
   serviceOverrides: Partial<ProfileService> = {},
   downloaderOverride?: AttachmentDownloader,
@@ -523,7 +458,6 @@ function createHarness(
     config: {
       applicationId: APPLICATION_ID,
       guildId: GUILD_ID,
-      ownerUserId: OWNER_ID,
       publicationMode,
     },
     service,
@@ -552,12 +486,6 @@ function defaultService(): ProfileService {
     discardOwnPhoto: async () => undefined,
     removeOwnPhoto: async () => ({}),
     setOwnListed: async () => ({}),
-    ownerHide: async () => ({}),
-    ownerUnhide: async () => ({}),
-    ownerRevoke: async () => ({}),
-    ownerRestore: async () => ({}),
-    ownerTransfer: async () => ({}),
-    ownerSetCategory: async () => ({}),
   };
 }
 
@@ -566,7 +494,6 @@ function snapshot(): ProfileSnapshot {
     profileSlug: 'taein-oh',
     stateRevision: STATE_REVISION,
     bindingStatus: 'active',
-    listingPolicy: 'user_controlled',
     profile: createEmptyProfile({
       name: 'Taein Oh',
       position: 'Undergraduate Student, KAIST',

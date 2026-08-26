@@ -14,10 +14,9 @@ import {
 
 export type QueuedProfilePublisherOptions = Omit<
   ProfilePublishWorkerOptions,
-  'backend' | 'guildId' | 'store'
+  'backend' | 'store'
 > & {
   store: SqliteStore;
-  guildId: string;
   backend: BatchProfilePublisher;
   foregroundWaitMs?: number;
   terminalPollMs?: number;
@@ -37,7 +36,6 @@ export class QueuedPublicationError extends Error {
 export class QueuedProfilePublisher {
   readonly usesDurableQueue = true;
   readonly #store: SqliteStore;
-  readonly #guildId: string;
   readonly #worker: ProfilePublishWorker;
   readonly #foregroundWaitMs: number;
   readonly #terminalPollMs: number;
@@ -45,7 +43,6 @@ export class QueuedProfilePublisher {
 
   constructor(options: QueuedProfilePublisherOptions) {
     this.#store = options.store;
-    this.#guildId = options.guildId;
     this.#foregroundWaitMs = positiveInteger(
       options.foregroundWaitMs ?? 6_000,
       'foregroundWaitMs',
@@ -68,13 +65,6 @@ export class QueuedProfilePublisher {
         'Durable production publication requires Discord operation context.',
       );
     }
-    if (context.guildId !== this.#guildId) {
-      throw new QueuedPublicationError(
-        'wrong_publication_guild',
-        'This publication queue only accepts the configured production guild.',
-      );
-    }
-
     this.#store.enqueuePublicationJob({
       operationId: input.operationId,
       context: {
@@ -84,7 +74,6 @@ export class QueuedProfilePublisher {
         interactionId: context.interactionId,
         receiptKind: context.receiptKind,
         ...(context.stagedPhotoId ? { stagedPhotoId: context.stagedPhotoId } : {}),
-        ...(context.adminAction ? { adminAction: context.adminAction } : {}),
       },
       profileSlug: input.slug,
       action: input.action,

@@ -55,19 +55,6 @@ export function getCommandOption(
   return options?.find((option) => option.name === name);
 }
 
-export function getRequiredStringOption(
-  options: readonly DiscordCommandOption[] | undefined,
-  name: string,
-) {
-  const value = getCommandOption(options, name)?.value;
-
-  if (typeof value !== 'string' || !SNOWFLAKE_PATTERN.test(value)) {
-    throw new DiscordInputError(`Command option ${name} must be a Discord user.`);
-  }
-
-  return value;
-}
-
 export function getRequiredMemberOrderOption(
   options: readonly DiscordCommandOption[] | undefined,
   name = 'category',
@@ -79,14 +66,6 @@ export function getRequiredMemberOrderOption(
   }
 
   return value;
-}
-
-export function getSubcommand(options: readonly DiscordCommandOption[] | undefined) {
-  if (options?.length !== 1 || options[0]?.type !== 1) {
-    throw new DiscordInputError('A valid profile-admin subcommand is required.');
-  }
-
-  return options[0];
 }
 
 export function findModalChild(interaction: DiscordInteraction, customId: string) {

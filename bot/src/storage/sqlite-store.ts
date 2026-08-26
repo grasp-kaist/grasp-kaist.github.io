@@ -2,9 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { backup, DatabaseSync, type StatementResultingChanges } from 'node:sqlite';
 
-export type BindingStatus = 'provisioning' | 'active' | 'revoked';
-export type ListingPolicy = 'user_controlled' | 'force_hidden';
-export type PendingAdminAction = 'hide' | 'revoke';
+export type BindingStatus = 'provisioning' | 'active';
 export type PublicationJobAction =
   | 'PROFILE_CREATE'
   | 'PROFILE_UPDATE'
@@ -20,7 +18,6 @@ export type PublicationJobContext = {
   interactionId: string;
   receiptKind: string;
   stagedPhotoId?: string;
-  adminAction?: PendingAdminAction;
 };
 
 export type PublicationJobPhoto =
@@ -67,9 +64,6 @@ export type ProfileBinding = {
   discordUserId: string;
   profileSlug: string;
   status: BindingStatus;
-  listingPolicy: ListingPolicy;
-  pendingAdminAction?: PendingAdminAction;
-  pendingAdminOperationId?: string;
   provisioningOperationId?: string;
   createdAt: string;
   updatedAt: string;
@@ -193,8 +187,7 @@ export class SqliteStore {
   getBinding(guildId: string, discordUserId: string) {
     const row = this.#database
       .prepare(
-        `SELECT guild_id, discord_user_id, profile_slug, status, listing_policy,
-                pending_admin_action, pending_admin_operation_id,
+        `SELECT guild_id, discord_user_id, profile_slug, status,
                 provisioning_operation_id, created_at, updated_at
          FROM profile_bindings
          WHERE guild_id = ? AND discord_user_id = ?`,
@@ -207,8 +200,7 @@ export class SqliteStore {
   getBindingBySlug(guildId: string, profileSlug: string) {
     const row = this.#database
       .prepare(
-        `SELECT guild_id, discord_user_id, profile_slug, status, listing_policy,
-                pending_admin_action, pending_admin_operation_id,
+        `SELECT guild_id, discord_user_id, profile_slug, status,
                 provisioning_operation_id, created_at, updated_at
          FROM profile_bindings
          WHERE guild_id = ? AND profile_slug = ?`,
@@ -272,8 +264,7 @@ export class SqliteStore {
   listBindings(guildId: string) {
     const rows = this.#database
       .prepare(
-        `SELECT guild_id, discord_user_id, profile_slug, status, listing_policy,
-                pending_admin_action, pending_admin_operation_id,
+        `SELECT guild_id, discord_user_id, profile_slug, status,
                 provisioning_operation_id, created_at, updated_at
          FROM profile_bindings
          WHERE guild_id = ?
@@ -351,142 +342,6 @@ export class SqliteStore {
          WHERE guild_id = ? AND discord_user_id = ? AND status = 'provisioning'`,
       )
       .run(guildId, discordUserId);
-  }
-
-  setBindingStatus(guildId: string, discordUserId: string, status: 'active' | 'revoked') {
-    this.#transaction(() => {
-      const binding = this.getBinding(guildId, discordUserId);
-      if (binding) {
-        this.#assertNoPendingPublication(guildId, binding.profileSlug);
-      }
-      const result = this.#database
-        .prepare(
-          `UPDATE profile_bindings
-           SET status = ?, provisioning_operation_id = NULL, updated_at = ?
-           WHERE guild_id = ? AND discord_user_id = ? AND pending_admin_action IS NULL`,
-        )
-        .run(status, this.#timestamp(), guildId, discordUserId);
-
-      assertChanged(result, 'Binding was not found.');
-    });
-    return this.getBinding(guildId, discordUserId)!;
-  }
-
-  beginAdminAction(
-    guildId: string,
-    discordUserId: string,
-    action: PendingAdminAction,
-    operationId: string,
-  ) {
-    this.#transaction(() => {
-      const binding = this.getBinding(guildId, discordUserId);
-      if (binding) {
-        this.#assertNoPendingPublication(guildId, binding.profileSlug);
-      }
-      const result = this.#database
-        .prepare(
-          `UPDATE profile_bindings
-           SET pending_admin_action = ?, pending_admin_operation_id = ?, updated_at = ?
-           WHERE guild_id = ? AND discord_user_id = ?
-             AND status = 'active' AND pending_admin_action IS NULL`,
-        )
-        .run(action, operationId, this.#timestamp(), guildId, discordUserId);
-
-      assertChanged(result, 'Active binding is missing or already has a pending admin action.');
-    });
-    return this.getBinding(guildId, discordUserId)!;
-  }
-
-  clearPendingAdminAction(guildId: string, discordUserId: string, operationId: string) {
-    const result = this.#database
-      .prepare(
-        `UPDATE profile_bindings
-         SET pending_admin_action = NULL, pending_admin_operation_id = NULL, updated_at = ?
-         WHERE guild_id = ? AND discord_user_id = ? AND pending_admin_operation_id = ?`,
-      )
-      .run(this.#timestamp(), guildId, discordUserId, operationId);
-
-    assertChanged(result, 'Pending admin action was not found.');
-    return this.getBinding(guildId, discordUserId)!;
-  }
-
-  completeAdminActionWithProfileState(input: {
-    guildId: string;
-    discordUserId: string;
-    operationId: string;
-    action: PendingAdminAction;
-    state: Omit<ProfileStateInput, 'guildId'>;
-  }) {
-    this.#transaction(() => {
-      this.#upsertProfileState({ guildId: input.guildId, ...input.state });
-      const result = this.#database
-        .prepare(
-          `UPDATE profile_bindings
-           SET status = ?, listing_policy = 'force_hidden',
-               pending_admin_action = NULL, pending_admin_operation_id = NULL, updated_at = ?
-           WHERE guild_id = ? AND discord_user_id = ?
-             AND pending_admin_action = ? AND pending_admin_operation_id = ?`,
-        )
-        .run(
-          input.action === 'revoke' ? 'revoked' : 'active',
-          this.#timestamp(),
-          input.guildId,
-          input.discordUserId,
-          input.action,
-          input.operationId,
-        );
-
-      assertChanged(result, 'Pending admin action changed before it could be completed.');
-    });
-
-    return {
-      binding: this.getBinding(input.guildId, input.discordUserId)!,
-      state: this.getProfileState(input.guildId, input.state.profileSlug)!,
-    };
-  }
-
-  clearForceHidden(guildId: string, discordUserId: string) {
-    this.#transaction(() => {
-      const binding = this.getBinding(guildId, discordUserId);
-      if (binding) {
-        this.#assertNoPendingPublication(guildId, binding.profileSlug);
-      }
-      const result = this.#database
-        .prepare(
-          `UPDATE profile_bindings
-           SET listing_policy = 'user_controlled', updated_at = ?
-           WHERE guild_id = ? AND discord_user_id = ?
-             AND pending_admin_action IS NULL`,
-        )
-        .run(this.#timestamp(), guildId, discordUserId);
-
-      assertChanged(result, 'Binding is missing or still has a pending admin action.');
-    });
-    return this.getBinding(guildId, discordUserId)!;
-  }
-
-  transferBinding(guildId: string, profileSlug: string, newDiscordUserId: string) {
-    this.#transaction(() => {
-      this.#assertNoPendingPublication(guildId, profileSlug);
-      const existingTarget = this.getBinding(guildId, newDiscordUserId);
-
-      if (existingTarget) {
-        throw new BindingConflictError('The destination Discord account is already registered.');
-      }
-
-      const result = this.#database
-        .prepare(
-          `UPDATE profile_bindings
-           SET discord_user_id = ?, status = 'active', provisioning_operation_id = NULL,
-               updated_at = ?
-           WHERE guild_id = ? AND profile_slug = ? AND pending_admin_action IS NULL`,
-        )
-        .run(newDiscordUserId, this.#timestamp(), guildId, profileSlug);
-
-      assertChanged(result, 'Profile binding was not found.');
-    });
-
-    return this.getBindingBySlug(guildId, profileSlug)!;
   }
 
   beginInteraction(interactionId: string, operationId: string, kind: string) {
@@ -607,7 +462,6 @@ export class SqliteStore {
         !binding
         || binding.profileSlug !== input.profileSlug
         || binding.status !== 'active'
-        || binding.pendingAdminAction
       ) {
         throw new BindingConflictError('The staged photo does not match the current profile binding.');
       }
@@ -689,7 +543,6 @@ export class SqliteStore {
         !binding
         || binding.profileSlug !== staged.profileSlug
         || binding.status !== 'active'
-        || binding.pendingAdminAction
       ) {
         throw new BindingConflictError('The staged photo does not match an active profile binding.');
       }
@@ -819,28 +672,9 @@ export class SqliteStore {
         return existing;
       }
 
-      const binding = this.#assertPublicationBindingCanEnqueue(input);
+      this.#assertPublicationBindingCanEnqueue(input);
       this.#assertNoPendingPublication(input.context.guildId, input.profileSlug);
       const timestamp = this.#timestamp();
-
-      if (input.context.adminAction && !binding.pendingAdminAction) {
-        const pending = this.#database
-          .prepare(
-            `UPDATE profile_bindings
-             SET pending_admin_action = ?, pending_admin_operation_id = ?, updated_at = ?
-             WHERE guild_id = ? AND discord_user_id = ? AND profile_slug = ?
-               AND status = 'active' AND pending_admin_action IS NULL`,
-          )
-          .run(
-            input.context.adminAction,
-            input.operationId,
-            timestamp,
-            input.context.guildId,
-            input.context.targetUserId,
-            input.profileSlug,
-          );
-        assertChanged(pending, 'Active binding changed before owner moderation could be queued.');
-      }
 
       const photoKind = input.photo?.kind ?? null;
       const photoBytes = input.photo?.kind === 'upsert' ? Buffer.from(input.photo.bytes) : null;
@@ -851,12 +685,12 @@ export class SqliteStore {
           .prepare(
             `INSERT INTO profile_publish_jobs (
                operation_id, guild_id, actor_user_id, target_user_id,
-               interaction_id, receipt_kind, staged_photo_id, admin_action,
+               interaction_id, receipt_kind, staged_photo_id,
                profile_slug, action,
                profile_json, profile_expected_sha,
                photo_kind, photo_bytes, photo_expected_sha,
                status, attempts, lease_generation, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, 0, ?, ?)`,
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, 0, ?, ?)`,
           )
           .run(
             input.operationId,
@@ -866,7 +700,6 @@ export class SqliteStore {
             input.context.interactionId,
             input.context.receiptKind,
             input.context.stagedPhotoId ?? null,
-            input.context.adminAction ?? null,
             input.profileSlug,
             input.action,
             input.profileJson,
@@ -929,15 +762,14 @@ export class SqliteStore {
     return rows.map(mapPublicationJob);
   }
 
-  listPublicationRecoveryCandidates(guildId: string): PublicationRecoveryCandidate[] {
+  listPublicationRecoveryCandidates(): PublicationRecoveryCandidate[] {
     const rows = this.#database
       .prepare(
         `SELECT status, lease_expires_at
          FROM profile_publish_jobs
-         WHERE guild_id = ?
-           AND (status IN ('queued', 'leased') OR (status = 'completed' AND applied_at IS NULL))`,
+         WHERE status IN ('queued', 'leased') OR (status = 'completed' AND applied_at IS NULL)`,
       )
-      .all(guildId) as unknown as Array<{
+      .all() as unknown as Array<{
         status: PublicationJobStatus;
         lease_expires_at: string | null;
       }>;
@@ -948,32 +780,32 @@ export class SqliteStore {
     }));
   }
 
-  getOldestQueuedPublicationCreatedAt(guildId: string) {
+  getOldestQueuedPublicationCreatedAt() {
     const row = this.#database
       .prepare(
         `SELECT created_at
          FROM profile_publish_jobs
-         WHERE guild_id = ? AND status = 'queued'
+         WHERE status = 'queued'
          ORDER BY created_at, operation_id
          LIMIT 1`,
       )
-      .get(guildId) as { created_at: string } | undefined;
+      .get() as { created_at: string } | undefined;
 
     return row?.created_at;
   }
 
-  listUnappliedPublicationJobs(guildId: string, limit = 20) {
+  listUnappliedPublicationJobs(limit = 20) {
     if (!Number.isInteger(limit) || limit < 1 || limit > 20) {
       throw new Error('Unapplied publication limit must be between 1 and 20.');
     }
     const rows = this.#database
       .prepare(
         `${PUBLICATION_JOB_SELECT}
-         WHERE guild_id = ? AND status = 'completed' AND applied_at IS NULL
+         WHERE status = 'completed' AND applied_at IS NULL
          ORDER BY completed_at, operation_id
          LIMIT ?`,
       )
-      .all(guildId, limit) as unknown as PublicationJobRow[];
+      .all(limit) as unknown as PublicationJobRow[];
 
     return rows.map(mapPublicationJob);
   }
@@ -992,21 +824,19 @@ export class SqliteStore {
     return row?.present === 1;
   }
 
-  countNonterminalPublicationJobs(guildId: string) {
+  countNonterminalPublicationJobs() {
     const row = this.#database
       .prepare(
         `SELECT COUNT(*) AS count
          FROM profile_publish_jobs
-         WHERE guild_id = ?
-           AND (status IN ('queued', 'leased') OR (status = 'completed' AND applied_at IS NULL))`,
+         WHERE status IN ('queued', 'leased') OR (status = 'completed' AND applied_at IS NULL)`,
       )
-      .get(guildId) as { count: number };
+      .get() as { count: number };
 
     return row.count;
   }
 
   claimPublicationJobs(input: {
-    guildId: string;
     workerId: string;
     leaseToken: string;
     leaseExpiresAt: Date;
@@ -1029,20 +859,20 @@ export class SqliteStore {
           `UPDATE profile_publish_jobs
            SET status = 'queued', lease_owner = NULL, lease_token = NULL,
                lease_expires_at = NULL, updated_at = ?
-           WHERE guild_id = ? AND status = 'leased'
+           WHERE status = 'leased'
              AND (lease_expires_at IS NULL OR lease_expires_at <= ?)`,
         )
-        .run(timestamp, input.guildId, timestamp);
+        .run(timestamp, timestamp);
 
       const rows = this.#database
         .prepare(
           `SELECT operation_id
            FROM profile_publish_jobs
-           WHERE guild_id = ? AND status = 'queued'
+           WHERE status = 'queued'
            ORDER BY created_at, operation_id
            LIMIT ?`,
         )
-        .all(input.guildId, limit) as unknown as Array<{ operation_id: string }>;
+        .all(limit) as unknown as Array<{ operation_id: string }>;
 
       if (rows.length === 0) {
         return [];
@@ -1270,17 +1100,17 @@ export class SqliteStore {
     });
   }
 
-  recoverPublicationLeases(guildId: string) {
+  recoverPublicationLeases() {
     const timestamp = this.#timestamp();
     const result = this.#database
       .prepare(
         `UPDATE profile_publish_jobs
          SET status = 'queued', lease_owner = NULL, lease_token = NULL,
              lease_expires_at = NULL, updated_at = ?
-         WHERE guild_id = ? AND status = 'leased'
+         WHERE status = 'leased'
            AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
       )
-      .run(timestamp, guildId, timestamp);
+      .run(timestamp, timestamp);
 
     return Number(result.changes);
   }
@@ -1330,52 +1160,14 @@ export class SqliteStore {
       if (
         binding.status !== 'provisioning'
         || binding.provisioningOperationId !== input.operationId
-        || binding.pendingAdminAction
       ) {
         throw new PublicationJobConflictError(
           'The profile registration changed before it could be queued.',
         );
       }
-    } else if (binding.status !== 'active' && binding.status !== 'revoked') {
+    } else if (binding.status !== 'active') {
       throw new PublicationJobConflictError(
         'The profile binding is not available for another website update.',
-      );
-    }
-
-    if (
-      input.action !== 'PROFILE_CREATE'
-      && !input.context.adminAction
-      && input.context.actorUserId === input.context.targetUserId
-      && binding.status !== 'active'
-    ) {
-      throw new PublicationJobConflictError(
-        'A revoked profile cannot queue a member-initiated website update.',
-      );
-    }
-
-    if (input.context.adminAction) {
-      if (input.action !== 'PROFILE_SET_LISTED') {
-        throw new PublicationJobConflictError(
-          'Owner moderation can only queue a profile listing change.',
-        );
-      }
-      if (
-        binding.status !== 'active'
-        || (
-          binding.pendingAdminAction !== undefined
-          && (
-            binding.pendingAdminAction !== input.context.adminAction
-            || binding.pendingAdminOperationId !== input.operationId
-          )
-        )
-      ) {
-        throw new PublicationJobConflictError(
-          'Only an available active profile can begin owner moderation.',
-        );
-      }
-    } else if (binding.pendingAdminAction) {
-      throw new PublicationJobConflictError(
-        'An owner moderation action is already pending for this profile.',
       );
     }
 
@@ -1412,32 +1204,6 @@ export class SqliteStore {
   }
 
   #applySuccessfulPublicationBinding(job: ProfilePublicationJob, timestamp: string) {
-    if (job.context.adminAction) {
-      if (job.action !== 'PROFILE_SET_LISTED') {
-        throw new Error('Owner moderation jobs may only publish listing changes.');
-      }
-      const result = this.#database
-        .prepare(
-          `UPDATE profile_bindings
-           SET status = ?, listing_policy = 'force_hidden',
-               pending_admin_action = NULL, pending_admin_operation_id = NULL,
-               updated_at = ?
-           WHERE guild_id = ? AND discord_user_id = ? AND profile_slug = ?
-             AND pending_admin_action = ? AND pending_admin_operation_id = ?`,
-        )
-        .run(
-          job.context.adminAction === 'revoke' ? 'revoked' : 'active',
-          timestamp,
-          job.context.guildId,
-          job.context.targetUserId,
-          job.profileSlug,
-          job.context.adminAction,
-          job.operationId,
-        );
-      assertChanged(result, 'The pending owner moderation state no longer matches the publication job.');
-      return;
-    }
-
     if (job.action === 'PROFILE_CREATE') {
       const result = this.#database
         .prepare(
@@ -1461,34 +1227,13 @@ export class SqliteStore {
     if (
       !binding
       || binding.profileSlug !== job.profileSlug
-      || (binding.status !== 'active' && binding.status !== 'revoked')
-      || binding.pendingAdminAction !== undefined
+      || binding.status !== 'active'
     ) {
       throw new Error('The profile binding no longer matches the publication job.');
     }
   }
 
   #cleanupFailedPublicationBinding(job: ProfilePublicationJob, timestamp: string) {
-    if (job.context.adminAction) {
-      const result = this.#database
-        .prepare(
-          `UPDATE profile_bindings
-           SET pending_admin_action = NULL, pending_admin_operation_id = NULL, updated_at = ?
-           WHERE guild_id = ? AND discord_user_id = ? AND profile_slug = ?
-             AND pending_admin_action = ? AND pending_admin_operation_id = ?`,
-        )
-        .run(
-          timestamp,
-          job.context.guildId,
-          job.context.targetUserId,
-          job.profileSlug,
-          job.context.adminAction,
-          job.operationId,
-        );
-      assertChanged(result, 'The failed owner moderation state no longer matches the publication job.');
-      return;
-    }
-
     if (job.action === 'PROFILE_CREATE') {
       const result = this.#database
         .prepare(
@@ -1588,7 +1333,6 @@ export class SqliteStore {
           operationId: job.operationId,
           targetUserId: job.context.targetUserId,
           queueAttempts: job.attempts,
-          ...(job.context.adminAction ? { adminAction: job.context.adminAction } : {}),
           ...(deploymentStatus === 'failed' ? { error: value } : {}),
         }),
         timestamp,
@@ -1622,12 +1366,7 @@ export class SqliteStore {
         guild_id TEXT NOT NULL,
         discord_user_id TEXT NOT NULL,
         profile_slug TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('provisioning', 'active', 'revoked')),
-        listing_policy TEXT NOT NULL DEFAULT 'user_controlled'
-          CHECK (listing_policy IN ('user_controlled', 'force_hidden')),
-        pending_admin_action TEXT
-          CHECK (pending_admin_action IS NULL OR pending_admin_action IN ('hide', 'revoke')),
-        pending_admin_operation_id TEXT,
+        status TEXT NOT NULL CHECK (status IN ('provisioning', 'active')),
         provisioning_operation_id TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -1681,8 +1420,6 @@ export class SqliteStore {
         interaction_id TEXT NOT NULL,
         receipt_kind TEXT NOT NULL,
         staged_photo_id TEXT,
-        admin_action TEXT
-          CHECK (admin_action IS NULL OR admin_action IN ('hide', 'revoke')),
         profile_slug TEXT NOT NULL,
         action TEXT NOT NULL CHECK (action IN (
           'PROFILE_CREATE', 'PROFILE_UPDATE', 'PROFILE_REPLACE_PHOTO',
@@ -1735,16 +1472,60 @@ export class SqliteStore {
         ON profile_publish_jobs (guild_id, status, created_at, operation_id);
     `);
 
-    this.#database.exec(`
-      DROP INDEX IF EXISTS idx_publish_jobs_nonterminal_profile;
-      CREATE UNIQUE INDEX idx_publish_jobs_nonterminal_profile
-        ON profile_publish_jobs (guild_id, profile_slug)
-        WHERE status IN ('queued', 'leased') OR (status = 'completed' AND applied_at IS NULL);
-    `);
-
     const bindingColumns = this.#database
       .prepare('PRAGMA table_info(profile_bindings)')
       .all() as unknown as Array<{ name: string }>;
+
+    const publicationJobColumns = this.#database
+      .prepare('PRAGMA table_info(profile_publish_jobs)')
+      .all() as unknown as Array<{ name: string }>;
+
+    if (publicationJobColumns.some((column) => column.name === 'admin_action')) {
+      const removedAt = this.#timestamp();
+      const removedResponse = JSON.stringify({
+        code: 'feature_removed',
+        message: 'The profile administration feature was removed.',
+      });
+      this.#database
+        .prepare(
+          `UPDATE interaction_receipts
+           SET status = 'failed', response_json = ?, updated_at = ?
+           WHERE status = 'processing' AND interaction_id IN (
+             SELECT interaction_id FROM profile_publish_jobs
+             WHERE admin_action IS NOT NULL
+           )`,
+        )
+        .run(removedResponse, removedAt);
+      this.#database
+        .prepare(
+          `UPDATE profile_publish_jobs
+           SET status = 'failed', error_json = ?, result_json = NULL,
+               lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+               completed_at = ?, applied_at = ?, updated_at = ?
+           WHERE admin_action IS NOT NULL
+             AND (status IN ('queued', 'leased')
+               OR (status = 'completed' AND applied_at IS NULL))`,
+        )
+        .run(removedResponse, removedAt, removedAt, removedAt);
+      this.#database.exec('ALTER TABLE profile_publish_jobs DROP COLUMN admin_action');
+    }
+
+    if (bindingColumns.some((column) => column.name === 'pending_admin_action')) {
+      this.#database.exec(
+        "UPDATE profile_bindings SET status = 'active' WHERE status = 'revoked'",
+      );
+      this.#database.exec('ALTER TABLE profile_bindings DROP COLUMN pending_admin_action');
+    }
+
+    if (bindingColumns.some((column) => column.name === 'pending_admin_operation_id')) {
+      this.#database.exec(
+        'ALTER TABLE profile_bindings DROP COLUMN pending_admin_operation_id',
+      );
+    }
+
+    if (bindingColumns.some((column) => column.name === 'listing_policy')) {
+      this.#database.exec('ALTER TABLE profile_bindings DROP COLUMN listing_policy');
+    }
 
     if (!bindingColumns.some((column) => column.name === 'provisioning_operation_id')) {
       this.#database.exec(
@@ -1752,23 +1533,19 @@ export class SqliteStore {
       );
     }
 
-    if (!bindingColumns.some((column) => column.name === 'listing_policy')) {
-      this.#database.exec(
-        "ALTER TABLE profile_bindings ADD COLUMN listing_policy TEXT NOT NULL DEFAULT 'user_controlled'",
-      );
-    }
+    this.#database.exec(`
+      DROP INDEX IF EXISTS idx_profile_bindings_global_slug;
 
-    if (!bindingColumns.some((column) => column.name === 'pending_admin_action')) {
-      this.#database.exec(
-        'ALTER TABLE profile_bindings ADD COLUMN pending_admin_action TEXT',
-      );
-    }
+      DROP INDEX IF EXISTS idx_publish_jobs_claim;
+      CREATE INDEX idx_publish_jobs_claim
+        ON profile_publish_jobs (status, created_at, operation_id);
 
-    if (!bindingColumns.some((column) => column.name === 'pending_admin_operation_id')) {
-      this.#database.exec(
-        'ALTER TABLE profile_bindings ADD COLUMN pending_admin_operation_id TEXT',
-      );
-    }
+      DROP INDEX IF EXISTS idx_publish_jobs_nonterminal_profile;
+      CREATE UNIQUE INDEX idx_publish_jobs_nonterminal_profile
+        ON profile_publish_jobs (guild_id, profile_slug)
+        WHERE status IN ('queued', 'leased') OR (status = 'completed' AND applied_at IS NULL);
+    `);
+
   }
 
   #upsertProfileState(input: ProfileStateInput) {
@@ -1804,9 +1581,6 @@ type BindingRow = {
   discord_user_id: string;
   profile_slug: string;
   status: BindingStatus;
-  listing_policy: ListingPolicy;
-  pending_admin_action: PendingAdminAction | null;
-  pending_admin_operation_id: string | null;
   provisioning_operation_id: string | null;
   created_at: string;
   updated_at: string;
@@ -1854,7 +1628,6 @@ type PublicationJobRow = {
   interaction_id: string;
   receipt_kind: string;
   staged_photo_id: string | null;
-  admin_action: PendingAdminAction | null;
   profile_slug: string;
   action: PublicationJobAction;
   profile_json: string;
@@ -1878,7 +1651,7 @@ type PublicationJobRow = {
 
 const PUBLICATION_JOB_SELECT = `SELECT
   operation_id, guild_id, actor_user_id, target_user_id, interaction_id, receipt_kind,
-  staged_photo_id, admin_action, profile_slug, action, profile_json, profile_expected_sha,
+  staged_photo_id, profile_slug, action, profile_json, profile_expected_sha,
   photo_kind, photo_bytes, photo_expected_sha, status, attempts,
   lease_owner, lease_token, lease_generation, lease_expires_at,
   error_json, result_json, created_at, updated_at, completed_at, applied_at
@@ -1890,21 +1663,12 @@ function mapBinding(row: BindingRow): ProfileBinding {
     discordUserId: row.discord_user_id,
     profileSlug: row.profile_slug,
     status: row.status,
-    listingPolicy: row.listing_policy,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 
   if (row.provisioning_operation_id !== null) {
     binding.provisioningOperationId = row.provisioning_operation_id;
-  }
-
-  if (row.pending_admin_action !== null) {
-    binding.pendingAdminAction = row.pending_admin_action;
-  }
-
-  if (row.pending_admin_operation_id !== null) {
-    binding.pendingAdminOperationId = row.pending_admin_operation_id;
   }
 
   return binding;
@@ -1975,10 +1739,6 @@ function mapPublicationJob(row: PublicationJobRow): ProfilePublicationJob {
   if (row.staged_photo_id !== null) {
     context.stagedPhotoId = row.staged_photo_id;
   }
-  if (row.admin_action !== null) {
-    context.adminAction = row.admin_action;
-  }
-
   const job: ProfilePublicationJob = {
     operationId: row.operation_id,
     context,
@@ -2056,7 +1816,6 @@ function assertSamePublicationRequest(
     && existing.context.interactionId === input.context.interactionId
     && existing.context.receiptKind === input.context.receiptKind
     && existing.context.stagedPhotoId === input.context.stagedPhotoId
-    && existing.context.adminAction === input.context.adminAction
     && existing.profileSlug === input.profileSlug
     && existing.action === input.action
     && existing.profileJson === input.profileJson

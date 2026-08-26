@@ -39,9 +39,9 @@ class CountingSqliteStore extends SqliteStore {
     return super.getPublicationJobOutcome(operationId);
   }
 
-  override listPublicationRecoveryCandidates(guildId: string) {
+  override listPublicationRecoveryCandidates() {
     this.recoveryCandidateReads += 1;
-    return super.listPublicationRecoveryCandidates(guildId);
+    return super.listPublicationRecoveryCandidates();
   }
 }
 
@@ -56,7 +56,6 @@ test('twenty foreground publications coalesce into one durable batch and apply a
   };
   const publisher = new QueuedProfilePublisher({
     store,
-    guildId: 'production-guild',
     backend,
     batchWindowMs: 20,
     foregroundWaitMs: 1_000,
@@ -70,7 +69,8 @@ test('twenty foreground publications coalesce into one durable batch and apply a
       const interactionId = `interaction-${suffix}`;
       const userId = `user-${suffix}`;
       const slug = `member-${suffix}`;
-      store.reserveBinding('production-guild', userId, slug, operationId);
+      const guildId = 'production-guild';
+      store.reserveBinding(guildId, userId, slug, operationId);
       assert.equal(store.beginInteraction(interactionId, operationId, 'PROFILE_CREATE'), true);
       return {
         input: {
@@ -80,7 +80,7 @@ test('twenty foreground publications coalesce into one durable batch and apply a
           profile: { json: JSON.stringify({ name: `Member ${suffix}` }), expectedSha: null },
         },
         context: {
-          guildId: 'production-guild',
+          guildId,
           actorUserId: userId,
           targetUserId: userId,
           interactionId,
@@ -98,7 +98,7 @@ test('twenty foreground publications coalesce into one durable batch and apply a
     assert.equal(batches[0]?.length, 20);
     assert.deepEqual(batches[0]?.map((input) => input.slug), operations.map(({ input }) => input.slug));
     assert.ok(results.every((result) => result.status === 'deployed' && result.stateApplied === true));
-    assert.equal(store.countNonterminalPublicationJobs('production-guild'), 0);
+    assert.equal(store.countNonterminalPublicationJobs(), 0);
 
     for (const { input, context } of operations) {
       const job = store.getPublicationJob(input.operationId);
@@ -128,14 +128,12 @@ test('two workers compete for a queue without publishing any job twice', async (
   };
   const first = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     backend,
     workerId: 'worker-one',
     batchWindowMs: 0,
   });
   const second = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     backend,
     workerId: 'worker-two',
     batchWindowMs: 0,
@@ -209,7 +207,6 @@ test('startup recovery waits for lease expiry before reclaiming a photo job from
       },
     });
     store.claimPublicationJobs({
-      guildId: 'production-guild',
       workerId: 'crashed-worker',
       leaseToken: 'crashed-lease',
       leaseExpiresAt: new Date('2026-08-21T00:05:00.000Z'),
@@ -219,7 +216,6 @@ test('startup recovery waits for lease expiry before reclaiming a photo job from
     store = new SqliteStore(databasePath, { now: () => now });
     const worker = new ProfilePublishWorker({
       store,
-      guildId: 'production-guild',
       batchWindowMs: 0,
       now: () => now,
       backend: {
@@ -265,7 +261,6 @@ test('an idle worker wakes itself when another process lease expires', async () 
   const store = new SqliteStore(':memory:');
   prepareRegistrationJob(store, 'lease-timer');
   store.claimPublicationJobs({
-    guildId: 'production-guild',
     workerId: 'crashed-worker',
     leaseToken: 'crashed-token',
     leaseExpiresAt: new Date(Date.now() + 200),
@@ -273,7 +268,6 @@ test('an idle worker wakes itself when another process lease expires', async () 
   let backendCalls = 0;
   const worker = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     batchWindowMs: 0,
     retryDelayMs: 5,
     backend: {
@@ -302,7 +296,6 @@ test('recovery delay reads only the lightweight nonterminal projection', async (
   store.fullJobListReads = 0;
   const worker = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     batchWindowMs: 0,
     retryDelayMs: 123,
     backend: {
@@ -335,7 +328,6 @@ test('recorded GitHub success is applied after restart without publishing twice'
   };
   const first = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     backend,
     batchWindowMs: 0,
   });
@@ -349,7 +341,7 @@ test('recorded GitHub success is applied after restart without publishing twice'
     const recorded = store.getPublicationJob('recorded-operation');
     assert.equal(recorded?.status, 'completed');
     assert.equal(recorded?.appliedAt, undefined);
-    assert.equal(store.countNonterminalPublicationJobs('production-guild'), 1);
+    assert.equal(store.countNonterminalPublicationJobs(), 1);
     assert.equal(store.getBinding('production-guild', 'recorded-user')?.status, 'provisioning');
     assert.equal(store.getInteractionReceipt('recorded-interaction')?.status, 'processing');
 
@@ -357,7 +349,6 @@ test('recorded GitHub success is applied after restart without publishing twice'
     store.applyRecordedPublicationBatchSuccess = applyRecorded;
     const recovered = new ProfilePublishWorker({
       store,
-      guildId: 'production-guild',
       backend,
       batchWindowMs: 0,
     });
@@ -369,7 +360,7 @@ test('recorded GitHub success is applied after restart without publishing twice'
 
     assert.equal(backendCalls, 1);
     assert.ok(store.getPublicationJob('recorded-operation')?.appliedAt);
-    assert.equal(store.countNonterminalPublicationJobs('production-guild'), 0);
+    assert.equal(store.countNonterminalPublicationJobs(), 0);
     assert.equal(store.getBinding('production-guild', 'recorded-user')?.status, 'active');
     assert.equal(store.getInteractionReceipt('recorded-interaction')?.status, 'completed');
   } finally {
@@ -395,7 +386,6 @@ test('a local apply failure retries in the same process without republishing', a
   const drainStates: string[] = [];
   const worker = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     batchWindowMs: 0,
     retryDelayMs: 5,
     onDrainError: () => drainStates.push('error'),
@@ -422,47 +412,6 @@ test('a local apply failure retries in the same process without republishing', a
   }
 });
 
-test('successful owner update preserves a revoked binding while applying local state', async () => {
-  const store = new SqliteStore(':memory:');
-  createActiveProfile(store, 'production-guild', 'revoked-user', 'revoked-member');
-  store.setBindingStatus('production-guild', 'revoked-user', 'revoked');
-  store.beginInteraction('revoked-interaction', 'revoked-operation', 'PROFILE_UPDATE');
-  store.enqueuePublicationJob({
-    operationId: 'revoked-operation',
-    context: {
-      ...publicationContext('revoked-user', 'revoked-interaction', 'PROFILE_UPDATE'),
-      actorUserId: 'owner',
-    },
-    profileSlug: 'revoked-member',
-    action: 'PROFILE_UPDATE',
-    profileJson: '{"name":"Revoked Member","order":3}',
-    profileExpectedSha: 'before-revoked-member',
-  });
-  const worker = new ProfilePublishWorker({
-    store,
-    guildId: 'production-guild',
-    batchWindowMs: 0,
-    backend: {
-      async publishBatch(inputs) {
-        return inputs.map((input) => successfulResult(input, 'revoked-update-commit'));
-      },
-    },
-  });
-
-  try {
-    await worker.drain();
-    assert.equal(store.getBinding('production-guild', 'revoked-user')?.status, 'revoked');
-    assert.equal(
-      store.getProfileState('production-guild', 'revoked-member')?.profileJson,
-      '{"name":"Revoked Member","order":3}',
-    );
-    assert.ok(store.getPublicationJob('revoked-operation')?.appliedAt);
-  } finally {
-    await worker.stop();
-    store.close();
-  }
-});
-
 test('ambiguous publisher errors stay queued without rolling back domain state', async () => {
   const store = new SqliteStore(':memory:');
   const ambiguous = Object.assign(new Error('publication deadline elapsed'), {
@@ -470,7 +419,6 @@ test('ambiguous publisher errors stay queued without rolling back domain state',
   });
   const worker = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     batchWindowMs: 0,
     retryDelayMs: 60_000,
     backend: {
@@ -494,7 +442,7 @@ test('ambiguous publisher errors stay queued without rolling back domain state',
     });
     assert.equal(store.getBinding('production-guild', 'ambiguous-user')?.status, 'provisioning');
     assert.equal(store.getInteractionReceipt('ambiguous-interaction')?.status, 'processing');
-    assert.equal(store.countNonterminalPublicationJobs('production-guild'), 1);
+    assert.equal(store.countNonterminalPublicationJobs(), 1);
   } finally {
     worker.stop();
     store.close();
@@ -505,7 +453,6 @@ test('a malformed batch result is released for retry instead of stranding its le
   const store = new SqliteStore(':memory:');
   const worker = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     batchWindowMs: 0,
     retryDelayMs: 60_000,
     backend: {
@@ -540,7 +487,6 @@ test('definite pre-publication failures atomically fail the receipt and release 
   const definite = Object.assign(new Error('profile input was rejected'), { code: 'invalid_input' });
   const worker = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     batchWindowMs: 0,
     backend: {
       async publishBatch() {
@@ -585,7 +531,6 @@ test('foreground publishing polls a lightweight outcome, returns queued, then ex
   };
   const publisher = new QueuedProfilePublisher({
     store,
-    guildId: 'production-guild',
     backend,
     batchWindowMs: 0,
     foregroundWaitMs: 10,
@@ -655,7 +600,6 @@ test('stop waits for the claimed batch and prevents any later claim', async () =
   });
   const worker = new ProfilePublishWorker({
     store,
-    guildId: 'production-guild',
     batchWindowMs: 0,
     backend: {
       async publishBatch(inputs) {

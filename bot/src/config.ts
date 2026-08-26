@@ -26,7 +26,6 @@ export type PublicationConfig =
     }
   | {
       mode: 'production';
-      productionGuildId: string;
       sandboxDirectory: string;
       github: GitHubConfig;
     };
@@ -48,7 +47,6 @@ export type AppConfig = {
   discord: {
     applicationId: string;
     botToken: string;
-    ownerUserId: string;
   };
   publication: PublicationConfig;
 };
@@ -82,7 +80,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     discord: {
       applicationId: requireValue(env, 'DISCORD_APPLICATION_ID'),
       botToken: requireValue(env, 'DISCORD_BOT_TOKEN'),
-      ownerUserId: requireValue(env, 'DISCORD_OWNER_USER_ID'),
     },
     publication,
   };
@@ -201,14 +198,8 @@ function loadPublicationConfig(
     };
   }
 
-  const productionGuildId = parseSnowflake(
-    requireValue(env, 'PROFILE_PRODUCTION_GUILD_ID'),
-    'PROFILE_PRODUCTION_GUILD_ID',
-  );
-
   return {
     mode,
-    productionGuildId,
     sandboxDirectory,
     github: {
       appId: parsePositiveInteger(requireValue(env, 'GITHUB_APP_ID'), 'GITHUB_APP_ID'),
@@ -224,14 +215,6 @@ function loadPublicationConfig(
       deployWorkflow: env.GITHUB_DEPLOY_WORKFLOW?.trim() || 'deploy.yml',
     },
   };
-}
-
-function parseSnowflake(value: string, name: string) {
-  if (!/^\d{17,20}$/.test(value)) {
-    throw new ConfigurationError(`${name} must be a Discord snowflake.`);
-  }
-
-  return value;
 }
 
 function parsePublicationMode(value: string | undefined): 'sandbox' | 'production' {

@@ -100,7 +100,7 @@ async function run() {
   const healthApp = createHealthApp(() => ({
     ...health,
     queuedPublications: config.publication.mode === 'production'
-      ? store.countNonterminalPublicationJobs(config.publication.productionGuildId)
+      ? store.countNonterminalPublicationJobs()
       : 0,
   }));
   const healthServer = startHealthServer({ fetch: healthApp.fetch, port: config.port });
@@ -137,12 +137,10 @@ async function run() {
     stagedRecovery = store.recoverInterruptedStagedPhotos();
     const profileRuntimes = new GuildProfileRuntimeRegistry({
       store,
-      ownerUserId: config.discord.ownerUserId,
       sandboxDirectory: config.publication.sandboxDirectory,
       ...(publication && config.publication.mode === 'production'
         ? {
             production: {
-              guildId: config.publication.productionGuildId,
               publisher: publication.publisher,
               repositoryReader: publication.repositoryReader,
               ...(publication.checkpointLookup
@@ -163,7 +161,6 @@ async function run() {
           config: {
             applicationId: config.discord.applicationId,
             guildId,
-            ownerUserId: config.discord.ownerUserId,
             publicationMode: runtime.publicationMode,
           },
           service: runtime.service,
@@ -212,10 +209,7 @@ async function run() {
     health.gateway = 'ready';
 
     const productionQueueRuntime = publication && config.publication.mode === 'production'
-      ? {
-          guildId: config.publication.productionGuildId,
-          queue: publication.queue,
-        }
+      ? { queue: publication.queue }
       : undefined;
     const recoverProductionQueue = async () => {
       if (!productionQueueRuntime) {
@@ -223,9 +217,7 @@ async function run() {
       }
       await finishPublicationQueueStartup({
         drain: () => productionQueueRuntime.queue.drain(),
-        countRemaining: () => store.countNonterminalPublicationJobs(
-          productionQueueRuntime.guildId,
-        ),
+        countRemaining: () => store.countNonterminalPublicationJobs(),
         nextAttemptDelayMs: () => productionQueueRuntime.queue.nextRecoveryDelayMs(),
         onAttemptError: (error) => reportError(
           error,
@@ -269,8 +261,8 @@ async function run() {
 
     process.stdout.write(
       `GRASP profile bot ready; ${config.publication.mode === 'production'
-        ? `guild ${config.publication.productionGuildId} is production and all other guilds are sandboxed`
-        : 'all guilds are sandboxed'}; `
+        ? 'website publishing is enabled'
+        : 'sandbox publishing is enabled'}; `
         + `${commandSync.commandCount} global command(s) ${commandSync.changed ? 'updated' : 'already current'}.\n`,
     );
     if (recoveredPublicationLeases > 0) {
@@ -476,7 +468,6 @@ async function createProductionPublicationRuntime(
   });
   const queue = new QueuedProfilePublisher({
     store,
-    guildId: config.publication.productionGuildId,
     backend: githubPublisher,
     onDrainError: callbacks.onDrainError,
     onDrainHealthy: callbacks.onDrainHealthy,

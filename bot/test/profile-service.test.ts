@@ -16,7 +16,6 @@ import {
 import { SqliteStore } from '../src/storage/sqlite-store.js';
 
 const guildId = 'guild';
-const ownerUserId = 'owner';
 
 class RecordingPublisher implements ProfilePublisher {
   readonly calls: ProfilePublishInput[] = [];
@@ -82,7 +81,6 @@ function createFixture(options: { repositoryReader?: ProfileRepositoryReader } =
     publisher,
     ...(options.repositoryReader ? { repositoryReader: options.repositoryReader } : {}),
     guildId,
-    ownerUserId,
     membersPageUrl: 'https://grasp-kaist.github.io/members/',
     now: () => new Date('2026-08-21T00:00:00.000Z'),
     newOperationId: () => `operation-${++operationSequence}`,
@@ -334,7 +332,6 @@ test('a second service cannot steal a fresh provisioning binding while publicati
     store,
     publisher,
     guildId,
-    ownerUserId,
     now: () => new Date('2026-08-21T00:00:00.000Z'),
     newOperationId: () => 'second-operation',
   });
@@ -520,16 +517,6 @@ test('a durable publication job blocks every conflicting profile mutation withou
       () => service.confirmOwnPhoto(actor('blocked-photo-confirm'), 'staged-before-queue'),
       () => service.discardOwnPhoto(actor('blocked-photo-discard'), 'staged-before-queue'),
       () => service.removeOwnPhoto(actor('blocked-photo-remove'), currentRevision(service)),
-      () => service.ownerSetCategory(actor('blocked-category', ownerUserId), 'member', 3),
-      () => service.ownerHide(actor('blocked-hide', ownerUserId), 'member'),
-      () => service.ownerRevoke(actor('blocked-revoke', ownerUserId), 'member'),
-      () => service.ownerUnhide(actor('blocked-unhide', ownerUserId), 'member'),
-      () => service.ownerRestore(actor('blocked-restore', ownerUserId), 'member'),
-      () => service.ownerTransfer(
-        actor('blocked-transfer', ownerUserId),
-        'member',
-        'new-member',
-      ),
     ];
 
     for (const mutate of blockedMutations) {
@@ -543,7 +530,6 @@ test('a durable publication job blocks every conflicting profile mutation withou
 
     assert.deepEqual(store.getBinding(guildId, 'member'), bindingBefore);
     assert.deepEqual(store.getProfileState(guildId, 'example-member'), stateBefore);
-    assert.equal(store.getBinding(guildId, 'new-member'), undefined);
     assert.equal(store.getPublicationJob('durable-operation')?.status, 'queued');
     assert.equal(
       store.getStagedPhoto(guildId, 'member', 'staged-before-queue')?.status,
@@ -794,396 +780,6 @@ test('photo confirmation cannot cross Discord accounts and removal deletes the e
   }
 });
 
-test('owner recovery is runtime-guarded and revoked users cannot edit', async () => {
-  const { store, service } = createFixture();
-
-  try {
-    await registerMember(service);
-    await assert.rejects(
-      () => service.ownerRevoke(actor('bad-owner'), 'member'),
-      (error: unknown) => error instanceof ProfileServiceError && error.code === 'owner_only',
-    );
-
-    const revoked = await service.ownerRevoke(actor('revoke', ownerUserId), 'member');
-    assert.equal(revoked.snapshot?.bindingStatus, 'revoked');
-    await assert.rejects(
-      () => service.updateOwnProfile(
-        actor('revoked-edit'),
-        { name: 'Blocked' },
-        currentRevision(service),
-      ),
-      (error: unknown) => error instanceof ProfileServiceError && error.code === 'profile_revoked',
-    );
-
-    await service.ownerRestore(actor('restore', ownerUserId), 'member');
-    const transferred = await service.ownerTransfer(
-      actor('transfer', ownerUserId),
-      'member',
-      'new-member',
-    );
-    assert.equal(transferred.snapshot?.bindingStatus, 'active');
-    assert.equal(store.getBinding(guildId, 'new-member')?.profileSlug, 'example-member');
-  } finally {
-    store.close();
-  }
-});
-
-test('owner hide prevents relisting until an explicit owner unhide', async () => {
-  const { store, publisher, service } = createFixture();
-
-  try {
-    await registerMember(service);
-    await service.setOwnListed(actor('list-before-hide'), true, currentRevision(service));
-
-    const hidden = await service.ownerHide(actor('owner-hide', ownerUserId), 'member');
-    assert.equal(hidden.snapshot?.profile.listed, false);
-    assert.equal(hidden.snapshot?.listingPolicy, 'force_hidden');
-    assert.equal(store.getBinding(guildId, 'member')?.listingPolicy, 'force_hidden');
-
-    const callsBeforeBlockedRelist = publisher.calls.length;
-    await assert.rejects(
-      () => service.setOwnListed(actor('blocked-relist'), true, currentRevision(service)),
-      (error: unknown) =>
-        error instanceof ProfileServiceError && error.code === 'visibility_locked',
-    );
-    assert.equal(publisher.calls.length, callsBeforeBlockedRelist);
-
-    const unhidden = await service.ownerUnhide(actor('owner-unhide', ownerUserId), 'member');
-    assert.equal(unhidden.snapshot?.listingPolicy, 'user_controlled');
-    assert.equal(unhidden.snapshot?.profile.listed, false);
-
-    const relisted = await service.setOwnListed(
-      actor('relist-after-unhide'),
-      true,
-      currentRevision(service),
-    );
-    assert.equal(relisted.snapshot?.profile.listed, true);
-  } finally {
-    store.close();
-  }
-});
-
-test('owner revoke remains pending and active until the hidden profile publish succeeds', async () => {
-  const { store, publisher, service } = createFixture();
-  const releasePublish = Promise.withResolvers<void>();
-
-  try {
-    await registerMember(service);
-    await service.setOwnListed(actor('list-before-revoke'), true, currentRevision(service));
-    publisher.pauseNext = releasePublish.promise;
-
-    const revoke = service.ownerRevoke(actor('owner-revoke', ownerUserId), 'member');
-    while (publisher.calls.length < 3) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-
-    const pending = store.getBinding(guildId, 'member');
-    assert.equal(pending?.status, 'active');
-    assert.equal(pending?.listingPolicy, 'user_controlled');
-    assert.equal(pending?.pendingAdminAction, 'revoke');
-    assert.equal(
-      JSON.parse(store.getProfileState(guildId, 'example-member')!.profileJson).listed,
-      true,
-    );
-
-    releasePublish.resolve();
-    const revoked = await revoke;
-    assert.equal(revoked.snapshot?.profile.listed, false);
-    assert.equal(revoked.snapshot?.bindingStatus, 'revoked');
-    assert.equal(revoked.snapshot?.listingPolicy, 'force_hidden');
-    assert.equal(store.getBinding(guildId, 'member')?.pendingAdminAction, undefined);
-    assert.equal(JSON.parse(publisher.calls[2]!.profile.json).listed, false);
-  } finally {
-    releasePublish.resolve();
-    store.close();
-  }
-});
-
-test('durable owner moderation lets the queue atomically create the pending admin state', async () => {
-  const store = new SqliteStore(':memory:', {
-    now: () => new Date('2026-08-21T00:00:00.000Z'),
-  });
-  let operationSequence = 0;
-  const publisher: ProfilePublisher = {
-    usesDurableQueue: true,
-    async publish(input, context) {
-      assert.ok(context);
-      store.enqueuePublicationJob({
-        operationId: input.operationId,
-        context: {
-          guildId: context.guildId,
-          actorUserId: context.actorUserId,
-          targetUserId: context.targetUserId,
-          interactionId: context.interactionId,
-          receiptKind: context.receiptKind,
-          ...(context.adminAction ? { adminAction: context.adminAction } : {}),
-        },
-        profileSlug: input.slug,
-        action: input.action,
-        profileJson: input.profile.json,
-        profileExpectedSha: input.profile.expectedSha,
-      });
-      return { status: 'queued', operationId: input.operationId, attempts: 0 };
-    },
-  };
-  const service = new ProfileService({
-    store,
-    publisher,
-    guildId,
-    ownerUserId,
-    newOperationId: () => `durable-owner-${++operationSequence}`,
-  });
-
-  try {
-    store.reserveBinding(guildId, 'member', 'example-member');
-    store.activateBinding(guildId, 'member');
-    store.saveProfileState({
-      guildId,
-      profileSlug: 'example-member',
-      profileJson: JSON.stringify(profileSnapshot({ listed: true })),
-      profileBlobSha: 'profile-before',
-      lastDeploymentStatus: 'deployed',
-    });
-
-    const result = await service.ownerHide(actor('durable-owner-hide', ownerUserId), 'member');
-
-    assert.equal(result.queued, true);
-    assert.equal(store.getBinding(guildId, 'member')?.pendingAdminAction, 'hide');
-    assert.equal(
-      store.getBinding(guildId, 'member')?.pendingAdminOperationId,
-      result.operationId,
-    );
-    assert.equal(store.getPublicationJob(result.operationId!)?.status, 'queued');
-  } finally {
-    store.close();
-  }
-});
-
-test('a definitely unpublished revoke failure leaves the binding active and visible', async () => {
-  const { store, publisher, service } = createFixture();
-
-  try {
-    await registerMember(service);
-    await service.setOwnListed(actor('list-before-failed-revoke'), true, currentRevision(service));
-    publisher.failNext = Object.assign(new Error('validation failed'), {
-      code: 'validation_failed',
-    });
-
-    await assert.rejects(
-      () => service.ownerRevoke(actor('failed-revoke', ownerUserId), 'member'),
-      /validation failed/,
-    );
-
-    const binding = store.getBinding(guildId, 'member');
-    assert.equal(binding?.status, 'active');
-    assert.equal(binding?.listingPolicy, 'user_controlled');
-    assert.equal(binding?.pendingAdminAction, undefined);
-    assert.equal(
-      JSON.parse(store.getProfileState(guildId, 'example-member')!.profileJson).listed,
-      true,
-    );
-  } finally {
-    store.close();
-  }
-});
-
-test('owner restore recovers editing but preserves the force-hidden listing policy', async () => {
-  const { store, publisher, service } = createFixture();
-
-  try {
-    await registerMember(service);
-    await service.setOwnListed(actor('list-before-restore-test'), true, currentRevision(service));
-    await service.ownerRevoke(actor('revoke-before-restore', ownerUserId), 'member');
-
-    const restored = await service.ownerRestore(actor('owner-restore', ownerUserId), 'member');
-    assert.equal(restored.snapshot?.bindingStatus, 'active');
-    assert.equal(restored.snapshot?.listingPolicy, 'force_hidden');
-    assert.equal(restored.snapshot?.profile.listed, false);
-
-    const callsBeforeBlockedRelist = publisher.calls.length;
-    await assert.rejects(
-      () => service.setOwnListed(actor('blocked-restored-relist'), true, currentRevision(service)),
-      (error: unknown) =>
-        error instanceof ProfileServiceError && error.code === 'visibility_locked',
-    );
-    assert.equal(publisher.calls.length, callsBeforeBlockedRelist);
-    assert.equal(store.getBinding(guildId, 'member')?.status, 'active');
-  } finally {
-    store.close();
-  }
-});
-
-for (const pendingAction of ['hide', 'revoke'] as const) {
-  test(`startup recovery completes a pending owner ${pendingAction} from remote proof`, async () => {
-    const { store, publisher, service } = createFixture();
-
-    try {
-      await registerMember(service);
-      await service.setOwnListed(
-        actor(`list-before-pending-${pendingAction}`),
-        true,
-        currentRevision(service),
-      );
-      const operationId = `pending-${pendingAction}-operation`;
-      const interactionId = `pending-${pendingAction}-interaction`;
-      store.beginInteraction(
-        interactionId,
-        operationId,
-        pendingAction === 'revoke' ? 'PROFILE_OWNER_REVOKE' : 'PROFILE_OWNER_HIDE',
-      );
-      store.beginAdminAction(guildId, 'member', pendingAction, operationId);
-      const hiddenProfile = profileSnapshot({ listed: false });
-      const restarted = new ProfileService({
-        store,
-        publisher,
-        repositoryReader: {
-          readProfile: async () => ({
-            profile: hiddenProfile,
-            profileBlobSha: `recovered-${pendingAction}-profile`,
-            commitSha: `recovered-${pendingAction}-commit`,
-            operationId,
-          }),
-        },
-        guildId,
-        ownerUserId,
-        now: () => new Date('2026-08-21T00:01:00.000Z'),
-      });
-
-      const summary = await restarted.reconcileKnownProfiles();
-      assert.deepEqual(summary.issues, []);
-
-      const recovered = store.getBinding(guildId, 'member');
-      assert.equal(recovered?.pendingAdminAction, undefined);
-      assert.equal(recovered?.pendingAdminOperationId, undefined);
-      assert.equal(recovered?.listingPolicy, 'force_hidden');
-      assert.equal(recovered?.status, pendingAction === 'revoke' ? 'revoked' : 'active');
-      assert.equal(
-        JSON.parse(store.getProfileState(guildId, 'example-member')!.profileJson).listed,
-        false,
-      );
-      assert.equal(store.getInteractionReceipt(interactionId)?.status, 'completed');
-    } finally {
-      store.close();
-    }
-  });
-}
-
-test('queued owner-action recovery reuses the original Discord interaction receipt', async () => {
-  const { store, publisher, service } = createFixture();
-
-  try {
-    await registerMember(service);
-    await service.setOwnListed(actor('list-before-queued-hide'), true, currentRevision(service));
-    store.beginInteraction('original-owner-interaction', 'pending-owner-operation', 'PROFILE_OWNER_HIDE');
-    store.beginAdminAction(guildId, 'member', 'hide', 'pending-owner-operation');
-    const restarted = new ProfileService({
-      store,
-      publisher,
-      repositoryReader: {
-        readProfile: async () => ({
-          profile: profileSnapshot({ listed: true }),
-          profileBlobSha: 'remote-visible-profile',
-          commitSha: 'remote-visible-commit',
-          operationId: 'list-operation',
-        }),
-      },
-      guildId,
-      ownerUserId,
-      now: () => new Date('2026-08-21T00:01:00.000Z'),
-    });
-
-    const summary = await restarted.reconcileKnownProfiles();
-
-    assert.deepEqual(summary.issues, []);
-    assert.equal(publisher.contexts.at(-1)?.interactionId, 'original-owner-interaction');
-    assert.equal(publisher.contexts.at(-1)?.receiptKind, 'PROFILE_OWNER_HIDE');
-    assert.equal(store.getInteractionReceipt('original-owner-interaction')?.status, 'completed');
-  } finally {
-    store.close();
-  }
-});
-
-test('owner transfer cannot change ownership during an active profile publication', async () => {
-  const { store, publisher, service } = createFixture();
-  const releasePublish = Promise.withResolvers<void>();
-
-  try {
-    await registerMember(service);
-    const editRevision = currentRevision(service);
-    publisher.pauseNext = releasePublish.promise;
-    const edit = service.updateOwnProfile(actor('edit-before-transfer'), {
-      website: 'in-flight.example',
-    }, editRevision);
-
-    while (publisher.calls.length < 2) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-
-    await assert.rejects(
-      service.ownerTransfer(
-        actor('transfer-while-busy', ownerUserId),
-        'member',
-        'new-member',
-      ),
-      (error: unknown) =>
-        error instanceof ProfileServiceError
-        && error.code === 'profile_busy',
-    );
-    assert.equal(store.getBinding(guildId, 'member')?.profileSlug, 'example-member');
-    assert.equal(store.getBinding(guildId, 'new-member'), undefined);
-
-    releasePublish.resolve();
-    await edit;
-    const transferred = await service.ownerTransfer(
-      actor('transfer-after-edit', ownerUserId),
-      'member',
-      'new-member',
-    );
-    assert.equal(transferred.snapshot?.profileSlug, 'example-member');
-    assert.equal(store.getBinding(guildId, 'member'), undefined);
-    assert.equal(store.getBinding(guildId, 'new-member')?.profileSlug, 'example-member');
-  } finally {
-    releasePublish.resolve();
-    store.close();
-  }
-});
-
-test('owner recovery does not mutate a provisioning binding without profile state', async () => {
-  const { store, service } = createFixture();
-
-  try {
-    store.reserveBinding(guildId, 'pending-member', 'pending-member', 'pending-operation');
-
-    await assert.rejects(
-      () => service.ownerRevoke(actor('pending-revoke', ownerUserId), 'pending-member'),
-      (error: unknown) =>
-        error instanceof ProfileServiceError && error.code === 'profile_state_missing',
-    );
-    assert.equal(store.getBinding(guildId, 'pending-member')?.status, 'provisioning');
-
-    await assert.rejects(
-      () => service.ownerRestore(actor('pending-restore', ownerUserId), 'pending-member'),
-      (error: unknown) =>
-        error instanceof ProfileServiceError && error.code === 'profile_state_missing',
-    );
-    assert.equal(store.getBinding(guildId, 'pending-member')?.status, 'provisioning');
-
-    await assert.rejects(
-      () => service.ownerTransfer(
-        actor('pending-transfer', ownerUserId),
-        'pending-member',
-        'destination-member',
-      ),
-      (error: unknown) =>
-        error instanceof ProfileServiceError && error.code === 'profile_state_missing',
-    );
-    assert.equal(store.getBinding(guildId, 'pending-member')?.status, 'provisioning');
-    assert.equal(store.getBinding(guildId, 'destination-member'), undefined);
-  } finally {
-    store.close();
-  }
-});
-
 test('an interrupted registration is claimed only when its remote operation proof matches', async () => {
   const profile = {
     listed: false,
@@ -1238,7 +834,6 @@ test('an aged provisioning binding with publication evidence survives a transien
     repositoryReader: { readProfile: async () => null },
     checkpointLookup: { load: async () => ({ stage: 'main_updated' }) },
     guildId,
-    ownerUserId,
     now: () => new Date('2026-08-21T00:31:00.000Z'),
   });
 

@@ -506,7 +506,6 @@ test('supports provisioning recovery from metadata after the process restarts', 
     publisher: restartedRepository,
     repositoryReader: restartedRepository,
     guildId,
-    ownerUserId: 'sandbox-owner',
     now: () => new Date('2026-08-26T00:01:00.000Z'),
   });
 

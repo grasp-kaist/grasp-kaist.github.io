@@ -13,7 +13,6 @@ import {
   BindingConflictError,
   PublicationJobConflictError,
   SqliteStore,
-  type PendingAdminAction,
   type ProfileBinding,
   type ProfileState,
   type ProfileStateInput,
@@ -30,9 +29,7 @@ export type DiscordActor = {
 export type ProfileSnapshot = {
   profileSlug: string;
   profile: MemberProfile;
-  bindingStatus: 'provisioning' | 'active' | 'revoked';
-  listingPolicy: 'user_controlled' | 'force_hidden';
-  pendingAdminAction?: PendingAdminAction;
+  bindingStatus: 'provisioning' | 'active';
   stateRevision: string;
   lastCommitSha?: string;
   lastDeploymentStatus?: string;
@@ -114,7 +111,6 @@ export type ProfilePublishContext = {
   interactionId: string;
   receiptKind: string;
   stagedPhotoId?: string;
-  adminAction?: PendingAdminAction;
   awaitCompletion?: boolean;
 };
 
@@ -158,7 +154,6 @@ export class ProfileService {
   readonly #repositoryReader: ProfileRepositoryReader | undefined;
   readonly #checkpointLookup: PublishCheckpointLookup | undefined;
   readonly #guildId: string;
-  readonly #ownerUserId: string;
   readonly #membersPageUrl: string | undefined;
   readonly #now: () => Date;
   readonly #newOperationId: () => string;
@@ -174,7 +169,6 @@ export class ProfileService {
     repositoryReader?: ProfileRepositoryReader;
     checkpointLookup?: PublishCheckpointLookup;
     guildId: string;
-    ownerUserId: string;
     membersPageUrl?: string;
     now?: () => Date;
     newOperationId?: () => string;
@@ -185,7 +179,6 @@ export class ProfileService {
     this.#repositoryReader = options.repositoryReader;
     this.#checkpointLookup = options.checkpointLookup;
     this.#guildId = options.guildId;
-    this.#ownerUserId = options.ownerUserId;
     this.#membersPageUrl = options.membersPageUrl;
     this.#now = options.now ?? (() => new Date());
     this.#newOperationId = options.newOperationId ?? randomUUID;
@@ -228,7 +221,6 @@ export class ProfileService {
       this.#repositoryReader
       && (
         !state
-        || binding.pendingAdminAction
         || this.#profilesNeedingReconciliation.has(profileKey(guildId, binding.profileSlug))
       )
     ) {
@@ -679,213 +671,7 @@ export class ProfileService {
         listed,
       }),
       expectedRevision,
-      listed,
     );
-  }
-
-  async ownerHide(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult> {
-    return this.#ownerForceHidden(actor, targetUserId, 'hide');
-  }
-
-  async ownerRevoke(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult> {
-    return this.#ownerForceHidden(actor, targetUserId, 'revoke');
-  }
-
-  async ownerUnhide(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult> {
-    this.#assertOwner(actor);
-    return this.#runOperation(actor, 'PROFILE_OWNER_UNHIDE', async () => {
-      const initialBinding = this.#requireBinding(actor.guildId, targetUserId);
-      return this.#withProfileOperationLock(
-        actor.guildId,
-        initialBinding.profileSlug,
-        'mutation',
-        async () => {
-          const binding = this.#requireBinding(actor.guildId, targetUserId);
-          this.#assertSameProfileBinding(initialBinding, binding);
-          this.#assertNoPendingPublication(binding);
-          const state = this.#requireState(actor.guildId, binding.profileSlug);
-          if (binding.pendingAdminAction) {
-            throw new ProfileServiceError(
-              'admin_action_pending',
-              'A previous owner moderation action is still being recovered.',
-            );
-          }
-          const updated = this.#store.clearForceHidden(actor.guildId, targetUserId);
-          const result = this.#operationResult(updated, state);
-          this.#audit(actor, binding.profileSlug, 'PROFILE_OWNER_UNHIDE', result, { targetUserId });
-          return result;
-        },
-      );
-    });
-  }
-
-  async ownerRestore(actor: DiscordActor, targetUserId: string): Promise<ProfileOperationResult> {
-    this.#assertOwner(actor);
-    return this.#runOperation(actor, 'PROFILE_OWNER_RESTORE', async () => {
-      const initialBinding = this.#requireBinding(actor.guildId, targetUserId);
-      return this.#withProfileOperationLock(
-        actor.guildId,
-        initialBinding.profileSlug,
-        'mutation',
-        async () => {
-          const binding = this.#requireBinding(actor.guildId, targetUserId);
-          this.#assertSameProfileBinding(initialBinding, binding);
-          this.#assertNoPendingPublication(binding);
-          const state = this.#requireState(actor.guildId, binding.profileSlug);
-          if (binding.pendingAdminAction) {
-            throw new ProfileServiceError(
-              'admin_action_pending',
-              'A previous owner moderation action is still being recovered.',
-            );
-          }
-          const updated = this.#store.setBindingStatus(actor.guildId, targetUserId, 'active');
-          const result = this.#operationResult(updated, state);
-          this.#audit(actor, binding.profileSlug, 'PROFILE_OWNER_RESTORE', result, { targetUserId });
-          return result;
-        },
-      );
-    });
-  }
-
-  async ownerTransfer(
-    actor: DiscordActor,
-    fromUserId: string,
-    toUserId: string,
-  ): Promise<ProfileOperationResult> {
-    this.#assertOwner(actor);
-    return this.#runOperation(actor, 'PROFILE_OWNER_TRANSFER', async () => {
-      const initialSource = this.#requireBinding(actor.guildId, fromUserId);
-      return this.#withProfileOperationLock(
-        actor.guildId,
-        initialSource.profileSlug,
-        'mutation',
-        async () => {
-          const source = this.#requireBinding(actor.guildId, fromUserId);
-          this.#assertSameProfileBinding(initialSource, source);
-          this.#assertNoPendingPublication(source);
-          const state = this.#requireState(actor.guildId, source.profileSlug);
-          const binding = this.#store.transferBinding(actor.guildId, source.profileSlug, toUserId);
-          const result = this.#operationResult(binding, state);
-          this.#audit(actor, source.profileSlug, 'PROFILE_OWNER_TRANSFER', result, {
-            fromUserId,
-            toUserId,
-          });
-          return result;
-        },
-      );
-    });
-  }
-
-  async ownerSetCategory(
-    actor: DiscordActor,
-    targetUserId: string,
-    order: MemberOrder,
-  ): Promise<ProfileOperationResult> {
-    this.#assertOwner(actor);
-    return this.#mutateTargetProfile(actor, targetUserId, 'PROFILE_UPDATE', (profile) => ({
-      ...profile,
-      order,
-    }));
-  }
-
-  async #ownerForceHidden(
-    actor: DiscordActor,
-    targetUserId: string,
-    adminAction: PendingAdminAction,
-  ): Promise<ProfileOperationResult> {
-    this.#assertOwner(actor);
-    const auditAction = adminAction === 'revoke' ? 'PROFILE_OWNER_REVOKE' : 'PROFILE_OWNER_HIDE';
-
-    return this.#runOperation(actor, auditAction, async (operationId) => {
-      const initialBinding = this.#requireBinding(actor.guildId, targetUserId);
-
-      return this.#withProfileOperationLock(
-        actor.guildId,
-        initialBinding.profileSlug,
-        'mutation',
-        async () => {
-          const current = this.#requireBinding(actor.guildId, targetUserId);
-          this.#assertSameProfileBinding(initialBinding, current);
-          this.#assertNoPendingPublication(current);
-
-          const state = this.#requireState(actor.guildId, current.profileSlug);
-
-          if (current.status !== 'active') {
-            throw new ProfileServiceError(
-              'profile_revoked',
-              'This profile is already revoked.',
-            );
-          }
-
-          if (current.pendingAdminAction) {
-            throw new ProfileServiceError(
-              'admin_action_pending',
-              'A previous owner moderation action is still being recovered.',
-            );
-          }
-
-          const profile = parseProfile(state.profileJson);
-          const hiddenProfile = normalizeMemberProfile({ ...profile, listed: false });
-          const usesDurableQueue = this.#publisher.usesDurableQueue === true;
-          const pending = usesDurableQueue
-            ? current
-            : this.#store.beginAdminAction(
-                actor.guildId,
-                targetUserId,
-                adminAction,
-                operationId,
-              );
-
-          try {
-            const publishResult = await this.#publisher.publish({
-              operationId,
-              slug: current.profileSlug,
-              action: 'PROFILE_SET_LISTED',
-              profile: {
-                json: serializeProfile(hiddenProfile),
-                expectedSha: state.profileBlobSha,
-              },
-            }, this.#publishContext(actor, targetUserId, auditAction, { adminAction }));
-
-            if (publishResult.status === 'queued') {
-              return this.#queuedResult(publishResult.operationId);
-            }
-
-            if (publishResult.stateApplied) {
-              return this.#currentOperationResult(
-                actor.guildId,
-                targetUserId,
-                current.profileSlug,
-              );
-            }
-
-            const completed = this.#store.completeAdminActionWithProfileState({
-              guildId: actor.guildId,
-              discordUserId: targetUserId,
-              operationId,
-              action: adminAction,
-              state: this.#publishedStateInput(
-                current.profileSlug,
-                hiddenProfile,
-                publishResult,
-                state.photoBlobSha,
-                state,
-              ),
-            });
-            const result = this.#operationResult(completed.binding, completed.state);
-            this.#audit(actor, current.profileSlug, auditAction, result, { targetUserId });
-            return result;
-          } catch (error) {
-            if (!usesDurableQueue && isDefinitelyUnpublishedRegistrationFailure(error)) {
-              this.#store.clearPendingAdminAction(actor.guildId, targetUserId, operationId);
-            } else {
-              this.#markReconciliationNeededAfterAmbiguousPublish(error, pending);
-            }
-            throw error;
-          }
-        },
-      );
-    });
   }
 
   async #mutateOwnProfile(
@@ -893,7 +679,6 @@ export class ProfileService {
     action: ProfilePublishInput['action'],
     mutate: (profile: MemberProfile) => MemberProfile,
     expectedRevision: string,
-    requireUserListingPermission = false,
   ) {
     this.#assertActor(actor);
     return this.#mutateTargetProfile(
@@ -902,9 +687,7 @@ export class ProfileService {
       action,
       mutate,
       undefined,
-      true,
       expectedRevision,
-      requireUserListingPermission,
     );
   }
 
@@ -914,9 +697,7 @@ export class ProfileService {
     action: ProfilePublishInput['action'],
     mutate: (profile: MemberProfile) => MemberProfile,
     photo?: ProfilePublishInput['photo'],
-    requireActive = false,
     expectedRevision?: string,
-    requireUserListingPermission = false,
   ): Promise<ProfileOperationResult> {
     return this.#runOperation(actor, action, async (operationId) => {
       const initialBinding = this.#requireBinding(actor.guildId, targetUserId);
@@ -933,24 +714,10 @@ export class ProfileService {
             this.#assertNoPendingPublication(binding);
             recoveryBinding = binding;
 
-            if (binding.pendingAdminAction) {
+            if (binding.status !== 'active') {
               throw new ProfileServiceError(
-                'admin_action_pending',
-                'An owner moderation action is still being recovered. Try again shortly.',
-              );
-            }
-
-            if (requireActive && binding.status !== 'active') {
-              throw new ProfileServiceError('profile_revoked', 'This profile is currently revoked.');
-            }
-
-            if (
-              requireUserListingPermission
-              && binding.listingPolicy === 'force_hidden'
-            ) {
-              throw new ProfileServiceError(
-                'visibility_locked',
-                'This profile was hidden by the site owner and cannot be shown again yet.',
+                'profile_not_active',
+                'This profile is not active yet. Try again shortly.',
               );
             }
 
@@ -1011,13 +778,9 @@ export class ProfileService {
     this.#assertNoPendingPublication(binding);
 
     if (binding.status !== 'active') {
-      throw new ProfileServiceError('profile_revoked', 'This profile is currently revoked.');
-    }
-
-    if (binding.pendingAdminAction) {
       throw new ProfileServiceError(
-        'admin_action_pending',
-        'An owner moderation action is still being recovered. Try again shortly.',
+        'profile_not_active',
+        'This profile is not active yet. Try again shortly.',
       );
     }
 
@@ -1124,10 +887,6 @@ export class ProfileService {
       }
     }
 
-    if (binding.pendingAdminAction) {
-      return this.#resumePendingAdminAction(binding, remote);
-    }
-
     const existing = this.#store.getProfileState(binding.guildId, binding.profileSlug);
 
     if (
@@ -1166,102 +925,6 @@ export class ProfileService {
     }
 
     return this.#store.saveProfileState({ guildId: binding.guildId, ...recoveredInput });
-  }
-
-  async #resumePendingAdminAction(
-    binding: ProfileBinding,
-    remote: RepositoryProfileSnapshot,
-  ): Promise<ProfileState> {
-    const action = binding.pendingAdminAction;
-    const operationId = binding.pendingAdminOperationId;
-
-    if (!action || !operationId) {
-      throw new ProfileServiceError(
-        'admin_action_corrupt',
-        'The pending owner moderation state is incomplete; writes remain blocked.',
-      );
-    }
-
-    const hiddenProfile = normalizeMemberProfile({ ...remote.profile, listed: false });
-    let recoveredInput: Omit<ProfileStateInput, 'guildId'>;
-
-    if (remote.profile.listed) {
-      const receiptKind = action === 'revoke' ? 'PROFILE_OWNER_REVOKE' : 'PROFILE_OWNER_HIDE';
-      const receipt = this.#store.getProcessingInteractionReceiptByOperation(
-        operationId,
-        receiptKind,
-      );
-
-      if (!receipt) {
-        throw new ProfileServiceError(
-          'admin_action_corrupt',
-          'The pending owner moderation receipt is missing; writes remain blocked.',
-        );
-      }
-
-      const publishResult = await this.#publisher.publish({
-        operationId,
-        slug: binding.profileSlug,
-        action: 'PROFILE_SET_LISTED',
-        profile: {
-          json: serializeProfile(hiddenProfile),
-          expectedSha: remote.profileBlobSha,
-        },
-      }, {
-        guildId: binding.guildId,
-        actorUserId: this.#ownerUserId,
-        targetUserId: binding.discordUserId,
-        interactionId: receipt.interactionId,
-        receiptKind,
-        adminAction: action,
-        awaitCompletion: true,
-      });
-
-      if (publishResult.status === 'queued') {
-        throw new ProfileServiceError(
-          'publication_queued',
-          'The recovered owner action is durably queued but has not completed yet.',
-        );
-      }
-
-      if (publishResult.stateApplied) {
-        return this.#requireState(binding.guildId, binding.profileSlug);
-      }
-
-      recoveredInput = this.#publishedStateInput(
-        binding.profileSlug,
-        hiddenProfile,
-        publishResult,
-        remote.photoBlobSha,
-      );
-    } else {
-      recoveredInput = {
-        profileSlug: binding.profileSlug,
-        profileJson: serializeProfile(hiddenProfile),
-        profileBlobSha: remote.profileBlobSha,
-        ...(remote.photoBlobSha ? { photoBlobSha: remote.photoBlobSha } : {}),
-        lastCommitSha: remote.commitSha,
-        lastDeploymentStatus: await this.#getRecoveredDeploymentStatus(remote),
-      };
-    }
-
-    const completed = this.#store.completeAdminActionWithProfileState({
-      guildId: binding.guildId,
-      discordUserId: binding.discordUserId,
-      operationId,
-      action,
-      state: recoveredInput,
-    });
-    const recoveryKind = action === 'revoke' ? 'PROFILE_OWNER_REVOKE' : 'PROFILE_OWNER_HIDE';
-    this.#completeRecoveredInteraction(
-      completed.binding,
-      completed.state,
-      operationId,
-      recoveryKind,
-      this.#ownerUserId,
-      { targetUserId: binding.discordUserId, recovered: true },
-    );
-    return completed.state;
   }
 
   #completeRecoveredInteraction(
@@ -1650,7 +1313,7 @@ export class ProfileService {
     actor: DiscordActor,
     targetUserId: string,
     receiptKind: string,
-    optional: Pick<ProfilePublishContext, 'stagedPhotoId' | 'adminAction'> = {},
+    optional: Pick<ProfilePublishContext, 'stagedPhotoId'> = {},
   ): ProfilePublishContext {
     return {
       guildId: actor.guildId,
@@ -1667,14 +1330,9 @@ export class ProfileService {
       profileSlug: binding.profileSlug,
       profile: parseProfile(state.profileJson),
       bindingStatus: binding.status,
-      listingPolicy: binding.listingPolicy,
       stateRevision: profileStateRevision(state),
       lastDeploymentStatus: state.lastDeploymentStatus,
     };
-
-    if (binding.pendingAdminAction) {
-      snapshot.pendingAdminAction = binding.pendingAdminAction;
-    }
 
     if (state.lastCommitSha) {
       snapshot.lastCommitSha = state.lastCommitSha;
@@ -1698,14 +1356,6 @@ export class ProfileService {
   #assertGuild(guildId: string) {
     if (guildId !== this.#guildId) {
       throw new ProfileServiceError('wrong_guild', 'This bot can only be used in the configured Discord server.');
-    }
-  }
-
-  #assertOwner(actor: DiscordActor) {
-    this.#assertActor(actor);
-
-    if (actor.userId !== this.#ownerUserId) {
-      throw new ProfileServiceError('owner_only', 'This recovery action is restricted to the bot owner.');
     }
   }
 

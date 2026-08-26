@@ -15,7 +15,6 @@ export type GuildProfileRuntime = {
 };
 
 export type ProductionProfileRuntime = {
-  guildId: string;
   publisher: ProfilePublisher;
   repositoryReader: ProfileRepositoryReader;
   checkpointLookup?: PublishCheckpointLookup;
@@ -30,27 +29,22 @@ type ReconciliationSummary = {
 };
 
 /**
- * Creates one guild-bound ProfileService per Discord server. The existing
- * service-level guild assertion remains in place as defense in depth, while
- * only the explicitly configured production guild ever receives GitHub
- * credentials. Every other installed guild is isolated under its own sandbox
- * directory.
+ * Creates a guild-bound ProfileService from the guild context supplied by
+ * Discord. Sandbox mode writes to local storage; production mode uses the
+ * configured GitHub publisher.
  */
 export class GuildProfileRuntimeRegistry {
   readonly #store: SqliteStore;
-  readonly #ownerUserId: string;
   readonly #sandboxDirectory: string;
   readonly #production: ProductionProfileRuntime | undefined;
   readonly #runtimes = new Map<string, GuildProfileRuntime>();
 
   constructor(options: {
     store: SqliteStore;
-    ownerUserId: string;
     sandboxDirectory: string;
     production?: ProductionProfileRuntime;
   }) {
     this.#store = options.store;
-    this.#ownerUserId = options.ownerUserId;
     this.#sandboxDirectory = options.sandboxDirectory;
     this.#production = options.production;
   }
@@ -62,7 +56,7 @@ export class GuildProfileRuntimeRegistry {
       return existing;
     }
 
-    const production = this.#production?.guildId === guildId ? this.#production : undefined;
+    const production = this.#production;
     const sandbox = production
       ? undefined
       : new SandboxProfileRepository({
@@ -79,7 +73,6 @@ export class GuildProfileRuntimeRegistry {
           ? { checkpointLookup: production.checkpointLookup }
           : {}),
         guildId,
-        ownerUserId: this.#ownerUserId,
         ...(production?.membersPageUrl ? { membersPageUrl: production.membersPageUrl } : {}),
       }),
     };
@@ -91,7 +84,6 @@ export class GuildProfileRuntimeRegistry {
     const guildIds = new Set([
       ...this.#store.listGuildIds(),
       ...this.#runtimes.keys(),
-      ...(this.#production ? [this.#production.guildId] : []),
     ]);
     const combined: ReconciliationSummary = {
       reconciled: 0,

@@ -8,9 +8,7 @@ import {
   getOptionalModalText,
   getRequiredMemberOrderOption,
   getRequiredModalText,
-  getRequiredStringOption,
   getSingleModalValue,
-  getSubcommand,
   getUploadedAttachment,
   splitModalLines,
 } from './inputs.js';
@@ -46,7 +44,6 @@ import type {
 type InteractionRouterConfig = {
   applicationId: string;
   guildId: string;
-  ownerUserId: string;
   publicationMode: 'sandbox' | 'production';
 };
 
@@ -165,80 +162,8 @@ export class DiscordInteractionRouter {
             }
           },
         };
-      case 'profile-admin':
-        this.#assertOwner(userId);
-        return this.#routeAdminCommand(interaction, userId);
       default:
         throw new DiscordInputError('Unknown application command.');
-    }
-  }
-
-  #routeAdminCommand(interaction: DiscordInteraction, userId: string): InteractionRouteResult {
-    const actor = this.#actor(interaction, userId);
-    const subcommand = getSubcommand(interaction.data?.options);
-
-    switch (subcommand.name) {
-      case 'hide': {
-        const target = getRequiredStringOption(subcommand.options, 'member');
-        return this.#deferredMutation(
-          interaction,
-          () => this.#service.ownerHide(actor, target),
-          this.#config.publicationMode === 'sandbox'
-            ? 'The profile was marked hidden in the sandbox. The website was not changed.'
-            : 'The profile was hidden from the website.',
-        );
-      }
-      case 'unhide': {
-        const target = getRequiredStringOption(subcommand.options, 'member');
-        return this.#deferredMutation(
-          interaction,
-          () => this.#service.ownerUnhide(actor, target),
-          this.#config.publicationMode === 'sandbox'
-            ? 'The owner visibility lock was removed in the sandbox. The profile remains hidden until its owner marks it listed.'
-            : 'The owner visibility lock was removed. The profile remains hidden until its owner shows it on the website.',
-        );
-      }
-      case 'revoke': {
-        const target = getRequiredStringOption(subcommand.options, 'member');
-        return this.#deferredMutation(
-          interaction,
-          () => this.#service.ownerRevoke(actor, target),
-          'The profile binding was suspended.',
-        );
-      }
-      case 'restore': {
-        const target = getRequiredStringOption(subcommand.options, 'member');
-        return this.#deferredMutation(
-          interaction,
-          () => this.#service.ownerRestore(actor, target),
-          'The profile binding was restored.',
-        );
-      }
-      case 'transfer': {
-        const from = getRequiredStringOption(subcommand.options, 'from');
-        const to = getRequiredStringOption(subcommand.options, 'to');
-
-        if (from === to) {
-          throw new DiscordInputError('The current and new Discord accounts must differ.');
-        }
-
-        return this.#deferredMutation(
-          interaction,
-          () => this.#service.ownerTransfer(actor, from, to),
-          'The profile binding was transferred.',
-        );
-      }
-      case 'set-category': {
-        const target = getRequiredStringOption(subcommand.options, 'member');
-        const order = getRequiredMemberOrderOption(subcommand.options);
-        return this.#deferredMutation(
-          interaction,
-          () => this.#service.ownerSetCategory(actor, target, order),
-          'The member category was corrected.',
-        );
-      }
-      default:
-        throw new DiscordInputError('Unknown profile-admin subcommand.');
     }
   }
 
@@ -519,12 +444,6 @@ export class DiscordInteractionRouter {
     }
 
     return snapshot;
-  }
-
-  #assertOwner(userId: string) {
-    if (userId !== this.#config.ownerUserId) {
-      throw new DiscordInputError('Only the configured site owner can use this command.');
-    }
   }
 
   #actor(interaction: DiscordInteraction, userId: string): DiscordActor {

@@ -263,12 +263,6 @@ function profilePanelComponents(
   const category = memberCategories.find(({ order }) => order === snapshot.profile.order)?.label;
   const profile = snapshot.profile;
   const statusText = snapshot.bindingStatus === 'active' ? '' : `\nStatus: **${snapshot.bindingStatus}**`;
-  const visibilityPolicyText = snapshot.listingPolicy === 'force_hidden'
-    ? 'Visibility control: **locked by the site owner**'
-    : '';
-  const pendingAdminText = snapshot.pendingAdminAction
-    ? `Owner moderation: **${snapshot.pendingAdminAction} pending recovery; editing is temporarily locked**`
-    : '';
   const summary = [
     `## ${escapeDiscordMarkdown(profile.name)}`,
     escapeDiscordMarkdown(profile.position),
@@ -276,8 +270,6 @@ function profilePanelComponents(
     publicationMode === 'sandbox'
       ? `Sandbox listing flag: **${profile.listed ? 'listed' : 'hidden'}**${statusText}`
       : `Website listing: **${profile.listed ? 'shown' : 'hidden'}**${statusText}`,
-    visibilityPolicyText,
-    pendingAdminText,
     snapshot.lastDeploymentStatus
       ? `${publicationMode === 'sandbox' ? 'Last sandbox save' : 'Last deployment'}: **${escapeDiscordMarkdown(snapshot.lastDeploymentStatus)}**`
       : '',
@@ -291,33 +283,26 @@ function profilePanelComponents(
   const containerChildren: Record<string, unknown>[] = [{ type: 10, content: summary }];
 
   if (snapshot.bindingStatus === 'active') {
-    const editingLocked = snapshot.pendingAdminAction !== undefined;
-    const listingLocked = editingLocked || snapshot.listingPolicy === 'force_hidden';
     containerChildren.push(
       {
         type: 1,
         components: [
-          button('Name & position', 'profile:edit-basic', 1, editingLocked),
-          button('Profile details', 'profile:edit-text', 2, editingLocked),
-          button('Category', 'profile:edit-category', 2, editingLocked),
-          button('Change photo', 'profile:replace-photo', 2, editingLocked),
+          button('Name & position', 'profile:edit-basic', 1),
+          button('Profile details', 'profile:edit-text', 2),
+          button('Category', 'profile:edit-category', 2),
+          button('Change photo', 'profile:replace-photo', 2),
         ],
       },
       {
         type: 1,
         components: [
-          button('Remove photo', `profile:remove-photo:${revision}`, 4, editingLocked),
+          button('Remove photo', `profile:remove-photo:${revision}`, 4),
           button(
-            snapshot.pendingAdminAction
-              ? 'Owner action pending'
-              : snapshot.listingPolicy === 'force_hidden'
-                ? 'Hidden by site owner'
-                : publicationMode === 'sandbox'
-                  ? (profile.listed ? 'Mark hidden (sandbox)' : 'Mark listed (sandbox)')
-                  : (profile.listed ? 'Hide from website' : 'Show on website'),
+            publicationMode === 'sandbox'
+              ? (profile.listed ? 'Mark hidden (sandbox)' : 'Mark listed (sandbox)')
+              : (profile.listed ? 'Hide from website' : 'Show on website'),
             `profile:set-listed:${profile.listed ? '0' : '1'}:${revision}`,
-            listingLocked ? 2 : profile.listed ? 2 : 3,
-            listingLocked,
+            profile.listed ? 2 : 3,
           ),
         ],
       },

@@ -17,7 +17,6 @@ export type BatchProfilePublisher = {
 
 export type ProfilePublishWorkerOptions = {
   store: SqliteStore;
-  guildId: string;
   backend: BatchProfilePublisher;
   workerId?: string;
   batchWindowMs?: number;
@@ -56,7 +55,6 @@ class PublicationWorkerError extends Error {
 
 export class ProfilePublishWorker {
   readonly #store: SqliteStore;
-  readonly #guildId: string;
   readonly #backend: BatchProfilePublisher;
   readonly #workerId: string;
   readonly #batchWindowMs: number;
@@ -73,9 +71,7 @@ export class ProfilePublishWorker {
   #wakeRequested = false;
 
   constructor(options: ProfilePublishWorkerOptions) {
-    if (!options.guildId.trim()) throw new Error('Production guild ID is required.');
     this.#store = options.store;
-    this.#guildId = options.guildId;
     this.#backend = options.backend;
     this.#workerId = options.workerId?.trim() || randomUUID();
     this.#batchWindowMs = nonNegativeInteger(
@@ -99,7 +95,7 @@ export class ProfilePublishWorker {
   }
 
   recoverLeases() {
-    return this.#store.recoverPublicationLeases(this.#guildId);
+    return this.#store.recoverPublicationLeases();
   }
 
   drain() {
@@ -114,7 +110,7 @@ export class ProfilePublishWorker {
     if (!this.#drainPromise) {
       this.#drainPromise = this.#runDrain()
         .then(() => {
-          if (this.#store.countNonterminalPublicationJobs(this.#guildId) === 0) {
+          if (this.#store.countNonterminalPublicationJobs() === 0) {
             this.#onDrainHealthy();
           } else {
             const recoveryDelay = this.nextRecoveryDelayMs();
@@ -161,7 +157,7 @@ export class ProfilePublishWorker {
     const now = this.#now().getTime();
     let delay: number | undefined;
 
-    for (const job of this.#store.listPublicationRecoveryCandidates(this.#guildId)) {
+    for (const job of this.#store.listPublicationRecoveryCandidates()) {
       const parsedLeaseExpiry = job.status === 'leased' && job.leaseExpiresAt
         ? Date.parse(job.leaseExpiresAt)
         : Number.NaN;
@@ -182,7 +178,7 @@ export class ProfilePublishWorker {
       this.#wakeRequested = false;
       this.recoverLeases();
 
-      const unapplied = this.#store.listUnappliedPublicationJobs(this.#guildId);
+      const unapplied = this.#store.listUnappliedPublicationJobs();
       if (unapplied.length > 0) {
         try {
           this.#applyRecordedBatch(unapplied);
@@ -193,7 +189,7 @@ export class ProfilePublishWorker {
         continue;
       }
 
-      const createdAt = this.#store.getOldestQueuedPublicationCreatedAt(this.#guildId);
+      const createdAt = this.#store.getOldestQueuedPublicationCreatedAt();
 
       if (!createdAt) {
         if (this.#wakeRequested) continue;
@@ -211,7 +207,6 @@ export class ProfilePublishWorker {
 
       const leaseToken = this.#newLeaseToken();
       const jobs = this.#store.claimPublicationJobs({
-        guildId: this.#guildId,
         workerId: this.#workerId,
         leaseToken,
         leaseExpiresAt: new Date(this.#now().getTime() + this.#leaseMs),
