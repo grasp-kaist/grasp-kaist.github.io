@@ -75,7 +75,7 @@ export function registerModalResponse(
         {
           type: 18,
           label: 'Position',
-          description: 'Your role or affiliation as shown on the website',
+          description: 'KAIST is implied. Enter only the role, such as M.S. Student.',
           component: {
             type: 4,
             custom_id: 'position',
@@ -83,7 +83,7 @@ export function registerModalResponse(
             min_length: 1,
             max_length: 160,
             required: true,
-            placeholder: 'Undergraduate Student, KAIST',
+            placeholder: memberCategories[order].label,
           },
         },
         {
@@ -134,6 +134,7 @@ export function editBasicModalResponse(snapshot: ProfileSnapshot): DiscordIntera
         {
           type: 18,
           label: 'Position',
+          description: 'KAIST is implied. Enter only the role, such as M.S. Student.',
           component: {
             type: 4,
             custom_id: 'position',

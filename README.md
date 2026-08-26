@@ -42,7 +42,7 @@ A member JSON file uses the following canonical format. All nine fields must be 
   "listed": true,
   "order": 4,
   "name": "Example",
-  "position": "Undergraduate Student, School of Computing, KAIST",
+  "position": "Undergraduate Student",
   "details": [
     "B.S. in Computer Science, Example University"
   ],

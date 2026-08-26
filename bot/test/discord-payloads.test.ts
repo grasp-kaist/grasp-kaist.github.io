@@ -46,6 +46,22 @@ test('registration and file upload modals use Label-based current components', (
       { type: 18, childType: 22 },
     ],
   );
+  const position = registerComponents.find((component) => component.label === 'Position');
+  assert.equal(
+    (position?.component as Record<string, unknown>).placeholder,
+    'Undergraduate Student',
+  );
+  assert.equal(
+    position?.description,
+    'KAIST is implied. Enter only the role, such as M.S. Student.',
+  );
+  const mastersPosition = (
+    registerModalResponse(3).data?.components as Array<Record<string, unknown>>
+  ).find((component) => component.label === 'Position');
+  assert.equal(
+    (mastersPosition?.component as Record<string, unknown>).placeholder,
+    'M.S. Student',
+  );
 
   const upload = photoUploadModalResponse();
   const uploadLabel = (upload.data?.components as Array<Record<string, unknown>>)[0]!;
@@ -129,6 +145,15 @@ test('profile edit modals bind submissions to the rendered state revision', () =
     `profile-category:v1:${STATE_REVISION}`,
   );
   assert.equal(photoUploadModalResponse().data?.custom_id, 'profile-photo:v1');
+
+  const basicComponents = editBasicModalResponse(current).data?.components as Array<
+    Record<string, unknown>
+  >;
+  const position = basicComponents.find((component) => component.label === 'Position');
+  assert.equal(
+    position?.description,
+    'KAIST is implied. Enter only the role, such as M.S. Student.',
+  );
 
   const textComponents = editTextModalResponse(current).data?.components as Array<
     Record<string, unknown>

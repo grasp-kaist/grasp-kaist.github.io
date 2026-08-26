@@ -1184,7 +1184,7 @@ function normalizeOptions(options: GitHubProfilePublisherOptions): NormalizedOpt
     pollIntervalMs: positiveInteger(options.pollIntervalMs, 2_000, 'pollIntervalMs'),
     workflowDiscoveryTimeoutMs: positiveInteger(
       options.workflowDiscoveryTimeoutMs,
-      10_000,
+      120_000,
       'workflowDiscoveryTimeoutMs',
     ),
     validationTimeoutMs: positiveInteger(options.validationTimeoutMs, 120_000, 'validationTimeoutMs'),

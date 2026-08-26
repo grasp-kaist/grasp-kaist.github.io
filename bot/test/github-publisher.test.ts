@@ -1077,7 +1077,7 @@ test('default publication time limits reserve Discord webhook-edit headroom', ()
   });
 
   assert.equal(PROFILE_PUBLISH_REQUEST_TIMEOUT_MS, 10_000);
-  assert.equal(publisher.options.workflowDiscoveryTimeoutMs, 10_000);
+  assert.equal(publisher.options.workflowDiscoveryTimeoutMs, 120_000);
   assert.equal(publisher.options.validationTimeoutMs, 120_000);
   assert.equal(publisher.options.deployTimeoutMs, 150_000);
   assert.equal(publisher.options.pagesTimeoutMs, 30_000);
