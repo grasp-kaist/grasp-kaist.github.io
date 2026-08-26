@@ -9,6 +9,8 @@ const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const OPERATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const SHA_PATTERN = /^[0-9a-f]{40}$/i;
 
+export const PROFILE_PUBLISH_BATCH_MAX_SIZE = 20;
+
 export const PROFILE_PUBLISH_REQUEST_TIMEOUT_MS = 10_000;
 export const PROFILE_PUBLISH_TIMEOUT_MS = 810_000;
 
@@ -67,6 +69,18 @@ export type PublishResult = {
 export type PublishCheckpoint =
   | {
       version: 1;
+      stage: 'candidate_validated';
+      operationId: string;
+      fingerprint: string;
+      slug: string;
+      baseSha: string;
+      commitSha: string;
+      attempts: number;
+      profileBlobSha: string;
+      photoBlobSha?: string;
+    }
+  | {
+      version: 1;
       stage: 'main_updated';
       operationId: string;
       fingerprint: string;
@@ -85,9 +99,15 @@ export type PublishCheckpoint =
       result: PublishResult;
     };
 
+type CandidateValidatedCheckpoint = Extract<PublishCheckpoint, { stage: 'candidate_validated' }>;
+type MainUpdatedCheckpoint = Extract<PublishCheckpoint, { stage: 'main_updated' }>;
+type PendingPublishCheckpoint = CandidateValidatedCheckpoint | MainUpdatedCheckpoint;
+
 export interface PublishStateStore {
   load(operationId: string): Promise<PublishCheckpoint | null>;
   save(checkpoint: PublishCheckpoint): Promise<void>;
+  /** Persist every checkpoint atomically when the backing store supports batches. */
+  saveBatch?(checkpoints: readonly PublishCheckpoint[]): Promise<void>;
   clear(operationId: string): Promise<void>;
 }
 
@@ -172,9 +192,23 @@ type DiffExpectation = {
 type Candidate = {
   baseSha: string;
   headSha?: string;
+  items: CandidateItem[];
+  expectedDiff: DiffExpectation[];
+};
+
+type CandidateItem = {
+  input: PreparedInput;
   profileBlobSha: string;
   photoBlobSha?: string | null;
-  expectedDiff: DiffExpectation[];
+  changed: boolean;
+};
+
+type DeploymentObservation = Omit<PublishResult, 'profileBlobSha' | 'photoBlobSha'>;
+
+type PendingCheckpointEntry = {
+  checkpoint: PendingPublishCheckpoint;
+  input: PreparedInput;
+  index: number;
 };
 
 type WorkflowRun = {
@@ -197,13 +231,18 @@ export class GitHubProfilePublisher {
   }
 
   async publish(input: ProfilePublishInput): Promise<PublishResult> {
+    const [result] = await this.publishBatch([input]);
+    return result!;
+  }
+
+  async publishBatch(inputs: readonly ProfilePublishInput[]): Promise<PublishResult[]> {
     const controller = new AbortController();
     const timeout = setTimeout(() => {
       controller.abort(publicationTimeoutError());
     }, this.options.publishTimeoutMs);
 
     try {
-      return await this.publishWithSignal(input, controller.signal);
+      return await this.publishBatchWithSignal(inputs, controller.signal);
     } catch (error) {
       if (controller.signal.aborted) {
         throw publicationTimeoutReason(controller.signal, error);
@@ -215,50 +254,63 @@ export class GitHubProfilePublisher {
     }
   }
 
-  private async publishWithSignal(
-    input: ProfilePublishInput,
+  private async publishBatchWithSignal(
+    inputs: readonly ProfilePublishInput[],
     signal: AbortSignal,
-  ): Promise<PublishResult> {
-    const prepared = prepareInput(input);
-    const prior = await this.options.stateStore?.load(prepared.operationId);
-    signal.throwIfAborted();
+  ): Promise<PublishResult[]> {
+    const prepared = prepareBatchInputs(inputs);
+    const results = Array<PublishResult | undefined>(prepared.length).fill(undefined);
+    const priors = await Promise.all(prepared.map(async (input) => {
+      const prior = await this.options.stateStore?.load(input.operationId) ?? null;
+      signal.throwIfAborted();
 
-    if (prior) {
-      assertMatchingCheckpoint(prior, prepared);
-
-      if (prior.stage === 'completed') {
-        return prior.result;
+      if (prior) {
+        assertMatchingCheckpoint(prior, input);
+        if (prior.stage === 'completed') {
+          results[prepared.indexOf(input)] = prior.result;
+        }
       }
 
-      const resumed = await this.observeDeployment(
-        prior.commitSha,
-        prior.attempts,
-        prior.profileBlobSha,
-        prior.photoBlobSha,
-        signal,
-      );
-      await this.saveCompleted(prepared, resumed);
+      return prior;
+    }));
+    const resumed = await this.resumeCheckpointedBatch(prepared, priors, results, signal);
+
+    if (resumed) {
       return resumed;
+    }
+
+    const active = prepared.filter((_input, index) => results[index] === undefined);
+
+    if (active.length === 0) {
+      return requireBatchResults(results);
     }
 
     for (let attempt = 1; attempt <= this.options.maxConflictAttempts; attempt += 1) {
       let temporaryRef: string | undefined;
+      let validatedOperationIds: string[] = [];
 
       try {
-        const candidate = await this.createCandidate(prepared, signal);
+        const candidate = await this.createCandidate(active, signal);
+        const unchangedItems = candidate.items.filter((candidateItem) => !candidateItem.changed);
 
-        if (!candidate.headSha) {
+        for (const item of unchangedItems) {
           const noChange = resultWithOptionalPhoto({
             status: 'no_change',
             attempts: attempt,
-            profileBlobSha: candidate.profileBlobSha,
-          }, candidate.photoBlobSha);
-          signal.throwIfAborted();
-          await this.saveCompleted(prepared, noChange);
-          return noChange;
+            profileBlobSha: item.profileBlobSha,
+          }, item.photoBlobSha);
+          results[prepared.indexOf(item.input)] = noChange;
         }
 
-        temporaryRef = temporaryBranchName(prepared, attempt);
+        if (!candidate.headSha) {
+          for (const item of unchangedItems) {
+            await this.saveCompleted(item.input, results[prepared.indexOf(item.input)]!);
+          }
+          return requireBatchResults(results);
+        }
+
+        const changedItems = candidate.items.filter((item) => item.changed);
+        temporaryRef = temporaryBranchName(changedItems.map((item) => item.input), candidate.expectedDiff, attempt);
         await this.createTemporaryRef(temporaryRef, candidate.headSha, signal);
         await this.awaitWorkflow({
           workflow: this.options.validateWorkflow,
@@ -270,24 +322,39 @@ export class GitHubProfilePublisher {
           completionTimeoutMs: this.options.validationTimeoutMs,
         }, signal);
 
+        await this.saveValidatedBatch(changedItems, candidate.baseSha, candidate.headSha, attempt);
+        validatedOperationIds = changedItems.map((item) => item.input.operationId);
         await this.promoteMain(candidate.baseSha, candidate.headSha, signal);
-        await this.saveMainUpdated(prepared, candidate, attempt);
+        await this.saveMainUpdatedBatch(changedItems, candidate.headSha, attempt);
         await this.cleanupTemporaryRef(temporaryRef);
         temporaryRef = undefined;
 
-        const result = await this.observeDeployment(
+        const observation = await this.observeDeployment(
           candidate.headSha,
           attempt,
-          candidate.profileBlobSha,
-          candidate.photoBlobSha,
           signal,
         );
-        await this.saveCompleted(prepared, result);
-        return result;
+
+        for (const item of changedItems) {
+          const result = resultWithOptionalPhoto({
+            ...observation,
+            profileBlobSha: item.profileBlobSha,
+          }, item.photoBlobSha);
+          results[prepared.indexOf(item.input)] = result;
+          await this.saveCompleted(item.input, result);
+        }
+
+        for (const item of unchangedItems) {
+          await this.saveCompleted(item.input, results[prepared.indexOf(item.input)]!);
+        }
+
+        return requireBatchResults(results);
       } catch (error) {
         if (!(error instanceof RetryableMainConflict)) {
           throw error;
         }
+
+        await this.clearValidatedCheckpoints(validatedOperationIds);
 
         if (attempt === this.options.maxConflictAttempts) {
           throw new ProfilePublisherError(
@@ -306,7 +373,105 @@ export class GitHubProfilePublisher {
     throw new ProfilePublisherError('main_conflict', 'Publication attempts were exhausted.');
   }
 
-  private async createCandidate(input: PreparedInput, signal: AbortSignal): Promise<Candidate> {
+  private async resumeCheckpointedBatch(
+    inputs: PreparedInput[],
+    priors: Array<PublishCheckpoint | null>,
+    results: Array<PublishResult | undefined>,
+    signal: AbortSignal,
+  ): Promise<PublishResult[] | null> {
+    const pending: PendingCheckpointEntry[] = [];
+    priors.forEach((checkpoint, index) => {
+      if (checkpoint?.stage === 'candidate_validated' || checkpoint?.stage === 'main_updated') {
+        pending.push({ checkpoint, input: inputs[index]!, index });
+      }
+    });
+
+    if (pending.length === 0) {
+      return results.every(Boolean) ? requireBatchResults(results) : null;
+    }
+
+    const groups = new Map<string, typeof pending>();
+    for (const entry of pending) {
+      const group = groups.get(entry.checkpoint.commitSha) ?? [];
+      group.push(entry);
+      groups.set(entry.checkpoint.commitSha, group);
+    }
+
+    for (const [commitSha, entries] of groups) {
+      const attempts = entries[0]!.checkpoint.attempts;
+
+      if (entries.some(({ checkpoint }) => checkpoint.attempts !== attempts)) {
+        throw new ProfilePublisherError(
+          'github_response_invalid',
+          'Profile operation checkpoints disagree about the candidate attempt.',
+        );
+      }
+
+      const alreadyMainUpdated = entries.some(({ checkpoint }) => checkpoint.stage === 'main_updated');
+
+      if (!alreadyMainUpdated) {
+        const validatedEntries = entries.filter(
+          (entry): entry is PendingCheckpointEntry & { checkpoint: CandidateValidatedCheckpoint } => (
+            entry.checkpoint.stage === 'candidate_validated'
+          ),
+        );
+        const baseSha = validatedEntries[0]!.checkpoint.baseSha;
+
+        if (validatedEntries.some(({ checkpoint }) => checkpoint.baseSha !== baseSha)) {
+          throw new ProfilePublisherError(
+            'github_response_invalid',
+            'Profile operation checkpoints disagree about the candidate base.',
+          );
+        }
+
+        const candidateParentSha = await this.getCommitParentSha(commitSha, signal);
+        if (candidateParentSha !== baseSha) {
+          throw new ProfilePublisherError(
+            'github_response_invalid',
+            'Validated candidate checkpoint does not match the commit parent.',
+          );
+        }
+
+        try {
+          const currentMain = await this.getBranchSha(this.options.defaultBranch, signal);
+
+          if (currentMain === baseSha) {
+            await this.promoteMain(baseSha, commitSha, signal);
+          } else if (
+            currentMain !== commitSha
+            && !await this.isCommitIncludedInMain(commitSha, currentMain, signal)
+          ) {
+            await this.clearValidatedCheckpoints(entries.map(({ input }) => input.operationId));
+            continue;
+          }
+        } catch (error) {
+          if (!(error instanceof RetryableMainConflict)) {
+            throw error;
+          }
+
+          await this.clearValidatedCheckpoints(entries.map(({ input }) => input.operationId));
+          continue;
+        }
+
+        await this.saveMainUpdatedCheckpoints(validatedEntries.map(({ checkpoint }) => checkpoint));
+      }
+
+      const observation = await this.observeDeployment(commitSha, attempts, signal);
+
+      for (const { checkpoint, input, index } of entries) {
+        const result = resultWithOptionalPhoto({
+          ...observation,
+          profileBlobSha: checkpoint.profileBlobSha,
+        }, checkpoint.photoBlobSha);
+        results[index] = result;
+        await this.saveCompleted(input, result);
+      }
+    }
+
+    return results.every(Boolean) ? requireBatchResults(results) : null;
+  }
+
+  private async createCandidate(inputs: PreparedInput[], signal: AbortSignal): Promise<Candidate> {
     const baseSha = await this.getBranchSha(this.options.defaultBranch, signal);
     const commit = await this.requestData(
       'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
@@ -315,62 +480,73 @@ export class GitHubProfilePublisher {
     );
     const baseTreeSha = requireNestedString(commit, ['tree', 'sha'], 'base commit tree SHA');
 
-    const currentProfileSha = await this.getContentSha(input.profilePath, baseSha, signal);
-    assertExpectedSha(input.profilePath, input.profile.expectedSha, currentProfileSha);
+    const treeEntries: Record<string, unknown>[] = [];
+    const expectedDiff: DiffExpectation[] = [];
+    const items: CandidateItem[] = [];
 
-    let currentPhotoSha: string | null | undefined;
-    if (input.photo) {
-      currentPhotoSha = await this.getContentSha(input.photoPath, baseSha, signal);
-      assertExpectedSha(input.photoPath, input.photo.expectedSha, currentPhotoSha);
-    }
+    for (const input of inputs) {
+      const itemDiff: DiffExpectation[] = [];
+      const currentProfileSha = await this.getContentSha(input.profilePath, baseSha, signal);
+      assertExpectedSha(input.profilePath, input.profile.expectedSha, currentProfileSha);
 
-    const profileBlobSha = await this.createBlob(input.profile.json, 'utf-8', signal);
-    const treeEntries: Record<string, unknown>[] = [
-      {
+      let currentPhotoSha: string | null | undefined;
+      if (input.photo) {
+        currentPhotoSha = await this.getContentSha(input.photoPath, baseSha, signal);
+        assertExpectedSha(input.photoPath, input.photo.expectedSha, currentPhotoSha);
+      }
+
+      const profileBlobSha = await this.createBlob(input.profile.json, 'utf-8', signal);
+      treeEntries.push({
         path: input.profilePath,
         mode: '100644',
         type: 'blob',
         sha: profileBlobSha,
-      },
-    ];
-    const expectedDiff: DiffExpectation[] = [];
-
-    if (profileBlobSha !== currentProfileSha) {
-      expectedDiff.push({
-        path: input.profilePath,
-        status: currentProfileSha ? 'modified' : 'added',
-      });
-    }
-
-    let photoBlobSha: string | null | undefined;
-    if (input.photo?.kind === 'upsert') {
-      photoBlobSha = await this.createBlob(
-        Buffer.from(input.photo.bytes).toString('base64'),
-        'base64',
-        signal,
-      );
-      treeEntries.push({
-        path: input.photoPath,
-        mode: '100644',
-        type: 'blob',
-        sha: photoBlobSha,
       });
 
-      if (photoBlobSha !== currentPhotoSha) {
-        expectedDiff.push({
-          path: input.photoPath,
-          status: currentPhotoSha ? 'modified' : 'added',
+      if (profileBlobSha !== currentProfileSha) {
+        itemDiff.push({
+          path: input.profilePath,
+          status: currentProfileSha ? 'modified' : 'added',
         });
       }
-    } else if (input.photo?.kind === 'delete') {
-      photoBlobSha = null;
-      treeEntries.push({
-        path: input.photoPath,
-        mode: '100644',
-        type: 'blob',
-        sha: null,
-      });
-      expectedDiff.push({ path: input.photoPath, status: 'removed' });
+
+      let photoBlobSha: string | null | undefined;
+      if (input.photo?.kind === 'upsert') {
+        photoBlobSha = await this.createBlob(
+          Buffer.from(input.photo.bytes).toString('base64'),
+          'base64',
+          signal,
+        );
+        treeEntries.push({
+          path: input.photoPath,
+          mode: '100644',
+          type: 'blob',
+          sha: photoBlobSha,
+        });
+
+        if (photoBlobSha !== currentPhotoSha) {
+          itemDiff.push({
+            path: input.photoPath,
+            status: currentPhotoSha ? 'modified' : 'added',
+          });
+        }
+      } else if (input.photo?.kind === 'delete') {
+        photoBlobSha = null;
+        treeEntries.push({
+          path: input.photoPath,
+          mode: '100644',
+          type: 'blob',
+          sha: null,
+        });
+        itemDiff.push({ path: input.photoPath, status: 'removed' });
+      }
+
+      expectedDiff.push(...itemDiff);
+      items.push(candidateItemWithOptionalPhoto({
+        input,
+        profileBlobSha,
+        changed: itemDiff.length > 0,
+      }, photoBlobSha));
     }
 
     const tree = await this.requestData('POST /repos/{owner}/{repo}/git/trees', {
@@ -384,27 +560,27 @@ export class GitHubProfilePublisher {
         throw invalidGitHubResponse('GitHub returned the base tree despite expected file changes.');
       }
 
-      return candidateWithOptionalPhoto({
+      return {
         baseSha,
-        profileBlobSha,
+        items,
         expectedDiff,
-      }, photoBlobSha);
+      };
     }
 
     const createdCommit = await this.requestData('POST /repos/{owner}/{repo}/git/commits', {
-      message: `Profile: ${input.action.toLowerCase().replaceAll('_', ' ')} ${input.slug}\n\nProfile-Operation: ${input.operationId}`,
+      message: batchCommitMessage(items.filter((item) => item.changed).map((item) => item.input)),
       tree: treeSha,
       parents: [baseSha],
     }, signal);
     const headSha = requireStringField(createdCommit, 'sha', 'created commit SHA');
     await this.assertExpectedDiff(baseSha, headSha, expectedDiff, signal);
 
-    return candidateWithOptionalPhoto({
+    return {
       baseSha,
       headSha,
-      profileBlobSha,
+      items,
       expectedDiff,
-    }, photoBlobSha);
+    };
   }
 
   private async assertExpectedDiff(
@@ -470,10 +646,34 @@ export class GitHubProfilePublisher {
   }
 
   private async createTemporaryRef(branch: string, headSha: string, signal: AbortSignal) {
-    await this.requestData('POST /repos/{owner}/{repo}/git/refs', {
+    const create = () => this.requestData('POST /repos/{owner}/{repo}/git/refs', {
       ref: `refs/heads/${branch}`,
       sha: headSha,
     }, signal);
+
+    try {
+      await create();
+      return;
+    } catch (error) {
+      if (getErrorStatus(error) !== 422) {
+        throw error;
+      }
+    }
+
+    try {
+      const existingSha = await this.getBranchSha(branch, signal);
+      if (existingSha === headSha) {
+        return;
+      }
+    } catch (error) {
+      if (getErrorStatus(error) !== 404) {
+        throw error;
+      }
+    }
+
+    await this.cleanupTemporaryRef(branch);
+    signal.throwIfAborted();
+    await create();
   }
 
   private async promoteMain(baseSha: string, headSha: string, signal: AbortSignal) {
@@ -498,11 +698,18 @@ export class GitHubProfilePublisher {
       }
 
       if (afterFirstFailure !== baseSha) {
-        throw new RetryableMainConflict();
+        if (await this.isCommitIncludedInMain(headSha, afterFirstFailure, signal)) {
+          return;
+        }
+
+        if (isExplicitRefUpdateRejection(firstError)) {
+          throw new RetryableMainConflict();
+        }
+
+        throw firstError;
       }
 
-      const firstStatus = getErrorStatus(firstError);
-      if (firstStatus === 403 || firstStatus === 409 || firstStatus === 422) {
+      if (isExplicitRefUpdateRejection(firstError)) {
         throw new ProfilePublisherError(
           'main_update_rejected',
           `GitHub rejected the fast-forward update of ${this.options.defaultBranch}.`,
@@ -520,7 +727,19 @@ export class GitHubProfilePublisher {
         }
 
         if (afterSecondFailure !== baseSha) {
-          throw new RetryableMainConflict();
+          if (await this.isCommitIncludedInMain(headSha, afterSecondFailure, signal)) {
+            return;
+          }
+
+          if (isExplicitRefUpdateRejection(secondError)) {
+            throw new RetryableMainConflict();
+          }
+
+          throw secondError;
+        }
+
+        if (!isExplicitRefUpdateRejection(secondError)) {
+          throw secondError;
         }
 
         throw new ProfilePublisherError(
@@ -543,10 +762,8 @@ export class GitHubProfilePublisher {
   private async observeDeployment(
     commitSha: string,
     attempts: number,
-    profileBlobSha: string,
-    photoBlobSha: string | null | undefined,
     signal: AbortSignal,
-  ): Promise<PublishResult> {
+  ): Promise<DeploymentObservation> {
     try {
       const deployRun = await this.awaitWorkflow({
         workflow: this.options.deployWorkflow,
@@ -558,23 +775,20 @@ export class GitHubProfilePublisher {
         completionTimeoutMs: this.options.deployTimeoutMs,
       }, signal);
       const pageStatus = await this.awaitPagesDeployment(commitSha, signal);
-      const deployed = resultWithOptionalPhoto({
+      return {
         status: 'deployed',
         attempts,
-        profileBlobSha,
         commitSha,
         pageStatus,
         ...(deployRun.html_url ? { workflowRunUrl: deployRun.html_url } : {}),
-      }, photoBlobSha);
-      return deployed;
+      };
     } catch (error) {
-      return resultWithOptionalPhoto({
+      return {
         status: 'published_deploy_failed',
         attempts,
-        profileBlobSha,
         commitSha,
         failure: error instanceof Error ? error.message : String(error),
-      }, photoBlobSha);
+      };
     }
   }
 
@@ -705,6 +919,44 @@ export class GitHubProfilePublisher {
     return requireNestedString(reference, ['object', 'sha'], `${branch} ref SHA`);
   }
 
+  private async getCommitParentSha(commitSha: string, signal: AbortSignal) {
+    const commit = await this.requestData(
+      'GET /repos/{owner}/{repo}/git/commits/{commit_sha}',
+      { commit_sha: commitSha },
+      signal,
+    );
+    const parents = commit.parents;
+
+    if (!Array.isArray(parents) || parents.length !== 1 || !isRecord(parents[0])) {
+      throw invalidGitHubResponse('Validated profile commit must have exactly one parent.');
+    }
+
+    return requireStringField(parents[0], 'sha', 'validated commit parent SHA');
+  }
+
+  private async isCommitIncludedInMain(
+    commitSha: string,
+    mainSha: string,
+    signal: AbortSignal,
+  ) {
+    const comparison = await this.requestData(
+      'GET /repos/{owner}/{repo}/compare/{basehead}',
+      { basehead: `${commitSha}...${mainSha}` },
+      signal,
+    );
+    const status = requireStringField(comparison, 'status', 'commit comparison status');
+
+    if (status === 'ahead' || status === 'identical') {
+      return true;
+    }
+
+    if (status === 'behind' || status === 'diverged') {
+      return false;
+    }
+
+    throw invalidGitHubResponse(`GitHub returned an unknown commit comparison status: ${status}.`);
+  }
+
   private async getContentSha(
     path: string,
     ref: string,
@@ -744,27 +996,116 @@ export class GitHubProfilePublisher {
     }
   }
 
-  private async saveMainUpdated(input: PreparedInput, candidate: Candidate, attempts: number) {
-    if (!this.options.stateStore || !candidate.headSha) {
+  private async saveValidatedBatch(
+    items: CandidateItem[],
+    baseSha: string,
+    commitSha: string,
+    attempts: number,
+  ) {
+    if (!this.options.stateStore) {
       return;
     }
 
-    const checkpoint = checkpointWithOptionalPhoto({
+    const checkpoints = items.map((item) => candidateCheckpointWithOptionalPhoto({
       version: 1,
-      stage: 'main_updated',
-      operationId: input.operationId,
-      fingerprint: input.fingerprint,
-      slug: input.slug,
-      commitSha: candidate.headSha,
+      stage: 'candidate_validated',
+      operationId: item.input.operationId,
+      fingerprint: item.input.fingerprint,
+      slug: item.input.slug,
+      baseSha,
+      commitSha,
       attempts,
-      profileBlobSha: candidate.profileBlobSha,
-    }, candidate.photoBlobSha);
+      profileBlobSha: item.profileBlobSha,
+    }, item.photoBlobSha));
+
+    if (this.options.stateStore.saveBatch) {
+      try {
+        await this.options.stateStore.saveBatch(checkpoints);
+      } catch (error) {
+        await this.clearValidatedCheckpoints(checkpoints.map((checkpoint) => checkpoint.operationId));
+        throw error;
+      }
+      return;
+    }
+
+    const saved: string[] = [];
 
     try {
-      await this.options.stateStore.save(checkpoint);
+      for (const checkpoint of checkpoints) {
+        await this.options.stateStore.save(checkpoint);
+        saved.push(checkpoint.operationId);
+      }
     } catch (error) {
-      this.options.onWarning('Could not persist the main_updated publish checkpoint.', error);
+      await this.clearValidatedCheckpoints(saved);
+      throw error;
     }
+  }
+
+  private async saveMainUpdatedBatch(
+    items: CandidateItem[],
+    commitSha: string,
+    attempts: number,
+  ) {
+    await this.saveMainUpdatedCheckpoints(items.map((item) => mainUpdatedCheckpointWithOptionalPhoto({
+      version: 1,
+      stage: 'main_updated',
+      operationId: item.input.operationId,
+      fingerprint: item.input.fingerprint,
+      slug: item.input.slug,
+      commitSha,
+      attempts,
+      profileBlobSha: item.profileBlobSha,
+    }, item.photoBlobSha)));
+  }
+
+  private async saveMainUpdatedCheckpoints(
+    checkpoints: PendingPublishCheckpoint[],
+  ) {
+    if (!this.options.stateStore) {
+      return;
+    }
+
+    const mainUpdated = checkpoints.map((checkpoint) => mainUpdatedCheckpointWithOptionalPhoto({
+      version: 1,
+      stage: 'main_updated',
+      operationId: checkpoint.operationId,
+      fingerprint: checkpoint.fingerprint,
+      slug: checkpoint.slug,
+      commitSha: checkpoint.commitSha,
+      attempts: checkpoint.attempts,
+      profileBlobSha: checkpoint.profileBlobSha,
+    }, checkpoint.photoBlobSha));
+
+    if (this.options.stateStore.saveBatch) {
+      try {
+        await this.options.stateStore.saveBatch(mainUpdated);
+      } catch (error) {
+        this.options.onWarning('Could not persist the main_updated publish checkpoints.', error);
+      }
+      return;
+    }
+
+    for (const checkpoint of mainUpdated) {
+      try {
+        await this.options.stateStore.save(checkpoint);
+      } catch (error) {
+        this.options.onWarning('Could not persist the main_updated publish checkpoint.', error);
+      }
+    }
+  }
+
+  private async clearValidatedCheckpoints(operationIds: string[]) {
+    if (!this.options.stateStore) {
+      return;
+    }
+
+    await Promise.all(operationIds.map(async (operationId) => {
+      try {
+        await this.options.stateStore!.clear(operationId);
+      } catch (error) {
+        this.options.onWarning(`Could not clear publish checkpoint ${operationId}.`, error);
+      }
+    }));
   }
 
   private async saveCompleted(input: PreparedInput, result: PublishResult) {
@@ -856,6 +1197,35 @@ function normalizeOptions(options: GitHubProfilePublisherOptions): NormalizedOpt
   };
 }
 
+function prepareBatchInputs(inputs: readonly ProfilePublishInput[]) {
+  if (!Array.isArray(inputs) || inputs.length < 1 || inputs.length > PROFILE_PUBLISH_BATCH_MAX_SIZE) {
+    throw new ProfilePublisherError(
+      'invalid_input',
+      `Profile publish batches must contain between 1 and ${PROFILE_PUBLISH_BATCH_MAX_SIZE} items.`,
+    );
+  }
+
+  const prepared = inputs.map(prepareInput);
+  const slugs = new Set<string>();
+  const operationIds = new Set<string>();
+
+  for (const input of prepared) {
+    if (slugs.has(input.slug)) {
+      throw new ProfilePublisherError('invalid_input', `Profile slug ${input.slug} appears twice in one batch.`);
+    }
+    if (operationIds.has(input.operationId)) {
+      throw new ProfilePublisherError(
+        'invalid_input',
+        `Operation ID ${input.operationId} appears twice in one batch.`,
+      );
+    }
+    slugs.add(input.slug);
+    operationIds.add(input.operationId);
+  }
+
+  return prepared;
+}
+
 function prepareInput(input: ProfilePublishInput): PreparedInput {
   if (!SLUG_PATTERN.test(input.slug) || input.slug.length > 64) {
     throw new ProfilePublisherError('invalid_input', 'Profile slug is invalid.');
@@ -939,7 +1309,12 @@ function fingerprintInput(input: ProfilePublishInput) {
 }
 
 function assertMatchingCheckpoint(checkpoint: PublishCheckpoint, input: PreparedInput) {
-  if (checkpoint.version !== 1 || checkpoint.slug !== input.slug || checkpoint.fingerprint !== input.fingerprint) {
+  if (
+    checkpoint.version !== 1
+    || checkpoint.operationId !== input.operationId
+    || checkpoint.slug !== input.slug
+    || checkpoint.fingerprint !== input.fingerprint
+  ) {
     throw new ProfilePublisherError(
       'invalid_input',
       'Operation ID was already used for a different profile publication.',
@@ -962,8 +1337,44 @@ function assertExpectedShaSyntax(value: string | null, label: string) {
   }
 }
 
-function temporaryBranchName(input: PreparedInput, attempt: number) {
-  return `bot/profile/${input.slug}/${input.operationId}/a${attempt}`;
+function temporaryBranchName(
+  inputs: PreparedInput[],
+  expectedDiff: DiffExpectation[],
+  attempt: number,
+) {
+  if (inputs.length === 1) {
+    const [input] = inputs;
+    return `bot/profile/${input!.slug}/${input!.operationId}/a${attempt}`;
+  }
+
+  const identity = createHash('sha256');
+  for (const input of [...inputs].sort((left, right) => left.slug.localeCompare(right.slug))) {
+    identity.update(input.slug);
+    identity.update('\0');
+    identity.update(input.operationId);
+    identity.update('\0');
+    identity.update(input.fingerprint);
+    identity.update('\n');
+  }
+
+  return `bot/profile-batch/${identity.digest('hex').slice(0, 24)}/${diffManifestHash(expectedDiff)}/a${attempt}`;
+}
+
+function diffManifestHash(expectedDiff: DiffExpectation[]) {
+  const status = { added: 'A', modified: 'M', removed: 'D' } as const;
+  const manifest = expectedDiff
+    .map((entry) => `${status[entry.status]}\t${entry.path}\n`)
+    .sort()
+    .join('');
+  return createHash('sha256').update(manifest).digest('hex');
+}
+
+function batchCommitMessage(inputs: PreparedInput[]) {
+  const noun = inputs.length === 1 ? 'profile update' : 'profile updates';
+  const trailers = inputs
+    .map((input) => `Profile-Operation: ${input.slug} ${input.operationId}`)
+    .join('\n');
+  return `Profiles: publish ${inputs.length} ${noun}\n\n${trailers}`;
 }
 
 function parseWorkflowRun(value: unknown): WorkflowRun {
@@ -1032,6 +1443,11 @@ function getErrorStatus(error: unknown) {
   return typeof error.status === 'number' ? error.status : undefined;
 }
 
+function isExplicitRefUpdateRejection(error: unknown) {
+  const status = getErrorStatus(error);
+  return status === 403 || status === 409 || status === 422;
+}
+
 function invalidGitHubResponse(message: string) {
   return new ProfilePublisherError('github_response_invalid', message);
 }
@@ -1091,11 +1507,18 @@ function requireNestedString(value: Record<string, unknown>, path: string[], lab
   return current;
 }
 
-function candidateWithOptionalPhoto(
-  candidate: Omit<Candidate, 'photoBlobSha'>,
+function candidateItemWithOptionalPhoto(
+  candidate: Omit<CandidateItem, 'photoBlobSha'>,
   photoBlobSha: string | null | undefined,
-): Candidate {
+): CandidateItem {
   return photoBlobSha === undefined ? candidate : { ...candidate, photoBlobSha };
+}
+
+function requireBatchResults(results: Array<PublishResult | undefined>) {
+  if (results.length === 0 || results.some((result) => result === undefined)) {
+    throw invalidGitHubResponse('Profile publish batch completed without every item result.');
+  }
+  return results as PublishResult[];
 }
 
 function resultWithOptionalPhoto(
@@ -1105,9 +1528,16 @@ function resultWithOptionalPhoto(
   return typeof photoBlobSha === 'string' ? { ...result, photoBlobSha } : result;
 }
 
-function checkpointWithOptionalPhoto(
-  checkpoint: Omit<Extract<PublishCheckpoint, { stage: 'main_updated' }>, 'photoBlobSha'>,
+function candidateCheckpointWithOptionalPhoto(
+  checkpoint: Omit<CandidateValidatedCheckpoint, 'photoBlobSha'>,
   photoBlobSha: string | null | undefined,
-): Extract<PublishCheckpoint, { stage: 'main_updated' }> {
+): CandidateValidatedCheckpoint {
+  return typeof photoBlobSha === 'string' ? { ...checkpoint, photoBlobSha } : checkpoint;
+}
+
+function mainUpdatedCheckpointWithOptionalPhoto(
+  checkpoint: Omit<MainUpdatedCheckpoint, 'photoBlobSha'>,
+  photoBlobSha: string | null | undefined,
+): MainUpdatedCheckpoint {
   return typeof photoBlobSha === 'string' ? { ...checkpoint, photoBlobSha } : checkpoint;
 }

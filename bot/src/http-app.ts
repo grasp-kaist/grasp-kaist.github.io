@@ -5,6 +5,9 @@ export type BotHealthSnapshot = {
   gateway: 'starting' | 'ready' | 'reconnecting' | 'disconnected' | 'stopping';
   profileRecovery: 'running' | 'ready';
   publicationMode: 'sandbox' | 'production';
+  publicationQueue: 'disabled' | 'recovering' | 'ready' | 'degraded';
+  queuedPublications: number;
+  storage: 'ready';
 };
 
 export function createHealthApp(getSnapshot: () => BotHealthSnapshot) {
@@ -18,6 +21,9 @@ export function createHealthApp(getSnapshot: () => BotHealthSnapshot) {
         gateway: snapshot.gateway,
         profileRecovery: snapshot.profileRecovery,
         publicationMode: snapshot.publicationMode,
+        publicationQueue: snapshot.publicationQueue,
+        queuedPublications: snapshot.queuedPublications,
+        storage: snapshot.storage,
       },
       snapshot.ready ? 200 : 503,
     );

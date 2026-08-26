@@ -353,6 +353,20 @@ export function operationCompleteEdit(
   result?: ProfileOperationResult,
   publicationMode: 'sandbox' | 'production' = 'production',
 ): DiscordMessagePayload {
+  if (result?.queued) {
+    return v2Edit(
+      [
+        {
+          type: 10,
+          content:
+            'The profile update was accepted and is safely queued. '
+            + 'Run `/profile` again shortly to see the published result.',
+        },
+      ],
+      [],
+    );
+  }
+
   if (result?.snapshot) {
     return profilePanelEdit(result.snapshot, message, publicationMode);
   }

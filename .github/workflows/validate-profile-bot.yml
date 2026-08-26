@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - 'bot/profile/**'
+      - 'bot/profile-batch/**'
 
 permissions:
   contents: read
@@ -23,23 +24,27 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Restrict the candidate diff to one member profile
+      - name: Verify the candidate profile manifest
         id: candidate
         shell: bash
         run: |
           set -euo pipefail
 
           branch="${GITHUB_REF_NAME}"
-          remainder="${branch#bot/profile/}"
-          branch_pattern='^([a-z0-9]+(-[a-z0-9]+)*)/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/a([1-2])$'
+          legacy_remainder="${branch#bot/profile/}"
+          batch_remainder="${branch#bot/profile-batch/}"
+          legacy_pattern='^([a-z0-9]+(-[a-z0-9]+)*)/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/a([1-2])$'
+          batch_pattern='^([0-9a-f]{24})/([0-9a-f]{64})/a([1-2])$'
+          mode=''
+          expected_slug=''
+          expected_manifest=''
 
-          if [[ "${branch}" == "${remainder}" ]]; then
-            echo "Invalid profile bot branch: ${branch}" >&2
-            exit 1
-          fi
-
-          if [[ "${remainder}" =~ ${branch_pattern} ]]; then
-            slug="${BASH_REMATCH[1]}"
+          if [[ "${branch}" != "${legacy_remainder}" && "${legacy_remainder}" =~ ${legacy_pattern} ]]; then
+            mode='legacy'
+            expected_slug="${BASH_REMATCH[1]}"
+          elif [[ "${branch}" != "${batch_remainder}" && "${batch_remainder}" =~ ${batch_pattern} ]]; then
+            mode='batch'
+            expected_manifest="${BASH_REMATCH[2]}"
           else
             echo "Invalid profile bot branch: ${branch}" >&2
             exit 1
@@ -51,15 +56,24 @@ jobs:
             exit 1
           fi
 
-          json_path="src/data/members/${slug}.json"
-          photo_path="src/data/members/${slug}.webp"
           changed_count=0
+          manifest_file="$(mktemp)"
+          declare -A changed_slugs=()
 
           while IFS=$'\t' read -r status path; do
             [[ -n "${path}" ]] || continue
             changed_count=$((changed_count + 1))
-            if [[ "${path}" != "${json_path}" && "${path}" != "${photo_path}" ]]; then
+
+            path_pattern='^src/data/members/([a-z0-9]+(-[a-z0-9]+)*)\.(json|webp)$'
+            if [[ ! "${path}" =~ ${path_pattern} ]]; then
               echo "Unexpected profile bot path: ${path}" >&2
+              exit 1
+            fi
+            slug="${BASH_REMATCH[1]}"
+            extension="${BASH_REMATCH[3]}"
+
+            if [[ "${mode}" == 'legacy' && "${slug}" != "${expected_slug}" ]]; then
+              echo "Legacy profile branch changed another slug: ${path}" >&2
               exit 1
             fi
 
@@ -68,23 +82,44 @@ jobs:
               exit 1
             fi
 
-            if [[ "${path}" == "${json_path}" && "${status}" == "D" ]]; then
-              echo "Profile bot commits may not delete ${json_path}." >&2
+            if [[ "${extension}" == 'json' && "${status}" == "D" ]]; then
+              echo "Profile bot commits may not delete ${path}." >&2
               exit 1
             fi
+
+            changed_slugs["${slug}"]=1
+            printf '%s\t%s\n' "${status}" "${path}" >> "${manifest_file}"
           done < <(git diff-tree --no-commit-id --name-status --no-renames -r HEAD^ HEAD)
 
-          if (( changed_count < 1 || changed_count > 2 )); then
-            echo "Profile bot commits must change one or two allowed files." >&2
+          slug_count="${#changed_slugs[@]}"
+          if (( changed_count < 1 || changed_count > 40 || slug_count < 1 || slug_count > 20 )); then
+            echo "Profile bot commits must change at most 20 profiles and 40 allowed files." >&2
             exit 1
           fi
 
-          if [[ ! -f "${json_path}" ]]; then
-            echo "Candidate profile JSON is missing: ${json_path}" >&2
+          if [[ "${mode}" == 'legacy' ]] && (( changed_count > 2 || slug_count != 1 )); then
+            echo "Legacy profile bot commits must change one or two files for one slug." >&2
             exit 1
           fi
 
-          echo "slug=${slug}" >> "${GITHUB_OUTPUT}"
+          mapfile -t slugs < <(printf '%s\n' "${!changed_slugs[@]}" | LC_ALL=C sort)
+          for slug in "${slugs[@]}"; do
+            json_path="src/data/members/${slug}.json"
+            if [[ ! -f "${json_path}" ]]; then
+              echo "Candidate profile JSON is missing: ${json_path}" >&2
+              exit 1
+            fi
+          done
+
+          if [[ "${mode}" == 'batch' ]]; then
+            actual_manifest="$(LC_ALL=C sort "${manifest_file}" | sha256sum | awk '{ print $1 }')"
+            if [[ "${actual_manifest}" != "${expected_manifest}" ]]; then
+              echo "Profile batch manifest mismatch." >&2
+              exit 1
+            fi
+          fi
+
+          echo "slugs=${slugs[*]}" >> "${GITHUB_OUTPUT}"
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
@@ -105,7 +140,12 @@ jobs:
         run: npm run validate:profiles
 
       - name: Validate bot-managed profile and photo relation
-        run: node bot/scripts/validate-profile-candidate.mjs "${{ steps.candidate.outputs.slug }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          for slug in ${{ steps.candidate.outputs.slugs }}; do
+            node bot/scripts/validate-profile-candidate.mjs "${slug}"
+          done
 
       - name: Build the site
         run: npm run build

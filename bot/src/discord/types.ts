@@ -26,6 +26,8 @@ export type ProfileOperationResult = {
   snapshot?: ProfileSnapshot;
   commitSha?: string;
   deploymentStatus?: string;
+  queued?: boolean;
+  operationId?: string;
 };
 
 export type LocalProfileProbe = {

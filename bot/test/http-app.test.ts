@@ -9,6 +9,9 @@ test('health endpoint stays unavailable until the Gateway is ready', async () =>
     gateway: 'starting',
     profileRecovery: 'running',
     publicationMode: 'sandbox',
+    publicationQueue: 'disabled',
+    queuedPublications: 0,
+    storage: 'ready',
   };
   const app = createHealthApp(() => snapshot);
 
@@ -19,6 +22,9 @@ test('health endpoint stays unavailable until the Gateway is ready', async () =>
     gateway: 'starting',
     profileRecovery: 'running',
     publicationMode: 'sandbox',
+    publicationQueue: 'disabled',
+    queuedPublications: 0,
+    storage: 'ready',
   });
 
   snapshot = {
@@ -26,6 +32,9 @@ test('health endpoint stays unavailable until the Gateway is ready', async () =>
     ready: true,
     gateway: 'ready',
     profileRecovery: 'ready',
+    publicationQueue: 'disabled',
+    queuedPublications: 0,
+    storage: 'ready',
   };
   const ready = await app.request('/healthz');
   assert.equal(ready.status, 200);
@@ -34,6 +43,9 @@ test('health endpoint stays unavailable until the Gateway is ready', async () =>
     gateway: 'ready',
     profileRecovery: 'ready',
     publicationMode: 'sandbox',
+    publicationQueue: 'disabled',
+    queuedPublications: 0,
+    storage: 'ready',
   });
 });
 
@@ -43,6 +55,9 @@ test('health service exposes no Discord interaction route', async () => {
     gateway: 'ready',
     profileRecovery: 'ready',
     publicationMode: 'production',
+    publicationQueue: 'ready',
+    queuedPublications: 3,
+    storage: 'ready',
   }));
 
   const response = await app.request('/interactions', { method: 'POST' });

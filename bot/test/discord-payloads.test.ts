@@ -8,6 +8,7 @@ import {
   editBasicModalResponse,
   editTextModalResponse,
   IS_COMPONENTS_V2_FLAG,
+  operationCompleteEdit,
   photoUploadModalResponse,
   preparedPhotoPreviewEdit,
   profilePanelResponse,
@@ -203,6 +204,20 @@ test('prepared photo preview attaches WebP and binds confirm/cancel to its token
     (row.components as Array<Record<string, unknown>>).map((button) => button.custom_id),
     ['profile:photo-confirm:stage_abc-123', 'profile:photo-cancel:stage_abc-123'],
   );
+});
+
+test('queued publications tell the user to reopen the profile instead of claiming completion', () => {
+  const payload = operationCompleteEdit(
+    'Your profile was updated.',
+    { queued: true, operationId: 'operation-1', deploymentStatus: 'queued' },
+  );
+  const content = String(
+    (payload.components as Array<Record<string, unknown>>)[0]?.content,
+  );
+
+  assert.match(content, /safely queued/i);
+  assert.match(content, /\/profile/);
+  assert.doesNotMatch(content, /Your profile was updated/);
 });
 
 function snapshot(): ProfileSnapshot {

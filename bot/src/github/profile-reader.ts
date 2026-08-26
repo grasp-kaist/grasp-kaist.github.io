@@ -106,7 +106,7 @@ export class GitHubProfileReader {
       result.commitSha = latestRelevantCommit.sha;
     }
 
-    const operationId = getOperationIdTrailer(latestRelevantCommit.message);
+    const operationId = getOperationIdTrailer(latestRelevantCommit.message, slug);
 
     if (operationId) {
       result.operationId = operationId;
@@ -209,9 +209,28 @@ export class GitHubProfileReader {
   }
 }
 
-function getOperationIdTrailer(message: string) {
-  const match = message.match(/(?:^|\n)Profile-Operation: ([A-Za-z0-9][A-Za-z0-9_-]{0,127})(?:\n|$)/);
-  return match?.[1];
+function getOperationIdTrailer(message: string, slug: string) {
+  let legacyOperationId: string | undefined;
+  let hasBatchTrailer = false;
+
+  for (const line of message.split('\n')) {
+    const batch = /^Profile-Operation: ([a-z0-9]+(?:-[a-z0-9]+)*) ([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(line);
+
+    if (batch) {
+      hasBatchTrailer = true;
+      if (batch[1] === slug) {
+        return batch[2];
+      }
+      continue;
+    }
+
+    const legacy = /^Profile-Operation: ([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/.exec(line);
+    if (legacy) {
+      legacyOperationId = legacy[1];
+    }
+  }
+
+  return hasBatchTrailer ? undefined : legacyOperationId;
 }
 
 function decodeBase64(content: string, path: string) {

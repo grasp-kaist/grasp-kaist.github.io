@@ -17,8 +17,8 @@ import {
 import { SqliteStore } from '../src/storage/sqlite-store.js';
 
 const SLUG = 'sandbox-member';
-const GUILD_ID = '1481587416832933999';
-const OTHER_GUILD_ID = '751112478947016836';
+const GUILD_ID = '111111111111111111';
+const OTHER_GUILD_ID = '222222222222222222';
 
 function createRepository(rootDirectory: string, guildId = GUILD_ID) {
   return new SandboxProfileRepository({ rootDirectory, guildId });

@@ -11,6 +11,7 @@ import {
 import { processProfilePhoto } from '../image/process-profile-photo.js';
 import {
   BindingConflictError,
+  PublicationJobConflictError,
   SqliteStore,
   type PendingAdminAction,
   type ProfileBinding,
@@ -42,6 +43,8 @@ export type ProfileOperationResult = {
   snapshot?: ProfileSnapshot;
   commitSha?: string;
   deploymentStatus?: string;
+  queued?: boolean;
+  operationId?: string;
 };
 
 export type LocalProfileProbe = {
@@ -87,18 +90,40 @@ export type ProfilePublishInput = {
       };
 };
 
-export type ProfilePublishResult = {
-  status: 'deployed' | 'no_change' | 'published_deploy_failed' | 'sandbox';
-  commitSha?: string;
-  profileBlobSha: string;
-  photoBlobSha?: string | null;
-  attempts: number;
-  workflowRunUrl?: string;
-  pageStatus?: string;
+export type ProfilePublishResult =
+  | {
+      status: 'queued';
+      operationId: string;
+      attempts: 0;
+    }
+  | {
+      status: 'deployed' | 'no_change' | 'published_deploy_failed' | 'sandbox';
+      commitSha?: string;
+      profileBlobSha: string;
+      photoBlobSha?: string | null;
+      attempts: number;
+      workflowRunUrl?: string;
+      pageStatus?: string;
+      stateApplied?: boolean;
+    };
+
+export type ProfilePublishContext = {
+  guildId: string;
+  actorUserId: string;
+  targetUserId: string;
+  interactionId: string;
+  receiptKind: string;
+  stagedPhotoId?: string;
+  adminAction?: PendingAdminAction;
+  awaitCompletion?: boolean;
 };
 
 export interface ProfilePublisher {
-  publish(input: ProfilePublishInput): Promise<ProfilePublishResult>;
+  readonly usesDurableQueue?: boolean;
+  publish(
+    input: ProfilePublishInput,
+    context?: ProfilePublishContext,
+  ): Promise<ProfilePublishResult>;
 }
 
 export type RepositoryProfileSnapshot = {
@@ -192,6 +217,13 @@ export class ProfileService {
 
     let state = this.#store.getProfileState(guildId, binding.profileSlug);
 
+    // A durable publication job owns reconciliation for this slug until it is
+    // atomically applied. Reading main here could observe the just-published
+    // commit first and make the worker's binding/receipt CAS impossible.
+    if (this.#store.hasNonterminalPublicationJob(guildId, binding.profileSlug)) {
+      return state ? this.#snapshot(binding, state) : null;
+    }
+
     if (
       this.#repositoryReader
       && (
@@ -235,7 +267,12 @@ export class ProfileService {
       return summary;
     }
 
-    const pendingBindings = [...this.#store.listBindings(this.#guildId)];
+    const pendingBindings = this.#store.listBindings(this.#guildId).filter(
+      (binding) => !this.#store.hasNonterminalPublicationJob(
+        binding.guildId,
+        binding.profileSlug,
+      ),
+    );
     const workers = Array.from(
       {
         length: Math.min(STARTUP_RECONCILIATION_CONCURRENCY, pendingBindings.length),
@@ -316,8 +353,18 @@ export class ProfileService {
               slug,
               action: 'PROFILE_CREATE',
               profile: { json: serializeProfile(profile), expectedSha: null },
-            });
+            }, this.#publishContext(actor, actor.userId, 'PROFILE_CREATE'));
+
+            if (publishResult.status === 'queued') {
+              return this.#queuedResult(publishResult.operationId);
+            }
+
             published = true;
+
+            if (publishResult.stateApplied) {
+              return this.#currentOperationResult(actor.guildId, actor.userId, slug);
+            }
+
             const publishedState = this.#publishedStateInput(slug, profile, publishResult);
             const { binding, state } = this.#store.activateBindingWithProfileState(
               actor.guildId,
@@ -412,8 +459,13 @@ export class ProfileService {
         height: processed.height,
       };
     } catch (error) {
-      this.#store.finishInteraction(actor.interactionId, 'failed', { error: toErrorMessage(error) });
-      throw error;
+      const normalizedError = publicationConflictError(error);
+      this.#store.finishInteraction(
+        actor.interactionId,
+        'failed',
+        { error: toErrorMessage(normalizedError) },
+      );
+      throw normalizedError;
     }
   }
 
@@ -470,7 +522,26 @@ export class ProfileService {
                   bytes: staged.bytes,
                   expectedSha: state.photoBlobSha ?? null,
                 },
-              });
+              }, this.#publishContext(
+                actor,
+                actor.userId,
+                'PROFILE_REPLACE_PHOTO',
+                { stagedPhotoId },
+              ));
+
+              if (publishResult.status === 'queued') {
+                return this.#queuedResult(publishResult.operationId);
+              }
+
+              if (publishResult.stateApplied) {
+                this.#store.deleteStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+                return this.#currentOperationResult(
+                  actor.guildId,
+                  actor.userId,
+                  binding.profileSlug,
+                );
+              }
+
               const nextState = this.#savePublishedState(
                 actor.guildId,
                 binding.profileSlug,
@@ -502,13 +573,21 @@ export class ProfileService {
 
   async discardOwnPhoto(actor: DiscordActor, stagedPhotoId: string): Promise<void> {
     this.#assertActor(actor);
+    const binding = this.#store.getBinding(actor.guildId, actor.userId);
+    if (binding) {
+      this.#assertNoPendingPublication(binding);
+    }
     const staged = this.#store.getStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
 
     if (staged?.status === 'publishing') {
       throw new ProfileServiceError('photo_publishing', 'This photo is already being published.');
     }
 
-    this.#store.deleteStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+    try {
+      this.#store.deleteStagedPhoto(actor.guildId, actor.userId, stagedPhotoId);
+    } catch (error) {
+      throw publicationConflictError(error);
+    }
     this.#audit(actor, staged?.profileSlug, 'PROFILE_DISCARD_PHOTO', {});
   }
 
@@ -549,7 +628,20 @@ export class ProfileService {
               action: 'PROFILE_REMOVE_PHOTO',
               profile: { json: serializeProfile(nextProfile), expectedSha: state.profileBlobSha },
               photo: { kind: 'delete', expectedSha: state.photoBlobSha },
-            });
+            }, this.#publishContext(actor, actor.userId, 'PROFILE_REMOVE_PHOTO'));
+
+            if (publishResult.status === 'queued') {
+              return this.#queuedResult(publishResult.operationId);
+            }
+
+            if (publishResult.stateApplied) {
+              return this.#currentOperationResult(
+                actor.guildId,
+                actor.userId,
+                binding.profileSlug,
+              );
+            }
+
             const nextState = this.#savePublishedState(
               actor.guildId,
               binding.profileSlug,
@@ -610,6 +702,7 @@ export class ProfileService {
         async () => {
           const binding = this.#requireBinding(actor.guildId, targetUserId);
           this.#assertSameProfileBinding(initialBinding, binding);
+          this.#assertNoPendingPublication(binding);
           const state = this.#requireState(actor.guildId, binding.profileSlug);
           if (binding.pendingAdminAction) {
             throw new ProfileServiceError(
@@ -637,6 +730,7 @@ export class ProfileService {
         async () => {
           const binding = this.#requireBinding(actor.guildId, targetUserId);
           this.#assertSameProfileBinding(initialBinding, binding);
+          this.#assertNoPendingPublication(binding);
           const state = this.#requireState(actor.guildId, binding.profileSlug);
           if (binding.pendingAdminAction) {
             throw new ProfileServiceError(
@@ -668,6 +762,7 @@ export class ProfileService {
         async () => {
           const source = this.#requireBinding(actor.guildId, fromUserId);
           this.#assertSameProfileBinding(initialSource, source);
+          this.#assertNoPendingPublication(source);
           const state = this.#requireState(actor.guildId, source.profileSlug);
           const binding = this.#store.transferBinding(actor.guildId, source.profileSlug, toUserId);
           const result = this.#operationResult(binding, state);
@@ -711,6 +806,7 @@ export class ProfileService {
         async () => {
           const current = this.#requireBinding(actor.guildId, targetUserId);
           this.#assertSameProfileBinding(initialBinding, current);
+          this.#assertNoPendingPublication(current);
 
           const state = this.#requireState(actor.guildId, current.profileSlug);
 
@@ -730,12 +826,15 @@ export class ProfileService {
 
           const profile = parseProfile(state.profileJson);
           const hiddenProfile = normalizeMemberProfile({ ...profile, listed: false });
-          const pending = this.#store.beginAdminAction(
-            actor.guildId,
-            targetUserId,
-            adminAction,
-            operationId,
-          );
+          const usesDurableQueue = this.#publisher.usesDurableQueue === true;
+          const pending = usesDurableQueue
+            ? current
+            : this.#store.beginAdminAction(
+                actor.guildId,
+                targetUserId,
+                adminAction,
+                operationId,
+              );
 
           try {
             const publishResult = await this.#publisher.publish({
@@ -746,7 +845,20 @@ export class ProfileService {
                 json: serializeProfile(hiddenProfile),
                 expectedSha: state.profileBlobSha,
               },
-            });
+            }, this.#publishContext(actor, targetUserId, auditAction, { adminAction }));
+
+            if (publishResult.status === 'queued') {
+              return this.#queuedResult(publishResult.operationId);
+            }
+
+            if (publishResult.stateApplied) {
+              return this.#currentOperationResult(
+                actor.guildId,
+                targetUserId,
+                current.profileSlug,
+              );
+            }
+
             const completed = this.#store.completeAdminActionWithProfileState({
               guildId: actor.guildId,
               discordUserId: targetUserId,
@@ -764,7 +876,7 @@ export class ProfileService {
             this.#audit(actor, current.profileSlug, auditAction, result, { targetUserId });
             return result;
           } catch (error) {
-            if (isDefinitelyUnpublishedRegistrationFailure(error)) {
+            if (!usesDurableQueue && isDefinitelyUnpublishedRegistrationFailure(error)) {
               this.#store.clearPendingAdminAction(actor.guildId, targetUserId, operationId);
             } else {
               this.#markReconciliationNeededAfterAmbiguousPublish(error, pending);
@@ -818,6 +930,7 @@ export class ProfileService {
           async () => {
             const binding = this.#requireBinding(actor.guildId, targetUserId);
             this.#assertSameProfileBinding(initialBinding, binding);
+            this.#assertNoPendingPublication(binding);
             recoveryBinding = binding;
 
             if (binding.pendingAdminAction) {
@@ -853,7 +966,20 @@ export class ProfileService {
               action,
               profile: { json: serializeProfile(nextProfile), expectedSha: state.profileBlobSha },
               ...(photo ? { photo } : {}),
-            });
+            }, this.#publishContext(actor, targetUserId, action));
+
+            if (publishResult.status === 'queued') {
+              return this.#queuedResult(publishResult.operationId);
+            }
+
+            if (publishResult.stateApplied) {
+              return this.#currentOperationResult(
+                actor.guildId,
+                targetUserId,
+                binding.profileSlug,
+              );
+            }
+
             const photoChange = photo?.kind;
             const nextState = this.#savePublishedState(
               actor.guildId,
@@ -882,6 +1008,7 @@ export class ProfileService {
   #requireOwnActiveState(actor: DiscordActor) {
     this.#assertActor(actor);
     const binding = this.#requireBinding(actor.guildId, actor.userId);
+    this.#assertNoPendingPublication(binding);
 
     if (binding.status !== 'active') {
       throw new ProfileServiceError('profile_revoked', 'This profile is currently revoked.');
@@ -898,7 +1025,20 @@ export class ProfileService {
     return { binding, state, profile: parseProfile(state.profileJson) };
   }
 
+  #assertNoPendingPublication(binding: ProfileBinding) {
+    if (this.#store.hasNonterminalPublicationJob(binding.guildId, binding.profileSlug)) {
+      throw new ProfileServiceError(
+        'publication_pending',
+        'A website update for this profile is already queued or publishing. Try again after it finishes.',
+      );
+    }
+  }
+
   async #reconcileBinding(binding: ProfileBinding): Promise<ProfileState | undefined> {
+    if (this.#store.hasNonterminalPublicationJob(binding.guildId, binding.profileSlug)) {
+      return this.#store.getProfileState(binding.guildId, binding.profileSlug);
+    }
+
     const key = profileKey(binding.guildId, binding.profileSlug);
     const existingTask = this.#reconciliationTasks.get(key);
 
@@ -1046,6 +1186,19 @@ export class ProfileService {
     let recoveredInput: Omit<ProfileStateInput, 'guildId'>;
 
     if (remote.profile.listed) {
+      const receiptKind = action === 'revoke' ? 'PROFILE_OWNER_REVOKE' : 'PROFILE_OWNER_HIDE';
+      const receipt = this.#store.getProcessingInteractionReceiptByOperation(
+        operationId,
+        receiptKind,
+      );
+
+      if (!receipt) {
+        throw new ProfileServiceError(
+          'admin_action_corrupt',
+          'The pending owner moderation receipt is missing; writes remain blocked.',
+        );
+      }
+
       const publishResult = await this.#publisher.publish({
         operationId,
         slug: binding.profileSlug,
@@ -1054,7 +1207,27 @@ export class ProfileService {
           json: serializeProfile(hiddenProfile),
           expectedSha: remote.profileBlobSha,
         },
+      }, {
+        guildId: binding.guildId,
+        actorUserId: this.#ownerUserId,
+        targetUserId: binding.discordUserId,
+        interactionId: receipt.interactionId,
+        receiptKind,
+        adminAction: action,
+        awaitCompletion: true,
       });
+
+      if (publishResult.status === 'queued') {
+        throw new ProfileServiceError(
+          'publication_queued',
+          'The recovered owner action is durably queued but has not completed yet.',
+        );
+      }
+
+      if (publishResult.stateApplied) {
+        return this.#requireState(binding.guildId, binding.profileSlug);
+      }
+
       recoveredInput = this.#publishedStateInput(
         binding.profileSlug,
         hiddenProfile,
@@ -1368,11 +1541,21 @@ export class ProfileService {
 
     try {
       const result = await operation(operationId);
+
+      if (result.queued) {
+        return result;
+      }
+
       this.#store.finishInteraction(actor.interactionId, 'completed', result);
       return result;
     } catch (error) {
-      this.#store.finishInteraction(actor.interactionId, 'failed', { error: toErrorMessage(error) });
-      throw error;
+      const normalizedError = publicationConflictError(error);
+      this.#store.finishInteraction(
+        actor.interactionId,
+        'failed',
+        { error: toErrorMessage(normalizedError) },
+      );
+      throw normalizedError;
     }
   }
 
@@ -1380,7 +1563,7 @@ export class ProfileService {
     guildId: string,
     slug: string,
     profile: MemberProfile,
-    result: ProfilePublishResult,
+    result: Exclude<ProfilePublishResult, { status: 'queued' }>,
     photoChange?: 'upsert' | 'delete',
     previous?: ProfileState,
   ) {
@@ -1405,7 +1588,7 @@ export class ProfileService {
   #publishedStateInput(
     slug: string,
     profile: MemberProfile,
-    result: ProfilePublishResult,
+    result: Exclude<ProfilePublishResult, { status: 'queued' }>,
     photoBlobSha?: string,
     previous?: ProfileState,
   ) {
@@ -1435,6 +1618,48 @@ export class ProfileService {
     }
 
     return result;
+  }
+
+  #queuedResult(operationId: string): ProfileOperationResult {
+    return {
+      queued: true,
+      operationId,
+      deploymentStatus: 'queued',
+    };
+  }
+
+  #currentOperationResult(
+    guildId: string,
+    targetUserId: string,
+    expectedSlug: string,
+  ) {
+    const binding = this.#requireBinding(guildId, targetUserId);
+
+    if (binding.profileSlug !== expectedSlug) {
+      throw new ProfileServiceError(
+        'profile_binding_changed',
+        'The queued publication completed for a profile whose binding has changed.',
+      );
+    }
+
+    const state = this.#requireState(guildId, expectedSlug);
+    return this.#operationResult(binding, state);
+  }
+
+  #publishContext(
+    actor: DiscordActor,
+    targetUserId: string,
+    receiptKind: string,
+    optional: Pick<ProfilePublishContext, 'stagedPhotoId' | 'adminAction'> = {},
+  ): ProfilePublishContext {
+    return {
+      guildId: actor.guildId,
+      actorUserId: actor.userId,
+      targetUserId,
+      interactionId: actor.interactionId,
+      receiptKind,
+      ...optional,
+    };
   }
 
   #snapshot(binding: ProfileBinding, state: ProfileState): ProfileSnapshot {
@@ -1528,6 +1753,15 @@ function toErrorMessage(error: unknown) {
 
 function isContentConflict(error: unknown) {
   return isRecord(error) && error.code === 'content_conflict';
+}
+
+function publicationConflictError(error: unknown) {
+  return error instanceof PublicationJobConflictError
+    ? new ProfileServiceError(
+        'publication_pending',
+        'A website update for this profile is already queued or publishing. Try again after it finishes.',
+      )
+    : error;
 }
 
 function isPublicationTimeout(error: unknown) {

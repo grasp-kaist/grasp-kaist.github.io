@@ -14,9 +14,11 @@ RUN npm run build && npm prune --omit=dev
 FROM node:24-bookworm-slim AS runtime
 
 ENV NODE_ENV=production \
+    PROFILE_REQUIRE_PERSISTENT_STORAGE=true \
     PROFILE_PUBLISH_MODE=sandbox \
     DATABASE_PATH=/data/sandbox/grasp-profile-bot.sqlite \
-    SANDBOX_PROFILE_DIRECTORY=/data/sandbox/profiles
+    SANDBOX_PROFILE_DIRECTORY=/data/sandbox/profiles \
+    PROFILE_BACKUP_DIRECTORY=/data/backups
 
 WORKDIR /app/bot
 

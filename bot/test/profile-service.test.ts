@@ -7,6 +7,7 @@ import {
   ProfileService,
   ProfileServiceError,
   type ProfilePublishInput,
+  type ProfilePublishContext,
   type ProfilePublishResult,
   type ProfilePublisher,
   type ProfileRepositoryReader,
@@ -19,12 +20,23 @@ const ownerUserId = 'owner';
 
 class RecordingPublisher implements ProfilePublisher {
   readonly calls: ProfilePublishInput[] = [];
+  readonly contexts: Array<ProfilePublishContext | undefined> = [];
   failNext: Error | undefined;
-  nextStatus: ProfilePublishResult['status'] | undefined;
+  nextStatus: Exclude<ProfilePublishResult['status'], 'queued'> | undefined;
   pauseNext: Promise<void> | undefined;
+  queueNext = false;
 
-  async publish(input: ProfilePublishInput): Promise<ProfilePublishResult> {
+  async publish(
+    input: ProfilePublishInput,
+    context?: ProfilePublishContext,
+  ): Promise<ProfilePublishResult> {
     this.calls.push(input);
+    this.contexts.push(context);
+
+    if (this.queueNext) {
+      this.queueNext = false;
+      return { status: 'queued', operationId: input.operationId, attempts: 0 };
+    }
 
     if (this.failNext) {
       const error = this.failNext;
@@ -157,6 +169,32 @@ test('registration immediately binds an unlisted canonical profile and is idempo
     assert.equal(first.snapshot?.profileSlug, 'example-member');
     assert.deepEqual(repeated, first);
     assert.equal(store.getBinding(guildId, 'member')?.status, 'active');
+  } finally {
+    store.close();
+  }
+});
+
+test('a queued registration keeps its reservation and processing receipt for the worker', async () => {
+  const { store, publisher, service } = createFixture();
+  publisher.queueNext = true;
+
+  try {
+    const result = await registerMember(service);
+
+    assert.deepEqual(result, {
+      queued: true,
+      operationId: 'operation-1',
+      deploymentStatus: 'queued',
+    });
+    assert.equal(store.getBinding(guildId, 'member')?.status, 'provisioning');
+    assert.equal(store.getInteractionReceipt('register-member')?.status, 'processing');
+    assert.deepEqual(publisher.contexts[0], {
+      guildId,
+      actorUserId: 'member',
+      targetUserId: 'member',
+      interactionId: 'register-member',
+      receiptKind: 'PROFILE_CREATE',
+    });
   } finally {
     store.close();
   }
@@ -352,6 +390,166 @@ test('profile edits carry the stored blob revision and listed is independently m
     assert.deepEqual(updated.snapshot?.profile.details, ['B.S. student']);
     assert.equal(updated.snapshot?.profile.website, 'example.com');
     assert.equal(listed.snapshot?.profile.listed, true);
+  } finally {
+    store.close();
+  }
+});
+
+test('a queued edit leaves published state unchanged until the worker applies it', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    publisher.queueNext = true;
+    const result = await service.updateOwnProfile(
+      actor('queued-edit'),
+      { website: 'queued.example' },
+      currentRevision(service),
+    );
+
+    assert.equal(result.queued, true);
+    assert.equal(
+      service.getOwnProfileLocal(guildId, 'member').snapshot?.profile.website,
+      '',
+    );
+    assert.equal(store.getInteractionReceipt('queued-edit')?.status, 'processing');
+    assert.equal(publisher.contexts[1]?.receiptKind, 'PROFILE_UPDATE');
+    assert.equal(publisher.contexts[1]?.targetUserId, 'member');
+  } finally {
+    store.close();
+  }
+});
+
+test('durable queued work owns reconciliation until its atomic apply', async () => {
+  let repositoryReads = 0;
+  let remoteVisible = false;
+  const { store, service } = createFixture({
+    repositoryReader: {
+      readProfile: async () => {
+        repositoryReads += 1;
+        return remoteVisible ? {
+          profile: profileSnapshot({ website: 'remote-too-early.example' }),
+          profileBlobSha: 'remote-too-early',
+          commitSha: 'remote-commit',
+          operationId: 'queued-operation',
+        } : null;
+      },
+    },
+  });
+
+  try {
+    await registerMember(service);
+    repositoryReads = 0;
+    remoteVisible = true;
+    store.beginInteraction('queued-interaction', 'queued-operation', 'PROFILE_UPDATE');
+    store.enqueuePublicationJob({
+      operationId: 'queued-operation',
+      context: {
+        guildId,
+        actorUserId: 'member',
+        targetUserId: 'member',
+        interactionId: 'queued-interaction',
+        receiptKind: 'PROFILE_UPDATE',
+      },
+      profileSlug: 'example-member',
+      action: 'PROFILE_UPDATE',
+      profileJson: JSON.stringify(profileSnapshot({ website: 'queued.example' })),
+      profileExpectedSha: 'profile-1',
+    });
+
+    const opened = await service.getOwnProfile(guildId, 'member');
+    const summary = await service.reconcileKnownProfiles();
+
+    assert.equal(repositoryReads, 0);
+    assert.equal(opened?.profile.website, '');
+    assert.deepEqual(summary, { reconciled: 0, unchanged: 0, released: 0, issues: [] });
+    assert.equal(store.getProfileState(guildId, 'example-member')?.profileBlobSha, 'profile-1');
+  } finally {
+    store.close();
+  }
+});
+
+test('a durable publication job blocks every conflicting profile mutation without changing local state', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    store.stagePhoto({
+      id: 'staged-before-queue',
+      guildId,
+      discordUserId: 'member',
+      profileSlug: 'example-member',
+      bytes: Uint8Array.of(1, 2, 3),
+      width: 1,
+      height: 1,
+      expiresAt: new Date('2026-08-21T00:10:00.000Z'),
+    });
+
+    const bindingBefore = store.getBinding(guildId, 'member');
+    const stateBefore = store.getProfileState(guildId, 'example-member');
+    assert.ok(bindingBefore);
+    assert.ok(stateBefore);
+
+    store.beginInteraction('durable-interaction', 'durable-operation', 'PROFILE_UPDATE');
+    store.enqueuePublicationJob({
+      operationId: 'durable-operation',
+      context: {
+        guildId,
+        actorUserId: 'member',
+        targetUserId: 'member',
+        interactionId: 'durable-interaction',
+        receiptKind: 'PROFILE_UPDATE',
+      },
+      profileSlug: 'example-member',
+      action: 'PROFILE_UPDATE',
+      profileJson: JSON.stringify(profileSnapshot({ website: 'queued.example' })),
+      profileExpectedSha: stateBefore.profileBlobSha,
+    });
+
+    const blockedMutations: Array<() => Promise<unknown>> = [
+      () => service.updateOwnProfile(
+        actor('blocked-edit'),
+        { website: 'must-not-apply.example' },
+        currentRevision(service),
+      ),
+      () => service.setOwnListed(actor('blocked-list'), true, currentRevision(service)),
+      () => service.prepareOwnPhoto(actor('blocked-photo-prepare'), {
+        bytes: Uint8Array.of(0),
+        filename: 'invalid.png',
+      }),
+      () => service.confirmOwnPhoto(actor('blocked-photo-confirm'), 'staged-before-queue'),
+      () => service.discardOwnPhoto(actor('blocked-photo-discard'), 'staged-before-queue'),
+      () => service.removeOwnPhoto(actor('blocked-photo-remove'), currentRevision(service)),
+      () => service.ownerSetCategory(actor('blocked-category', ownerUserId), 'member', 3),
+      () => service.ownerHide(actor('blocked-hide', ownerUserId), 'member'),
+      () => service.ownerRevoke(actor('blocked-revoke', ownerUserId), 'member'),
+      () => service.ownerUnhide(actor('blocked-unhide', ownerUserId), 'member'),
+      () => service.ownerRestore(actor('blocked-restore', ownerUserId), 'member'),
+      () => service.ownerTransfer(
+        actor('blocked-transfer', ownerUserId),
+        'member',
+        'new-member',
+      ),
+    ];
+
+    for (const mutate of blockedMutations) {
+      await assert.rejects(
+        mutate,
+        (error: unknown) =>
+          error instanceof ProfileServiceError
+          && error.code === 'publication_pending',
+      );
+    }
+
+    assert.deepEqual(store.getBinding(guildId, 'member'), bindingBefore);
+    assert.deepEqual(store.getProfileState(guildId, 'example-member'), stateBefore);
+    assert.equal(store.getBinding(guildId, 'new-member'), undefined);
+    assert.equal(store.getPublicationJob('durable-operation')?.status, 'queued');
+    assert.equal(
+      store.getStagedPhoto(guildId, 'member', 'staged-before-queue')?.status,
+      'prepared',
+    );
+    assert.equal(publisher.calls.length, 1, 'blocked mutations must not reach the publisher');
   } finally {
     store.close();
   }
@@ -701,6 +899,66 @@ test('owner revoke remains pending and active until the hidden profile publish s
   }
 });
 
+test('durable owner moderation lets the queue atomically create the pending admin state', async () => {
+  const store = new SqliteStore(':memory:', {
+    now: () => new Date('2026-08-21T00:00:00.000Z'),
+  });
+  let operationSequence = 0;
+  const publisher: ProfilePublisher = {
+    usesDurableQueue: true,
+    async publish(input, context) {
+      assert.ok(context);
+      store.enqueuePublicationJob({
+        operationId: input.operationId,
+        context: {
+          guildId: context.guildId,
+          actorUserId: context.actorUserId,
+          targetUserId: context.targetUserId,
+          interactionId: context.interactionId,
+          receiptKind: context.receiptKind,
+          ...(context.adminAction ? { adminAction: context.adminAction } : {}),
+        },
+        profileSlug: input.slug,
+        action: input.action,
+        profileJson: input.profile.json,
+        profileExpectedSha: input.profile.expectedSha,
+      });
+      return { status: 'queued', operationId: input.operationId, attempts: 0 };
+    },
+  };
+  const service = new ProfileService({
+    store,
+    publisher,
+    guildId,
+    ownerUserId,
+    newOperationId: () => `durable-owner-${++operationSequence}`,
+  });
+
+  try {
+    store.reserveBinding(guildId, 'member', 'example-member');
+    store.activateBinding(guildId, 'member');
+    store.saveProfileState({
+      guildId,
+      profileSlug: 'example-member',
+      profileJson: JSON.stringify(profileSnapshot({ listed: true })),
+      profileBlobSha: 'profile-before',
+      lastDeploymentStatus: 'deployed',
+    });
+
+    const result = await service.ownerHide(actor('durable-owner-hide', ownerUserId), 'member');
+
+    assert.equal(result.queued, true);
+    assert.equal(store.getBinding(guildId, 'member')?.pendingAdminAction, 'hide');
+    assert.equal(
+      store.getBinding(guildId, 'member')?.pendingAdminOperationId,
+      result.operationId,
+    );
+    assert.equal(store.getPublicationJob(result.operationId!)?.status, 'queued');
+  } finally {
+    store.close();
+  }
+});
+
 test('a definitely unpublished revoke failure leaves the binding active and visible', async () => {
   const { store, publisher, service } = createFixture();
 
@@ -809,6 +1067,41 @@ for (const pendingAction of ['hide', 'revoke'] as const) {
     }
   });
 }
+
+test('queued owner-action recovery reuses the original Discord interaction receipt', async () => {
+  const { store, publisher, service } = createFixture();
+
+  try {
+    await registerMember(service);
+    await service.setOwnListed(actor('list-before-queued-hide'), true, currentRevision(service));
+    store.beginInteraction('original-owner-interaction', 'pending-owner-operation', 'PROFILE_OWNER_HIDE');
+    store.beginAdminAction(guildId, 'member', 'hide', 'pending-owner-operation');
+    const restarted = new ProfileService({
+      store,
+      publisher,
+      repositoryReader: {
+        readProfile: async () => ({
+          profile: profileSnapshot({ listed: true }),
+          profileBlobSha: 'remote-visible-profile',
+          commitSha: 'remote-visible-commit',
+          operationId: 'list-operation',
+        }),
+      },
+      guildId,
+      ownerUserId,
+      now: () => new Date('2026-08-21T00:01:00.000Z'),
+    });
+
+    const summary = await restarted.reconcileKnownProfiles();
+
+    assert.deepEqual(summary.issues, []);
+    assert.equal(publisher.contexts.at(-1)?.interactionId, 'original-owner-interaction');
+    assert.equal(publisher.contexts.at(-1)?.receiptKind, 'PROFILE_OWNER_HIDE');
+    assert.equal(store.getInteractionReceipt('original-owner-interaction')?.status, 'completed');
+  } finally {
+    store.close();
+  }
+});
 
 test('owner transfer cannot change ownership during an active profile publication', async () => {
   const { store, publisher, service } = createFixture();

@@ -81,6 +81,83 @@ test('reads and proves a canonical bot profile from main without downloading pho
   assert.equal(routes.filter((route) => route.endsWith('/contents/{path}')).length, 2);
 });
 
+test('selects the operation trailer for this slug from a batch commit', async () => {
+  const request: GitHubRequest = async (route) => {
+    if (route.includes('/git/ref/')) {
+      return { data: { object: { sha: MAIN } } };
+    }
+
+    if (route.endsWith('/contents/{path}')) {
+      return {
+        data: {
+          type: 'file',
+          sha: PROFILE,
+          encoding: 'base64',
+          content: Buffer.from(JSON.stringify(canonicalProfile())).toString('base64'),
+        },
+      };
+    }
+
+    assert.equal(route, 'GET /repos/{owner}/{repo}/commits');
+    return {
+      data: [{
+        sha: COMMIT,
+        commit: {
+          message: [
+            'Profiles: publish 2 profile updates',
+            '',
+            'Profile-Operation: another-member another-operation',
+            'Profile-Operation: recovered-member recovered-operation',
+          ].join('\n'),
+        },
+      }],
+    };
+  };
+  const reader = new GitHubProfileReader({ request, owner: 'owner', repo: 'repo' });
+
+  const result = await reader.readProfile('recovered-member');
+
+  assert.equal(result?.operationId, 'recovered-operation');
+});
+
+test('does not use a legacy trailer when a batch commit lacks this slug', async () => {
+  const request: GitHubRequest = async (route) => {
+    if (route.includes('/git/ref/')) {
+      return { data: { object: { sha: MAIN } } };
+    }
+
+    if (route.endsWith('/contents/{path}')) {
+      return {
+        data: {
+          type: 'file',
+          sha: PROFILE,
+          encoding: 'base64',
+          content: Buffer.from(JSON.stringify(canonicalProfile())).toString('base64'),
+        },
+      };
+    }
+
+    return {
+      data: [{
+        sha: COMMIT,
+        commit: {
+          message: [
+            'Profiles: publish profile updates',
+            '',
+            'Profile-Operation: another-member another-operation',
+            'Profile-Operation: legacy-operation',
+          ].join('\n'),
+        },
+      }],
+    };
+  };
+  const reader = new GitHubProfileReader({ request, owner: 'owner', repo: 'repo' });
+
+  const result = await reader.readProfile('recovered-member');
+
+  assert.equal(result?.operationId, undefined);
+});
+
 test('rejects a bot binding whose profile points at another member photo', async () => {
   const request: GitHubRequest = async (route) => {
     if (route.includes('/git/ref/')) {

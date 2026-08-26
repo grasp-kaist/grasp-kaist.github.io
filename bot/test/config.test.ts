@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 
 import { ConfigurationError, loadConfig } from '../src/config.js';
@@ -23,11 +24,89 @@ test('defaults to sandbox publication without GitHub credentials', () => {
 
   assert.equal(config.port, 3000);
   assert.equal(config.publication.mode, 'sandbox');
+  assert.equal(config.storage.persistentRequired, false);
+  assert.match(config.storage.backupDirectory, /data[\\/]sandbox[\\/]backups$/);
   assert.match(config.databasePath, /data[\\/]sandbox[\\/]grasp-profile-bot\.sqlite$/);
   assert.equal(config.membersPageUrl, undefined);
   assert.match(
     config.publication.sandboxDirectory,
     /sandbox-profiles$/,
+  );
+});
+
+test('fails closed in a production container when no Railway volume is attached', () => {
+  assert.throws(
+    () => loadConfig({
+      ...completeEnv,
+      NODE_ENV: 'production',
+      PROFILE_REQUIRE_PERSISTENT_STORAGE: 'false',
+    }),
+    (error: unknown) =>
+      error instanceof ConfigurationError
+      && error.message.includes('RAILWAY_VOLUME_MOUNT_PATH'),
+  );
+});
+
+test('keeps all durable paths inside the attached Railway volume', () => {
+  const volume = resolve('test-railway-volume');
+  const config = loadConfig({
+    ...completeEnv,
+    NODE_ENV: 'production',
+    RAILWAY_VOLUME_MOUNT_PATH: volume,
+    PROFILE_STORAGE_ID: '8e99c82b-441b-4ce0-a763-cfe01340f39b',
+    DATABASE_PATH: join(volume, 'state', 'profiles.sqlite'),
+    SANDBOX_PROFILE_DIRECTORY: join(volume, 'sandbox-profiles'),
+  });
+
+  assert.equal(config.storage.persistentRequired, true);
+  assert.equal(config.storage.volumeMountPath, volume);
+  assert.equal(config.storage.backupDirectory, join(volume, 'backups'));
+  assert.throws(
+    () => loadConfig({
+      ...completeEnv,
+      NODE_ENV: 'production',
+      RAILWAY_VOLUME_MOUNT_PATH: volume,
+      PROFILE_STORAGE_ID: '8e99c82b-441b-4ce0-a763-cfe01340f39b',
+      DATABASE_PATH: resolve('ephemeral', 'profiles.sqlite'),
+    }),
+    (error: unknown) =>
+      error instanceof ConfigurationError
+      && error.message === 'DATABASE_PATH must be inside RAILWAY_VOLUME_MOUNT_PATH.',
+  );
+});
+
+test('requires one stable storage identity for an attached volume', () => {
+  const volume = resolve('test-railway-volume');
+
+  assert.throws(
+    () => loadConfig({
+      ...completeEnv,
+      NODE_ENV: 'production',
+      RAILWAY_VOLUME_MOUNT_PATH: volume,
+    }),
+    (error: unknown) =>
+      error instanceof ConfigurationError
+      && error.message === 'PROFILE_STORAGE_ID is required when a persistent volume is attached.',
+  );
+  assert.throws(
+    () => loadConfig({
+      ...completeEnv,
+      NODE_ENV: 'production',
+      RAILWAY_VOLUME_MOUNT_PATH: volume,
+      PROFILE_STORAGE_ID: 'not-a-uuid',
+    }),
+    (error: unknown) =>
+      error instanceof ConfigurationError
+      && error.message === 'PROFILE_STORAGE_ID must be a UUID.',
+  );
+  assert.throws(
+    () => loadConfig({
+      ...completeEnv,
+      PROFILE_ADOPT_EXISTING_STORAGE: 'true',
+    }),
+    (error: unknown) =>
+      error instanceof ConfigurationError
+      && error.message === 'Storage initialization requires RAILWAY_VOLUME_MOUNT_PATH.',
   );
 });
 

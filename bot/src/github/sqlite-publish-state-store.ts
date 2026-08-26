@@ -65,20 +65,40 @@ export class SqlitePublishStateStore implements PublishStateStore {
   }
 
   async save(checkpoint: PublishCheckpoint): Promise<void> {
-    const validated = parseCheckpoint(checkpoint, checkpoint.operationId);
-    this.#database
-      .prepare(
-        `INSERT INTO profile_publish_checkpoints (operation_id, checkpoint_json, updated_at)
-         VALUES (?, ?, ?)
-         ON CONFLICT(operation_id) DO UPDATE SET
-           checkpoint_json = excluded.checkpoint_json,
-           updated_at = excluded.updated_at`,
-      )
-      .run(
-        validated.operationId,
-        JSON.stringify(validated),
-        this.#now().toISOString(),
-      );
+    await this.saveBatch([checkpoint]);
+  }
+
+  async saveBatch(checkpoints: readonly PublishCheckpoint[]): Promise<void> {
+    const validated = checkpoints.map((checkpoint) => (
+      parseCheckpoint(checkpoint, checkpoint.operationId)
+    ));
+    const updatedAt = this.#now().toISOString();
+    const statement = this.#database.prepare(
+      `INSERT INTO profile_publish_checkpoints (operation_id, checkpoint_json, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(operation_id) DO UPDATE SET
+         checkpoint_json = excluded.checkpoint_json,
+         updated_at = excluded.updated_at`,
+    );
+
+    this.#database.exec('BEGIN IMMEDIATE');
+    try {
+      for (const checkpoint of validated) {
+        statement.run(
+          checkpoint.operationId,
+          JSON.stringify(checkpoint),
+          updatedAt,
+        );
+      }
+      this.#database.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.#database.exec('ROLLBACK');
+      } catch {
+        // Preserve the original storage error if SQLite already ended the transaction.
+      }
+      throw error;
+    }
   }
 
   async clear(operationId: string): Promise<void> {
@@ -101,7 +121,10 @@ function parseCheckpoint(value: unknown, expectedOperationId: string): PublishCh
   assertPattern(value.fingerprint, FINGERPRINT_PATTERN, expectedOperationId, 'fingerprint');
   assertPattern(value.slug, SLUG_PATTERN, expectedOperationId, 'slug');
 
-  if (value.stage === 'main_updated') {
+  if (value.stage === 'candidate_validated' || value.stage === 'main_updated') {
+    if (value.stage === 'candidate_validated') {
+      assertPattern(value.baseSha, SHA_PATTERN, expectedOperationId, 'baseSha');
+    }
     assertPattern(value.commitSha, SHA_PATTERN, expectedOperationId, 'commitSha');
     assertPositiveInteger(value.attempts, expectedOperationId, 'attempts');
     assertPattern(value.profileBlobSha, SHA_PATTERN, expectedOperationId, 'profileBlobSha');

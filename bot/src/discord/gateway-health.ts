@@ -9,6 +9,7 @@ export type DiscordGatewayHealthOptions = {
   client: Client;
   health: DiscordGatewayHealthState;
   isStartupComplete: () => boolean;
+  isServiceOperational?: () => boolean;
   isShuttingDown: () => boolean;
   onUnrecoverableDisconnect?: (event: CloseEvent, shardId: number) => void | Promise<void>;
 };
@@ -43,7 +44,11 @@ export function attachDiscordGatewayHealthEvents(
     }
   };
   const markReady = () => {
-    if (options.isStartupComplete() && !options.isShuttingDown()) {
+    if (
+      options.isStartupComplete()
+      && (options.isServiceOperational?.() ?? true)
+      && !options.isShuttingDown()
+    ) {
       options.health.ready = true;
       options.health.gateway = 'ready';
     }

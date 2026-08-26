@@ -32,16 +32,34 @@ function mainUpdatedCheckpoint(): PublishCheckpoint {
   };
 }
 
+function candidateValidatedCheckpoint(): PublishCheckpoint {
+  return {
+    version: 1,
+    stage: 'candidate_validated',
+    operationId: 'operation-1',
+    fingerprint: FINGERPRINT,
+    slug: 'example-member',
+    baseSha: 'e'.repeat(40),
+    commitSha: COMMIT_SHA,
+    attempts: 2,
+    profileBlobSha: PROFILE_SHA,
+    photoBlobSha: PHOTO_SHA,
+  };
+}
+
 test('SQLite publish checkpoints persist across process-style reopen and can be cleared', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'grasp-publish-state-'));
   const databasePath = join(directory, 'bot.sqlite');
 
   try {
     const first = new SqlitePublishStateStore(databasePath, { now: () => FIXED_DATE });
-    await first.save(mainUpdatedCheckpoint());
+    await first.save(candidateValidatedCheckpoint());
     first.close();
 
     const second = new SqlitePublishStateStore(databasePath);
+    assert.deepEqual(await second.load('operation-1'), candidateValidatedCheckpoint());
+
+    await second.save(mainUpdatedCheckpoint());
     assert.deepEqual(await second.load('operation-1'), mainUpdatedCheckpoint());
 
     const completed: PublishCheckpoint = {
@@ -116,5 +134,49 @@ test('corrupt checkpoint JSON fails closed', async () => {
     }
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('candidate_validated checkpoints require the validated base commit', async () => {
+  const checkpoints = new SqlitePublishStateStore(':memory:');
+
+  try {
+    const invalid = { ...candidateValidatedCheckpoint() } as Record<string, unknown>;
+    delete invalid.baseSha;
+
+    await assert.rejects(
+      checkpoints.save(invalid as PublishCheckpoint),
+      PublishCheckpointCorruptionError,
+    );
+  } finally {
+    checkpoints.close();
+  }
+});
+
+test('SQLite batch checkpoint saves validate the whole batch before replacing any row', async () => {
+  const checkpoints = new SqlitePublishStateStore(':memory:');
+  const original = mainUpdatedCheckpoint();
+  await checkpoints.save(original);
+
+  try {
+    const invalid = {
+      ...candidateValidatedCheckpoint(),
+      operationId: 'operation-2',
+      slug: 'second-member',
+    } as Record<string, unknown>;
+    delete invalid.baseSha;
+
+    await assert.rejects(
+      checkpoints.saveBatch([
+        candidateValidatedCheckpoint(),
+        invalid as PublishCheckpoint,
+      ]),
+      PublishCheckpointCorruptionError,
+    );
+
+    assert.deepEqual(await checkpoints.load('operation-1'), original);
+    assert.equal(await checkpoints.load('operation-2'), null);
+  } finally {
+    checkpoints.close();
   }
 });

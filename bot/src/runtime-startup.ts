@@ -67,3 +67,48 @@ export async function waitForPromiseWithin(
 
   return result;
 }
+
+export async function finishPublicationQueueStartup(options: {
+  drain: () => Promise<void>;
+  countRemaining: () => number;
+  nextAttemptDelayMs?: () => number | undefined;
+  sleep?: (milliseconds: number) => Promise<void>;
+  onAttemptError?: (error: unknown) => void;
+  markReady: () => void;
+}) {
+  const sleep = options.sleep ?? delay;
+
+  while (true) {
+    let drainError: unknown;
+    try {
+      await options.drain();
+    } catch (error) {
+      drainError = error;
+      options.onAttemptError?.(error);
+    }
+
+    const remaining = options.countRemaining();
+    if (!drainError && remaining === 0) {
+      options.markReady();
+      return;
+    }
+
+    const retryDelay = options.nextAttemptDelayMs?.();
+    if (retryDelay === undefined) {
+      if (drainError) {
+        throw drainError;
+      }
+      throw new Error(
+        `Publication startup drain left ${remaining} unapplied or actively leased job(s).`,
+      );
+    }
+    if (!Number.isFinite(retryDelay) || retryDelay < 0) {
+      throw new Error('Publication startup recovery returned an invalid retry delay.');
+    }
+    await sleep(Math.max(1, retryDelay));
+  }
+}
+
+function delay(milliseconds: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+}

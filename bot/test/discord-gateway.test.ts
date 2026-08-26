@@ -420,12 +420,14 @@ test('Gateway health follows reconnect, resume, ready, and disconnect shard even
     gateway: 'starting',
   };
   let startupComplete = false;
+  let serviceOperational = true;
   let shuttingDown = false;
   let fatalDisconnects = 0;
   const detach = attachDiscordGatewayHealthEvents({
     client,
     health,
     isStartupComplete: () => startupComplete,
+    isServiceOperational: () => serviceOperational,
     isShuttingDown: () => shuttingDown,
     onUnrecoverableDisconnect: async () => {
       fatalDisconnects += 1;
@@ -446,6 +448,12 @@ test('Gateway health follows reconnect, resume, ready, and disconnect shard even
 
   client.emit(Events.ShardResume, 0, 4);
   assert.deepEqual(health, { ready: true, gateway: 'ready' });
+
+  serviceOperational = false;
+  health.ready = false;
+  client.emit(Events.ShardResume, 0, 5);
+  assert.deepEqual(health, { ready: false, gateway: 'ready' });
+  serviceOperational = true;
 
   client.emit(Events.ShardDisconnect, {} as CloseEvent, 0);
   assert.deepEqual(health, { ready: false, gateway: 'disconnected' });

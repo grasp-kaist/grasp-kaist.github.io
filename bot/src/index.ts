@@ -16,6 +16,7 @@ import { createHealthApp, type BotHealthSnapshot } from './http-app.js';
 import { ProfilePhotoError } from './image/process-profile-photo.js';
 import {
   closeHttpServerWithin,
+  finishPublicationQueueStartup,
   startHealthServer,
   waitForPromiseWithin,
 } from './runtime-startup.js';
@@ -26,15 +27,24 @@ import {
   type PublishCheckpointLookup,
 } from './service/profile-service.js';
 import { GuildProfileRuntimeRegistry } from './service/guild-profile-runtime.js';
+import { QueuedProfilePublisher } from './publication/index.js';
 import {
   SandboxProfileRepositoryError,
 } from './service/sandbox-profile-repository.js';
 import { SqliteStore } from './storage/sqlite-store.js';
+import {
+  backupStorageBeforeMigration,
+  finalizeRuntimeStorage,
+  prepareRuntimeStorage,
+} from './storage/runtime-storage.js';
+import { SqliteBackupScheduler } from './storage/sqlite-backup.js';
 
 type PublicationRuntime = {
   publisher: ProfilePublisher;
   repositoryReader: ProfileRepositoryReader;
   checkpointLookup?: PublishCheckpointLookup;
+  queue: QueuedProfilePublisher;
+  stop(): Promise<void>;
   close(): void;
 };
 
@@ -44,28 +54,87 @@ await run();
 
 async function run() {
   const config = loadConfig();
+  const runtimeStorageConfig = {
+    ...config.storage,
+    databasePath: config.databasePath,
+    sandboxDirectory: config.publication.sandboxDirectory,
+  };
+  const storagePreparation = prepareRuntimeStorage(runtimeStorageConfig);
+  const storageIdentity = storagePreparation?.identity;
+  await backupStorageBeforeMigration(runtimeStorageConfig, storagePreparation);
   const store = new SqliteStore(config.databasePath);
-  const stagedRecovery = store.recoverInterruptedStagedPhotos();
+  store.assertHealthy();
+  const backupScheduler = new SqliteBackupScheduler({
+    source: store,
+    directory: config.storage.backupDirectory,
+    intervalMs: config.storage.backupIntervalMs,
+    retentionCount: config.storage.backupRetentionCount,
+    onError: (error) => {
+      reportError(error, 'Scheduled SQLite backup failed');
+      void shutdown('scheduled SQLite backup failure', 1);
+    },
+  });
+  await backupScheduler.backupNow();
+  if (storagePreparation?.initializationPending) {
+    try {
+      finalizeRuntimeStorage(runtimeStorageConfig, storagePreparation);
+    } finally {
+      store.close();
+    }
+    throw new Error(
+      `Profile storage ${storagePreparation.identity.id} is ready. Remove the storage initialization flags and redeploy before serving traffic.`,
+    );
+  }
+  backupScheduler.start();
+  let stagedRecovery = { recovered: 0, expired: 0 };
+  let recoveredPublicationLeases = 0;
   const health: BotHealthSnapshot = {
     ready: false,
     gateway: 'starting',
     profileRecovery: 'running',
     publicationMode: config.publication.mode,
+    publicationQueue: config.publication.mode === 'production' ? 'recovering' : 'disabled',
+    queuedPublications: 0,
+    storage: 'ready',
   };
-  const healthApp = createHealthApp(() => ({ ...health }));
+  const healthApp = createHealthApp(() => ({
+    ...health,
+    queuedPublications: config.publication.mode === 'production'
+      ? store.countNonterminalPublicationJobs(config.publication.productionGuildId)
+      : 0,
+  }));
   const healthServer = startHealthServer({ fetch: healthApp.fetch, port: config.port });
   let publication: PublicationRuntime | undefined;
   let gateway: DiscordGatewayRuntime | undefined;
   let stagedPhotoCleanupTimer: ReturnType<typeof setInterval> | undefined;
   let startupComplete = false;
   let profileRecoveryComplete = false;
+  let publicationQueueOperational = config.publication.mode === 'sandbox';
   let shuttingDown = false;
+  let storageCanClose = true;
 
   process.once('SIGINT', () => void shutdown('SIGINT'));
   process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
   try {
-    publication = await createProductionPublicationRuntime(config);
+    publication = await createProductionPublicationRuntime(config, store, {
+      onDrainError: (error) => {
+        publicationQueueOperational = false;
+        health.publicationQueue = 'degraded';
+        health.ready = false;
+        reportError(error, 'Durable publication queue entered degraded recovery');
+      },
+      onDrainHealthy: () => {
+        if (!startupComplete || shuttingDown) {
+          return;
+        }
+        publicationQueueOperational = true;
+        health.publicationQueue = 'ready';
+        health.ready = profileRecoveryComplete && health.gateway === 'ready';
+      },
+    });
+    recoveredPublicationLeases = publication?.queue.recoverLeases() ?? 0;
+    stagedRecovery = store.recoverInterruptedStagedPhotos();
     const profileRuntimes = new GuildProfileRuntimeRegistry({
       store,
       ownerUserId: config.discord.ownerUserId,
@@ -107,7 +176,8 @@ async function run() {
       reportError: (error) => reportError(error, 'Discord profile operation failed'),
     });
     const guardedRouter = {
-      route: (interaction: DiscordInteraction) => profileRecoveryComplete
+      route: (interaction: DiscordInteraction) =>
+        profileRecoveryComplete && publicationQueueOperational
         ? router.route(interaction)
         : Promise.resolve({
             response: ephemeralTextResponse(
@@ -129,6 +199,7 @@ async function run() {
       client: gateway.client,
       health,
       isStartupComplete: () => startupComplete,
+      isServiceOperational: () => profileRecoveryComplete && publicationQueueOperational,
       isShuttingDown: () => shuttingDown,
       onUnrecoverableDisconnect: () => shutdown(
         'unrecoverable Discord shard disconnect',
@@ -140,19 +211,56 @@ async function run() {
     assertConnectedApplication(gateway, config.discord.applicationId);
     health.gateway = 'ready';
 
-    const reconciliation = await profileRuntimes.reconcileKnownProfiles();
+    const productionQueueRuntime = publication && config.publication.mode === 'production'
+      ? {
+          guildId: config.publication.productionGuildId,
+          queue: publication.queue,
+        }
+      : undefined;
+    const recoverProductionQueue = async () => {
+      if (!productionQueueRuntime) {
+        return;
+      }
+      await finishPublicationQueueStartup({
+        drain: () => productionQueueRuntime.queue.drain(),
+        countRemaining: () => store.countNonterminalPublicationJobs(
+          productionQueueRuntime.guildId,
+        ),
+        nextAttemptDelayMs: () => productionQueueRuntime.queue.nextRecoveryDelayMs(),
+        onAttemptError: (error) => reportError(
+          error,
+          'Publication startup recovery will retry',
+        ),
+        markReady: () => {
+          health.publicationQueue = 'ready';
+        },
+      });
+      publicationQueueOperational = true;
+    };
+    await recoverProductionQueue();
 
-    for (const issue of reconciliation.issues) {
-      reportError(
-        new Error(issue.message),
-        `Profile reconciliation failed for guild ${issue.guildId}, profile ${issue.profileSlug}`,
-      );
+    const reportedReconciliationIssues = new Set<string>();
+    let reconciliation = await profileRuntimes.reconcileKnownProfiles();
+    while (reconciliation.issues.length > 0) {
+      for (const issue of reconciliation.issues) {
+        const key = `${issue.guildId}\0${issue.profileSlug}\0${issue.message}`;
+        if (!reportedReconciliationIssues.has(key)) {
+          reportedReconciliationIssues.add(key);
+          reportError(
+            new Error(issue.message),
+            `Profile reconciliation failed for guild ${issue.guildId}, profile ${issue.profileSlug}; startup will retry`,
+          );
+        }
+      }
+      await recoverProductionQueue();
+      await delay(30_000);
+      reconciliation = await profileRuntimes.reconcileKnownProfiles();
     }
 
     profileRecoveryComplete = true;
     health.profileRecovery = 'ready';
     startupComplete = true;
-    health.ready = true;
+    health.ready = publicationQueueOperational && health.gateway === 'ready';
 
     stagedPhotoCleanupTimer = setInterval(() => {
       store.deleteExpiredStagedPhotos();
@@ -165,6 +273,14 @@ async function run() {
         : 'all guilds are sandboxed'}; `
         + `${commandSync.commandCount} global command(s) ${commandSync.changed ? 'updated' : 'already current'}.\n`,
     );
+    if (recoveredPublicationLeases > 0) {
+      process.stdout.write(
+        `Recovered ${recoveredPublicationLeases} interrupted publication lease(s).\n`,
+      );
+    }
+    if (storageIdentity) {
+      process.stdout.write(`Persistent storage ready (${storageIdentity.id}).\n`);
+    }
     process.stdout.write(
       `Startup profile recovery: ${reconciliation.reconciled} reconciled, `
         + `${reconciliation.released} released, ${reconciliation.issues.length} issue(s).\n`,
@@ -245,18 +361,50 @@ async function run() {
       }
     }
 
-    try {
-      publication?.close();
-    } catch (error) {
-      exitCode = 1;
-      reportError(error, 'Publication state shutdown failed');
+    if (publication) {
+      const queueStop = await waitForPromiseWithin(
+        publication.stop(),
+        Math.max(0, deadline - Date.now()),
+      );
+
+      if (queueStop.error) {
+        storageCanClose = false;
+        reportError(queueStop.error, 'Publication queue shutdown failed');
+      } else if (queueStop.timedOut) {
+        storageCanClose = false;
+        reportError(
+          new Error('An in-flight publication will be recovered from its durable lease.'),
+          'Publication queue exceeded the shutdown window',
+        );
+      }
     }
 
-    try {
-      store.close();
-    } catch (error) {
-      exitCode = 1;
-      reportError(error, 'SQLite shutdown failed');
+    const backupStop = await waitForPromiseWithin(
+      backupScheduler.stop(),
+      Math.max(0, deadline - Date.now()),
+    );
+    if (backupStop.error || backupStop.timedOut) {
+      storageCanClose = false;
+      reportError(
+        backupStop.error ?? new Error('A SQLite backup exceeded the shutdown window.'),
+        'SQLite backup shutdown failed',
+      );
+    }
+
+    if (storageCanClose) {
+      try {
+        publication?.close();
+      } catch (error) {
+        exitCode = 1;
+        reportError(error, 'Publication state shutdown failed');
+      }
+
+      try {
+        store.close();
+      } catch (error) {
+        exitCode = 1;
+        reportError(error, 'SQLite shutdown failed');
+      }
     }
 
     process.exit(exitCode);
@@ -265,6 +413,11 @@ async function run() {
 
 async function createProductionPublicationRuntime(
   config: AppConfig,
+  store: SqliteStore,
+  callbacks: {
+    onDrainError(error: unknown): void;
+    onDrainHealthy(): void;
+  },
 ): Promise<PublicationRuntime | undefined> {
   if (config.publication.mode === 'sandbox') {
     return undefined;
@@ -305,7 +458,7 @@ async function createProductionPublicationRuntime(
       headers: response.headers,
     };
   };
-  const publisher = new github.GitHubProfilePublisher({
+  const githubPublisher = new github.GitHubProfilePublisher({
     request: githubRequest,
     owner: githubConfig.owner,
     repo: githubConfig.repo,
@@ -321,11 +474,20 @@ async function createProductionPublicationRuntime(
     repo: githubConfig.repo,
     defaultBranch: githubConfig.defaultBranch,
   });
+  const queue = new QueuedProfilePublisher({
+    store,
+    guildId: config.publication.productionGuildId,
+    backend: githubPublisher,
+    onDrainError: callbacks.onDrainError,
+    onDrainHealthy: callbacks.onDrainHealthy,
+  });
 
   return {
-    publisher,
+    publisher: queue,
     repositoryReader,
     checkpointLookup: publishStateStore,
+    queue,
+    stop: () => queue.stop(),
     close: () => publishStateStore.close(),
   };
 }
@@ -400,6 +562,10 @@ function reportError(error: unknown, context = 'GRASP profile bot error') {
       }
     : { message: String(error) };
   console.error(JSON.stringify({ level: 'error', context, error: safe }));
+}
+
+function delay(milliseconds: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

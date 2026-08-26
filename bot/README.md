@@ -23,7 +23,9 @@ DATABASE_PATH=/data/grasp-profile-bot.sqlite
 PROFILE_PRODUCTION_GUILD_ID=<GRASP 서버 ID>
 ```
 
-production 모드는 기존 blob SHA 확인, 격리된 `bot/profile/...` 브랜치, 저장소 검증 workflow, `main` 비강제 fast-forward, GitHub Pages 배포 확인 순서로 제한된 프로필 파일만 반영한다. 정확히 `PROFILE_PRODUCTION_GUILD_ID`인 서버만 실제 저장소를 사용하고, 봇이 설치된 나머지 모든 서버는 자동으로 서버별 sandbox를 사용한다.
+production 모드는 요청을 먼저 SQLite 영구 큐에 저장한 뒤 기존 blob SHA 확인, 격리된 `bot/profile-batch/...` 브랜치, 저장소 검증 workflow, `main` 비강제 fast-forward, GitHub Pages 배포 확인 순서로 제한된 프로필 파일만 반영한다. 2초 안에 모인 서로 다른 프로필 최대 20개(파일 최대 40개)는 한 번의 검증·커밋·Pages 배포로 합친다. 정확히 `PROFILE_PRODUCTION_GUILD_ID`인 서버만 실제 저장소를 사용하고, 봇이 설치된 나머지 모든 서버는 자동으로 서버별 sandbox를 사용한다.
+
+요청은 최대 6초 동안 완료를 기다린다. 그 안에 끝나지 않으면 실패로 표시하지 않고 “안전하게 대기열에 들어갔다”고 안내한다. 게시 결과가 불명확하게 끊긴 경우에는 로컬 상태를 되돌리지 않고 같은 operation ID로 복구·재시도한다. 확실히 게시 전 실패한 검증 오류만 사용자에게 실패로 확정한다.
 
 `listed`는 Members 페이지 표시 설정이지 비공개 저장 기능은 아니다. production에서 게시한 JSON, 사진, 커밋 기록은 공개 저장소에 남는다.
 
@@ -61,7 +63,13 @@ npm run dev
 
 ## Railway 설정
 
-서비스 하나, replica 하나, `/data` persistent volume을 사용한다. SQLite가 단일 writer라 수평 복제하지 않는다. Serverless/sleeping은 끈다. 커밋된 `railway.json`이 `bot/Dockerfile`로 빌드하고 `/healthz`로 Gateway 준비 상태를 확인한다.
+서비스 하나, replica 하나, `/data` persistent volume을 사용한다. SQLite가 단일 writer라 수평 복제하지 않는다. Serverless/sleeping은 끈다. `bot/Dockerfile`로 빌드하고 `/healthz`로 Gateway·복구·큐·저장소 준비 상태를 확인한다. 정상 시작은 짧지만, 강제 종료 직후 남은 15분 lease와 최장 게시 복구를 안전하게 기다리도록 healthcheck 제한은 1시간으로 둔다.
+
+Railway는 volume을 붙이면 `RAILWAY_VOLUME_MOUNT_PATH=/data`를 자동 제공한다. production 컨테이너는 이 값이 없거나 DB·sandbox·backup 경로가 volume 밖이면 시작을 거부하며, 환경변수로 `false`를 넣어도 이 보호는 해제되지 않는다. 시작할 때 원본 DB 무결성을 확인하고, 6시간마다 검증된 SQLite 온라인 백업을 `/data/backups`에 만들며 최근 28개를 유지한다. Railway 자체 volume backup은 별도 계층이므로 Backups 탭에서 Daily와 Weekly 일정을 켜는 것을 권장한다.
+
+볼륨은 한 번만 명시적으로 초기화한다. `PROFILE_STORAGE_ID`에 새 UUID를 넣고, 새 볼륨이면 `PROFILE_INITIALIZE_STORAGE=true`, 기존 DB가 든 현재 볼륨이면 여기에 `PROFILE_ADOPT_EXISTING_STORAGE=true`도 함께 넣어 한 번 배포한다. 기존 DB를 채택할 때는 writer migration 전에 원본 백업을 먼저 남긴다. 이 첫 배포는 식별 marker, 정상 스키마의 DB, 검증된 첫 백업, 준비 완료 marker를 만든 뒤 의도적으로 종료된다. 로그에서 초기화 완료를 확인한 다음 두 초기화 변수를 삭제하고 다시 배포해야 정상 기동한다. 이후 marker가 없거나 ID가 다르거나 준비 완료 DB가 사라졌거나 초기화 변수가 남아 있으면 봇은 시작하지 않으므로, 비어 있거나 엉뚱한 볼륨을 자동 승인하지 않는다.
+
+현재 서비스가 읽는 `railway.json`은 Railway의 구형 Config as Code 형식이다. Railway의 공식 절차대로 연결된 CLI에서 `railway config migrate`로 실제 프로젝트 상태를 가져와 검토한 뒤 IaC로 전환해야 하며, 프로젝트 상태를 보지 않고 `.railway/railway.ts`를 임의 생성하면 안 된다.
 
 개인 서버 테스트에 필요한 변수는 다음뿐이다.
 
@@ -69,6 +77,8 @@ npm run dev
 PROFILE_PUBLISH_MODE=sandbox
 DATABASE_PATH=/data/sandbox/grasp-profile-bot.sqlite
 SANDBOX_PROFILE_DIRECTORY=/data/sandbox/profiles
+PROFILE_BACKUP_DIRECTORY=/data/backups
+PROFILE_STORAGE_ID=<이 볼륨에 고정할 UUID>
 DISCORD_APPLICATION_ID=<Application ID>
 DISCORD_BOT_TOKEN=<Bot Token>
 DISCORD_OWNER_USER_ID=<관리자 Discord 사용자 ID>
@@ -78,6 +88,6 @@ production으로 바꿀 때에만 GitHub App 변수와 `MEMBERS_PAGE_URL`을 사
 
 ## HTTP endpoint
 
-- `GET /healthz`: Railway 내부 health check 전용. Gateway 접속과 모든 기존 서버의 프로필 복구가 끝나기 전에는 503, 둘 다 준비된 뒤에만 200을 반환한다.
+- `GET /healthz`: Railway 내부 health check 전용. Gateway 접속과 모든 기존 서버의 프로필 복구가 끝나기 전에는 503, 준비된 뒤에만 200을 반환한다. 현재 영구 큐의 대기 건수도 함께 보여 준다.
 
 프로필 REST API, 로그인 페이지, 공개 interaction webhook, 파일 브라우저는 제공하지 않는다.
