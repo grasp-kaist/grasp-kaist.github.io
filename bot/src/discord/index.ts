@@ -3,6 +3,7 @@ export * from './command-sync.js';
 export * from './gateway-adapter.js';
 export * from './gateway-health.js';
 export * from './gateway.js';
+export * from './guild-router.js';
 export * from './inputs.js';
 export * from './payloads.js';
 export * from './router.js';

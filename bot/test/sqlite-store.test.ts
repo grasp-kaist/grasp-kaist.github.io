@@ -41,6 +41,23 @@ test('failed provisioning reservations can be released', () => {
   }
 });
 
+test('known guild IDs are distinct and sorted for startup recovery', () => {
+  const store = new SqliteStore(':memory:');
+
+  try {
+    store.reserveBinding('333333333333333333', 'user-1', 'member-a');
+    store.reserveBinding('222222222222222222', 'user-2', 'member-b');
+    store.reserveBinding('333333333333333333', 'user-3', 'member-c');
+
+    assert.deepEqual(store.listGuildIds(), [
+      '222222222222222222',
+      '333333333333333333',
+    ]);
+  } finally {
+    store.close();
+  }
+});
+
 test('owner recovery can revoke and transfer a binding', () => {
   const store = new SqliteStore(':memory:');
 

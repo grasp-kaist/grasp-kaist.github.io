@@ -5,6 +5,7 @@ import {
   DiscordAttachmentDownloadError,
   DiscordCdnAttachmentDownloader,
   DiscordGatewayRuntime,
+  DiscordGuildRouter,
   DiscordInteractionRouter,
   DiscordInteractionWebhookClient,
   attachDiscordGatewayHealthEvents,
@@ -19,14 +20,13 @@ import {
   waitForPromiseWithin,
 } from './runtime-startup.js';
 import {
-  ProfileService,
   ProfileServiceError,
   type ProfilePublisher,
   type ProfileRepositoryReader,
   type PublishCheckpointLookup,
 } from './service/profile-service.js';
+import { GuildProfileRuntimeRegistry } from './service/guild-profile-runtime.js';
 import {
-  SandboxProfileRepository,
   SandboxProfileRepositoryError,
 } from './service/sandbox-profile-repository.js';
 import { SqliteStore } from './storage/sqlite-store.js';
@@ -65,29 +65,45 @@ async function run() {
   process.once('SIGTERM', () => void shutdown('SIGTERM'));
 
   try {
-    publication = await createPublicationRuntime(config);
-    const profileService = new ProfileService({
+    publication = await createProductionPublicationRuntime(config);
+    const profileRuntimes = new GuildProfileRuntimeRegistry({
       store,
-      publisher: publication.publisher,
-      repositoryReader: publication.repositoryReader,
-      ...(publication.checkpointLookup
-        ? { checkpointLookup: publication.checkpointLookup }
-        : {}),
-      guildId: config.discord.guildId,
       ownerUserId: config.discord.ownerUserId,
-      ...(config.membersPageUrl ? { membersPageUrl: config.membersPageUrl } : {}),
+      sandboxDirectory: config.publication.sandboxDirectory,
+      ...(publication && config.publication.mode === 'production'
+        ? {
+            production: {
+              guildId: config.publication.productionGuildId,
+              publisher: publication.publisher,
+              repositoryReader: publication.repositoryReader,
+              ...(publication.checkpointLookup
+                ? { checkpointLookup: publication.checkpointLookup }
+                : {}),
+              ...(config.membersPageUrl ? { membersPageUrl: config.membersPageUrl } : {}),
+            },
+          }
+        : {}),
     });
-    const router = new DiscordInteractionRouter({
-      config: {
-        applicationId: config.discord.applicationId,
-        guildId: config.discord.guildId,
-        ownerUserId: config.discord.ownerUserId,
-        publicationMode: config.publication.mode,
+    const webhook = new DiscordInteractionWebhookClient(config.discord.applicationId);
+    const attachmentDownloader = new DiscordCdnAttachmentDownloader();
+    const router = new DiscordGuildRouter({
+      applicationId: config.discord.applicationId,
+      createRouter: (guildId) => {
+        const runtime = profileRuntimes.resolve(guildId);
+        return new DiscordInteractionRouter({
+          config: {
+            applicationId: config.discord.applicationId,
+            guildId,
+            ownerUserId: config.discord.ownerUserId,
+            publicationMode: runtime.publicationMode,
+          },
+          service: runtime.service,
+          webhook,
+          attachmentDownloader,
+          formatError: formatUserError,
+          reportError: (error) => reportError(error, 'Discord profile operation failed'),
+        });
       },
-      service: profileService,
-      webhook: new DiscordInteractionWebhookClient(config.discord.applicationId),
-      attachmentDownloader: new DiscordCdnAttachmentDownloader(),
-      formatError: formatUserError,
       reportError: (error) => reportError(error, 'Discord profile operation failed'),
     });
     const guardedRouter = {
@@ -122,21 +138,21 @@ async function run() {
 
     const commandSync = await gateway.start();
     assertConnectedApplication(gateway, config.discord.applicationId);
-    startupComplete = true;
     health.gateway = 'ready';
-    health.ready = true;
 
-    const reconciliation = await profileService.reconcileKnownProfiles();
+    const reconciliation = await profileRuntimes.reconcileKnownProfiles();
 
     for (const issue of reconciliation.issues) {
       reportError(
         new Error(issue.message),
-        `Profile reconciliation failed for ${issue.profileSlug}`,
+        `Profile reconciliation failed for guild ${issue.guildId}, profile ${issue.profileSlug}`,
       );
     }
 
     profileRecoveryComplete = true;
     health.profileRecovery = 'ready';
+    startupComplete = true;
+    health.ready = true;
 
     stagedPhotoCleanupTimer = setInterval(() => {
       store.deleteExpiredStagedPhotos();
@@ -144,7 +160,9 @@ async function run() {
     stagedPhotoCleanupTimer.unref();
 
     process.stdout.write(
-      `GRASP profile bot ready in ${config.publication.mode} mode; `
+      `GRASP profile bot ready; ${config.publication.mode === 'production'
+        ? `guild ${config.publication.productionGuildId} is production and all other guilds are sandboxed`
+        : 'all guilds are sandboxed'}; `
         + `${commandSync.commandCount} global command(s) ${commandSync.changed ? 'updated' : 'already current'}.\n`,
     );
     process.stdout.write(
@@ -245,17 +263,11 @@ async function run() {
   }
 }
 
-async function createPublicationRuntime(config: AppConfig): Promise<PublicationRuntime> {
+async function createProductionPublicationRuntime(
+  config: AppConfig,
+): Promise<PublicationRuntime | undefined> {
   if (config.publication.mode === 'sandbox') {
-    const repository = new SandboxProfileRepository({
-      rootDirectory: config.publication.directory,
-      guildId: config.discord.guildId,
-    });
-    return {
-      publisher: repository,
-      repositoryReader: repository,
-      close: () => undefined,
-    };
+    return undefined;
   }
 
   const [{ App: GitHubApp, Octokit }, github] = await Promise.all([

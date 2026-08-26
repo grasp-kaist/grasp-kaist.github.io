@@ -6,14 +6,13 @@ import { ConfigurationError, loadConfig } from '../src/config.js';
 const completeEnv = {
   DISCORD_APPLICATION_ID: 'application',
   DISCORD_BOT_TOKEN: 'bot-token',
-  DISCORD_GUILD_ID: 'guild',
   DISCORD_OWNER_USER_ID: 'owner',
 };
 
 const productionEnv = {
   ...completeEnv,
   PROFILE_PUBLISH_MODE: 'production',
-  PROFILE_PRODUCTION_GUILD_ID: 'guild',
+  PROFILE_PRODUCTION_GUILD_ID: '222222222222222222',
   GITHUB_APP_ID: '123',
   GITHUB_INSTALLATION_ID: '456',
   GITHUB_APP_PRIVATE_KEY: 'private-key',
@@ -27,7 +26,7 @@ test('defaults to sandbox publication without GitHub credentials', () => {
   assert.match(config.databasePath, /data[\\/]sandbox[\\/]grasp-profile-bot\.sqlite$/);
   assert.equal(config.membersPageUrl, undefined);
   assert.match(
-    config.publication.mode === 'sandbox' ? config.publication.directory : '',
+    config.publication.sandboxDirectory,
     /sandbox-profiles$/,
   );
 });
@@ -46,16 +45,33 @@ test('loads production GitHub identifiers only for the configured production gui
     'grasp-kaist',
   );
   assert.equal(config.membersPageUrl, 'https://grasp-kaist.github.io/members/');
+  assert.equal(
+    config.publication.mode === 'production' ? config.publication.productionGuildId : '',
+    '222222222222222222',
+  );
 });
 
-test('fails closed when the production guild does not match', () => {
+test('fails closed when the production guild is missing or invalid', () => {
+  const { PROFILE_PRODUCTION_GUILD_ID: _omitted, ...missingGuild } = productionEnv;
   assert.throws(
-    () => loadConfig({ ...productionEnv, PROFILE_PRODUCTION_GUILD_ID: 'different-guild' }),
+    () => loadConfig(missingGuild),
     (error: unknown) =>
       error instanceof ConfigurationError
-      && error.message
-        === 'DISCORD_GUILD_ID must match PROFILE_PRODUCTION_GUILD_ID in production mode.',
+      && error.message === 'PROFILE_PRODUCTION_GUILD_ID is required.',
   );
+  assert.throws(
+    () => loadConfig({ ...productionEnv, PROFILE_PRODUCTION_GUILD_ID: 'not-a-guild' }),
+    (error: unknown) =>
+      error instanceof ConfigurationError
+      && error.message === 'PROFILE_PRODUCTION_GUILD_ID must be a Discord snowflake.',
+  );
+});
+
+test('a legacy DISCORD_GUILD_ID cannot restrict routing', () => {
+  const config = loadConfig({ ...completeEnv, DISCORD_GUILD_ID: '999999999999999999' });
+
+  assert.equal('guildId' in config.discord, false);
+  assert.equal(config.publication.mode, 'sandbox');
 });
 
 test('fails closed when the Gateway bot token is not configured', () => {

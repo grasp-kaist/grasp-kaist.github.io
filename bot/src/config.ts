@@ -15,10 +15,12 @@ export type GitHubConfig = {
 export type PublicationConfig =
   | {
       mode: 'sandbox';
-      directory: string;
+      sandboxDirectory: string;
     }
   | {
       mode: 'production';
+      productionGuildId: string;
+      sandboxDirectory: string;
       github: GitHubConfig;
     };
 
@@ -29,7 +31,6 @@ export type AppConfig = {
   discord: {
     applicationId: string;
     botToken: string;
-    guildId: string;
     ownerUserId: string;
   };
   publication: PublicationConfig;
@@ -48,8 +49,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     ? './data/sandbox/grasp-profile-bot.sqlite'
     : './data/grasp-profile-bot.sqlite';
   const databasePath = resolve(env.DATABASE_PATH?.trim() || defaultDatabasePath);
-  const guildId = requireValue(env, 'DISCORD_GUILD_ID');
-  const publication = loadPublicationConfig(env, publicationMode, databasePath, guildId);
+  const publication = loadPublicationConfig(env, publicationMode, databasePath);
 
   return {
     port: parsePort(env.PORT),
@@ -63,7 +63,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     discord: {
       applicationId: requireValue(env, 'DISCORD_APPLICATION_ID'),
       botToken: requireValue(env, 'DISCORD_BOT_TOKEN'),
-      guildId,
       ownerUserId: requireValue(env, 'DISCORD_OWNER_USER_ID'),
     },
     publication,
@@ -74,27 +73,27 @@ function loadPublicationConfig(
   env: NodeJS.ProcessEnv,
   mode: 'sandbox' | 'production',
   databasePath: string,
-  guildId: string,
 ): PublicationConfig {
+  const sandboxDirectory = resolve(
+    env.SANDBOX_PROFILE_DIRECTORY?.trim() || join(dirname(databasePath), 'sandbox-profiles'),
+  );
+
   if (mode === 'sandbox') {
     return {
       mode,
-      directory: resolve(
-        env.SANDBOX_PROFILE_DIRECTORY?.trim() || join(dirname(databasePath), 'sandbox-profiles'),
-      ),
+      sandboxDirectory,
     };
   }
 
-  const productionGuildId = requireValue(env, 'PROFILE_PRODUCTION_GUILD_ID');
-
-  if (guildId !== productionGuildId) {
-    throw new ConfigurationError(
-      'DISCORD_GUILD_ID must match PROFILE_PRODUCTION_GUILD_ID in production mode.',
-    );
-  }
+  const productionGuildId = parseSnowflake(
+    requireValue(env, 'PROFILE_PRODUCTION_GUILD_ID'),
+    'PROFILE_PRODUCTION_GUILD_ID',
+  );
 
   return {
     mode,
+    productionGuildId,
+    sandboxDirectory,
     github: {
       appId: parsePositiveInteger(requireValue(env, 'GITHUB_APP_ID'), 'GITHUB_APP_ID'),
       installationId: parsePositiveInteger(
@@ -109,6 +108,14 @@ function loadPublicationConfig(
       deployWorkflow: env.GITHUB_DEPLOY_WORKFLOW?.trim() || 'deploy.yml',
     },
   };
+}
+
+function parseSnowflake(value: string, name: string) {
+  if (!/^\d{17,20}$/.test(value)) {
+    throw new ConfigurationError(`${name} must be a Discord snowflake.`);
+  }
+
+  return value;
 }
 
 function parsePublicationMode(value: string | undefined): 'sandbox' | 'production' {

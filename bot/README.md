@@ -21,10 +21,9 @@ GRASP 구성원이 Discord의 `/register`와 `/profile`만으로 자신의 웹�
 PROFILE_PUBLISH_MODE=production
 DATABASE_PATH=/data/grasp-profile-bot.sqlite
 PROFILE_PRODUCTION_GUILD_ID=<GRASP 서버 ID>
-DISCORD_GUILD_ID=<같은 GRASP 서버 ID>
 ```
 
-production 모드는 기존 blob SHA 확인, 격리된 `bot/profile/...` 브랜치, 저장소 검증 workflow, `main` 비강제 fast-forward, GitHub Pages 배포 확인 순서로 제한된 프로필 파일만 반영한다. `PROFILE_PRODUCTION_GUILD_ID`와 현재 서버 ID가 다르면 봇이 시작되지 않는다.
+production 모드는 기존 blob SHA 확인, 격리된 `bot/profile/...` 브랜치, 저장소 검증 workflow, `main` 비강제 fast-forward, GitHub Pages 배포 확인 순서로 제한된 프로필 파일만 반영한다. 정확히 `PROFILE_PRODUCTION_GUILD_ID`인 서버만 실제 저장소를 사용하고, 봇이 설치된 나머지 모든 서버는 자동으로 서버별 sandbox를 사용한다.
 
 `listed`는 Members 페이지 표시 설정이지 비공개 저장 기능은 아니다. production에서 게시한 JSON, 사진, 커밋 기록은 공개 저장소에 남는다.
 
@@ -36,7 +35,8 @@ production 모드는 기존 blob SHA 확인, 격리된 `bot/profile/...` 브랜�
 - 별도의 `npm run register:commands`, Discord Public Key, Railway 공개 도메인이 필요 없다.
 - Discord Developer Portal의 **General Information → Interactions Endpoint URL은 비워 둔다.** 기존 HTTP interaction 방식에서 전환했다면 URL을 지우고 Save Changes를 눌러야 한다. URL이 남아 있으면 Discord가 interaction을 Gateway로 보내지 않으므로, 봇은 시작할 때 `application.fetch()`로 이를 확인하고 명확한 오류와 함께 중단한다.
 - 설치 scope는 `bot`과 `applications.commands`이며 권한은 View Channels, Send Messages, Attach Files만 사용한다.
-- 명령이 다른 서버에도 보일 수는 있지만 `DISCORD_GUILD_ID`가 아닌 서버에서 실행하면 거부한다.
+- 새 서버에 봇을 초대하면 Railway 변수 변경이나 재배포 없이 즉시 서버별 sandbox에서 명령을 사용할 수 있다.
+- 실제 사이트를 수정하는 production 서버는 `PROFILE_PRODUCTION_GUILD_ID` 하나뿐이다.
 
 ## 로컬 검증
 
@@ -71,7 +71,6 @@ DATABASE_PATH=/data/sandbox/grasp-profile-bot.sqlite
 SANDBOX_PROFILE_DIRECTORY=/data/sandbox/profiles
 DISCORD_APPLICATION_ID=<Application ID>
 DISCORD_BOT_TOKEN=<Bot Token>
-DISCORD_GUILD_ID=<개인 테스트 서버 ID>
 DISCORD_OWNER_USER_ID=<관리자 Discord 사용자 ID>
 ```
 
@@ -79,6 +78,6 @@ production으로 바꿀 때에만 GitHub App 변수와 `MEMBERS_PAGE_URL`을 사
 
 ## HTTP endpoint
 
-- `GET /healthz`: Railway 내부 health check 전용. Gateway 접속 전에는 503, 접속 후에는 200을 반환한다. 기존 프로필 복구 중에는 응답의 `profileRecovery`가 `running`이며 Discord 명령은 잠시 후 다시 시도하라는 안전한 안내만 보낸다.
+- `GET /healthz`: Railway 내부 health check 전용. Gateway 접속과 모든 기존 서버의 프로필 복구가 끝나기 전에는 503, 둘 다 준비된 뒤에만 200을 반환한다.
 
 프로필 REST API, 로그인 페이지, 공개 interaction webhook, 파일 브라우저는 제공하지 않는다.

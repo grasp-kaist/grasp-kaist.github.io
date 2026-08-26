@@ -187,6 +187,18 @@ export class SqliteStore {
     return rows.map(mapBinding);
   }
 
+  listGuildIds() {
+    const rows = this.#database
+      .prepare(
+        `SELECT DISTINCT guild_id
+         FROM profile_bindings
+         ORDER BY guild_id`,
+      )
+      .all() as unknown as Array<{ guild_id: string }>;
+
+    return rows.map((row) => row.guild_id);
+  }
+
   reserveBinding(
     guildId: string,
     discordUserId: string,
