@@ -136,7 +136,7 @@ test('profile explains registration delay when no usable profile is available', 
   >;
   assert.equal(
     components[0]?.content,
-    'register로부터 수 분이 걸릴 수 있습니다. 오랜 시간이 지나도 안 되면 Taein Oh에게 DM주세요.',
+    'It may take a few minutes for your profile to appear after `/register`. If it still does not appear after a while, please DM Taein Oh.',
   );
 });
 
@@ -365,7 +365,7 @@ test('a profile publication already in progress is shown as waiting, not failed'
   const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
   assert.equal(
     components[0]?.content,
-    '프로필 등록 또는 이전 변경을 사이트에 반영 중이며 수 분이 걸릴 수 있습니다. 잠시 후 `/profile`을 다시 실행해주세요.',
+    'Your profile registration or previous update is being published and may take a few minutes. Run `/profile` again shortly.',
   );
   assert.deepEqual(harness.errors, []);
 });

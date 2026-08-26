@@ -170,7 +170,8 @@ export function editTextModalResponse(snapshot: ProfileSnapshot): DiscordInterac
           'contact',
           snapshot.profile.contact,
           1_000,
-          '연락처, 이메일 등이 크롤링당하는 것을 막고 싶으면 적절히 변형해서 작성하세요. @kaist.ac.kr 메일의 경우 @kaist만 작성하길 권장합니다.',
+          'To deter scraping, obfuscate contact details if needed. '
+          + 'For @kaist.ac.kr, use only @kaist.',
         ),
         {
           type: 18,
@@ -400,8 +401,8 @@ export function operationPendingEdit(): DiscordMessagePayload {
       {
         type: 10,
         content:
-          '프로필 등록 또는 이전 변경을 사이트에 반영 중이며 수 분이 걸릴 수 있습니다. '
-          + '잠시 후 `/profile`을 다시 실행해주세요.',
+          'Your profile registration or previous update is being published and may take a few minutes. '
+          + 'Run `/profile` again shortly.',
       },
     ],
     [],

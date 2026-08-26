@@ -136,7 +136,7 @@ test('profile edit modals bind submissions to the rendered state revision', () =
   const contact = textComponents.find((component) => component.label === 'Contact');
   assert.equal(
     contact?.description,
-    '연락처, 이메일 등이 크롤링당하는 것을 막고 싶으면 적절히 변형해서 작성하세요. @kaist.ac.kr 메일의 경우 @kaist만 작성하길 권장합니다.',
+    'To deter scraping, obfuscate contact details if needed. For @kaist.ac.kr, use only @kaist.',
   );
 });
 

@@ -156,7 +156,8 @@ export class DiscordInteractionRouter {
                 snapshot
                   ? profilePanelEdit(snapshot, undefined, this.#config.publicationMode)
                   : photoFlowFinishedEdit(
-                      'register로부터 수 분이 걸릴 수 있습니다. 오랜 시간이 지나도 안 되면 Taein Oh에게 DM주세요.',
+                      'It may take a few minutes for your profile to appear after `/register`. '
+                      + 'If it still does not appear after a while, please DM Taein Oh.',
                     ),
               );
             } catch (error) {
