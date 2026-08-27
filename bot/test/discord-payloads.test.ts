@@ -9,9 +9,11 @@ import {
   editTextModalResponse,
   IS_COMPONENTS_V2_FLAG,
   operationCompleteEdit,
+  operationPendingEdit,
   photoUploadModalResponse,
   preparedPhotoPreviewEdit,
   profilePanelResponse,
+  REGISTRATION_PENDING_TEXT,
   registerModalResponse,
 } from '../src/discord/payloads.js';
 import type { ProfileSnapshot } from '../src/discord/types.js';
@@ -315,6 +317,28 @@ test('queued publications explain normal delay and temporary GitHub failure with
   assert.match(content, /GitHub may be temporarily unavailable/i);
   assert.match(content, /submit the update again later/i);
   assert.doesNotMatch(content, /Your profile was updated/);
+});
+
+test('queued registration uses registration guidance instead of profile-update retry copy', () => {
+  const result = { queued: true, operationId: 'operation-1', deploymentStatus: 'queued' };
+  const completedPayload = operationCompleteEdit(
+    'Your hidden GRASP profile was created.',
+    result,
+    'production',
+    'registration',
+  );
+  const pendingPayload = operationPendingEdit('registration');
+  const contents = [completedPayload, pendingPayload].map((payload) => String(
+    (payload.components as Array<Record<string, unknown>>)[0]?.content,
+  ));
+
+  for (const content of contents) {
+    assert.equal(content, REGISTRATION_PENDING_TEXT);
+    assert.match(content, /few minutes/i);
+    assert.match(content, /run `\/profile`/i);
+    assert.doesNotMatch(content, /profile update/i);
+    assert.doesNotMatch(content, /profile` again/i);
+  }
 });
 
 function snapshot(): ProfileSnapshot {

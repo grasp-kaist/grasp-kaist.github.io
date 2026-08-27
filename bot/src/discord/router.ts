@@ -30,7 +30,9 @@ import {
   profilePanelResponse,
   profilePanelEdit,
   profilePanelUpdateResponse,
+  REGISTRATION_PENDING_TEXT,
   registerModalResponse,
+  type ProfileOperationKind,
 } from './payloads.js';
 import type {
   AttachmentDownloader,
@@ -132,9 +134,7 @@ export class DiscordInteractionRouter {
 
         if (local.hasBinding) {
           return {
-            response: ephemeralTextResponse(
-              'This Discord account already has a registration that is being recovered. Run `/profile` again shortly.',
-            ),
+            response: ephemeralTextResponse(REGISTRATION_PENDING_TEXT),
           };
         }
 
@@ -156,8 +156,10 @@ export class DiscordInteractionRouter {
                 snapshot
                   ? profilePanelEdit(snapshot, undefined, this.#config.publicationMode)
                   : photoFlowFinishedEdit(
-                      'It may take a few minutes for your profile to appear after `/register`. '
-                      + 'If it still does not appear after a while, please DM Taein Oh.',
+                      '`/profile` could not find an available GRASP profile. '
+                      + 'If you have not registered yet, run `/register` first. '
+                      + 'If you already submitted `/register`, it may take a few minutes to finish; try `/profile` again shortly. '
+                      + 'If it is still unavailable after a while, please DM Taein Oh.',
                     ),
               );
             } catch (error) {
@@ -335,8 +337,10 @@ export class DiscordInteractionRouter {
         interaction,
         () => this.#service.register(actor, { name, position, order }),
         this.#config.publicationMode === 'sandbox'
-          ? 'Your sandbox profile was created. Run `/profile` to continue editing it; the website was not changed.'
-          : 'Your hidden GRASP profile was created. Run `/profile` to continue editing it.',
+          ? 'Your sandbox profile was created. Run `/profile` to finish setting it up; the website was not changed.'
+          : 'Your hidden GRASP profile was created. Run `/profile` to finish setting it up.',
+        false,
+        'registration',
       );
     }
 
@@ -432,6 +436,7 @@ export class DiscordInteractionRouter {
     operation: () => Promise<ProfileOperationResult>,
     successMessage: string,
     updateOriginal = false,
+    operationKind: ProfileOperationKind = 'profile-update',
   ): InteractionRouteResult {
     return {
       response: updateOriginal ? deferUpdateResponse() : deferEphemeralResponse(),
@@ -440,10 +445,15 @@ export class DiscordInteractionRouter {
           const result = await operation();
           await this.#webhook.editOriginal(
             interaction.token,
-            operationCompleteEdit(successMessage, result, this.#config.publicationMode),
+            operationCompleteEdit(
+              successMessage,
+              result,
+              this.#config.publicationMode,
+              operationKind,
+            ),
           );
         } catch (error) {
-          await this.#editDeferredFailure(interaction.token, error);
+          await this.#editDeferredFailure(interaction.token, error, operationKind);
         }
       },
     };
@@ -475,9 +485,16 @@ export class DiscordInteractionRouter {
     };
   }
 
-  async #editDeferredFailure(interactionToken: string, error: unknown) {
+  async #editDeferredFailure(
+    interactionToken: string,
+    error: unknown,
+    operationKind: ProfileOperationKind = 'profile-update',
+  ) {
     if (isExpectedPendingError(error)) {
-      await this.#webhook.editOriginal(interactionToken, operationPendingEdit());
+      await this.#webhook.editOriginal(
+        interactionToken,
+        operationPendingEdit(operationKind),
+      );
       return;
     }
 

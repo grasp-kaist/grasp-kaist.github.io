@@ -98,6 +98,11 @@ test('register does not reopen the modal while a local binding is being recovere
 
   assert.equal(routed.response.type, 4);
   assert.notEqual(routed.response.type, 9);
+  const components = routed.response.data?.components as Array<Record<string, unknown>>;
+  const content = String(components[0]?.content);
+  assert.match(content, /registration was accepted/i);
+  assert.match(content, /few minutes/i);
+  assert.doesNotMatch(content, /profile` again/i);
   assert.equal(profileReads, 0);
 });
 
@@ -125,7 +130,7 @@ test('profile defers ephemerally before any potentially networked reconciliation
   assert.equal(components[0]?.type, 17);
 });
 
-test('profile explains registration delay when no usable profile is available', async () => {
+test('profile failure explains both first registration and post-registration delay', async () => {
   const harness = createHarness({
     getOwnProfile: async () => null,
   });
@@ -139,7 +144,7 @@ test('profile explains registration delay when no usable profile is available', 
   >;
   assert.equal(
     components[0]?.content,
-    'It may take a few minutes for your profile to appear after `/register`. If it still does not appear after a while, please DM Taein Oh.',
+    '`/profile` could not find an available GRASP profile. If you have not registered yet, run `/register` first. If you already submitted `/register`, it may take a few minutes to finish; try `/profile` again shortly. If it is still unavailable after a while, please DM Taein Oh.',
   );
 });
 
@@ -213,6 +218,38 @@ test('register modal defers before invoking the mutation and edits the webhook a
   assert.equal(harness.edits.length, 1);
   assert.equal(harness.edits[0]?.token, interaction.token);
   assert.equal(harness.edits[0]?.payload.flags, 32768);
+  const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
+  assert.match(String(components[0]?.content), /finish setting it up/i);
+  assert.doesNotMatch(String(components[0]?.content), /continue editing/i);
+});
+
+test('queued registration never reuses the queued profile-update message', async () => {
+  const harness = createHarness({
+    register: async () => ({
+      queued: true,
+      operationId: 'registration-operation',
+      deploymentStatus: 'queued',
+    }),
+  });
+  const interaction = modalInteraction('register:v1:production:4', [
+    labelText('name', 'Taein Oh'),
+    labelText('position', 'M.S. Student'),
+    {
+      type: 18,
+      component: { type: 22, custom_id: 'consent', values: ['accepted'] },
+    },
+  ]);
+
+  const routed = await harness.router.route(interaction);
+  await routed.afterResponse?.();
+
+  const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
+  const content = String(components[0]?.content);
+  assert.match(content, /registration was accepted/i);
+  assert.match(content, /few minutes/i);
+  assert.match(content, /run `\/profile`/i);
+  assert.doesNotMatch(content, /profile update/i);
+  assert.doesNotMatch(content, /profile` again/i);
 });
 
 test('register rejects a sandbox modal submitted after switching to production', async () => {
@@ -372,7 +409,7 @@ test('a profile publication already in progress is shown as waiting, not failed'
   const components = harness.edits[0]?.payload.components as Array<Record<string, unknown>>;
   assert.equal(
     components[0]?.content,
-    'Your profile registration or previous update is being published and may take a few minutes. Run `/profile` again shortly.',
+    'Your profile update is still being published and may take a few minutes. Run `/profile` again shortly.',
   );
   assert.deepEqual(harness.errors, []);
 });

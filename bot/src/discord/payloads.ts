@@ -10,6 +10,12 @@ import type {
 
 export const EPHEMERAL_FLAG = 1 << 6;
 export const IS_COMPONENTS_V2_FLAG = 1 << 15;
+export const REGISTRATION_PENDING_TEXT =
+  'Your registration was accepted and is being published. It may take a few minutes. '
+  + 'Once it is ready, run `/profile` to finish setting it up. '
+  + 'If it is still unavailable after a while, please DM Taein Oh.';
+
+export type ProfileOperationKind = 'registration' | 'profile-update';
 
 const PROFILE_ACCENT_COLOR = 0x315795;
 const PHOTO_TOKEN_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
@@ -435,15 +441,17 @@ export function operationCompleteEdit(
   message: string,
   result?: ProfileOperationResult,
   publicationMode: 'sandbox' | 'production' = 'production',
+  operationKind: ProfileOperationKind = 'profile-update',
 ): DiscordMessagePayload {
   if (result?.queued) {
     return v2Edit(
       [
         {
           type: 10,
-          content:
-            'The profile update was accepted and queued. Run `/profile` again in a few minutes to see the published result. '
-            + 'If it is still unchanged, GitHub may be temporarily unavailable; please submit the update again later.',
+          content: operationKind === 'registration'
+            ? REGISTRATION_PENDING_TEXT
+            : 'The profile update was accepted and queued. Run `/profile` again in a few minutes to see the published result. '
+              + 'If it is still unchanged, GitHub may be temporarily unavailable; please submit the update again later.',
         },
       ],
       [],
@@ -479,14 +487,17 @@ export function operationFailedEdit(message: string): DiscordMessagePayload {
   );
 }
 
-export function operationPendingEdit(): DiscordMessagePayload {
+export function operationPendingEdit(
+  operationKind: ProfileOperationKind = 'profile-update',
+): DiscordMessagePayload {
   return v2Edit(
     [
       {
         type: 10,
-        content:
-          'Your profile registration or previous update is being published and may take a few minutes. '
-          + 'Run `/profile` again shortly.',
+        content: operationKind === 'registration'
+          ? REGISTRATION_PENDING_TEXT
+          : 'Your profile update is still being published and may take a few minutes. '
+            + 'Run `/profile` again shortly.',
       },
     ],
     [],
