@@ -1,11 +1,13 @@
 {
-  "listed": false,
+  "listed": true,
   "order": 3,
   "name": "Taein Oh",
   "position": "M.S. student",
   "details": [],
   "researchInterests": [],
-  "contact": [],
-  "website": "",
+  "contact": [
+    "octanec8h18@kaist"
+  ],
+  "website": "https://octane-kr.github.io/",
   "photo": ""
 }
