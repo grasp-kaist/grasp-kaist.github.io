@@ -5,7 +5,9 @@
   "position": "M.S. Student",
   "details": [],
   "researchInterests": [],
-  "contact": [],
+  "contact": [
+    "jaewonmoon@kaist"
+  ],
   "website": "",
-  "photo": ""
+  "photo": "jaewon-moon.webp"
 }
